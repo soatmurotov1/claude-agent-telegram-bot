@@ -61,8 +61,22 @@ export class RecordingApi {
       };
       return { ok: true, result: message };
     }
+    if (method === "forwardMessage") {
+      const message = {
+        message_id: this.#nextMessageId++,
+        date: 1_800_000_000,
+        chat: { id: Number(payload.chat_id), type: "private", first_name: "Owner" },
+      };
+      return { ok: true, result: message };
+    }
+    if (method === "copyMessage") {
+      if (this.failCopy) return { ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user" };
+      return { ok: true, result: { message_id: this.#nextMessageId++ } };
+    }
     return { ok: true, result: true };
   }
+
+  failCopy = false;
 
   byMethod(method: string): ApiCall[] {
     return this.calls.filter((call) => call.method === method);
@@ -232,16 +246,33 @@ export class Harness {
     return { update_id: updateId++, business_message: message as unknown as NonNullable<Update["business_message"]> };
   }
 
-  directMessage(text: string, opts: { fromId?: number } = {}): Update {
+  directMessage(
+    text: string | null,
+    opts: {
+      fromId?: number;
+      messageId?: number;
+      replyTo?: number;
+      group?: boolean;
+      isBot?: boolean;
+      extra?: Record<string, unknown>;
+    } = {},
+  ): Update {
     const fromId = opts.fromId ?? OWNER_ID;
-    const command = /^\/\w+/.exec(text);
+    const command = text !== null ? /^\/\w+/.exec(text) : null;
+    const chat = opts.group
+      ? { id: -100500, type: "group", title: "Group" }
+      : { id: fromId, type: "private", first_name: "User", username: `user${fromId}` };
     const message: Record<string, unknown> = {
-      message_id: messageId++,
+      message_id: opts.messageId ?? messageId++,
       date: Math.floor(this.clock.t),
-      chat: { id: fromId, type: "private", first_name: "User" },
-      from: { id: fromId, is_bot: false, first_name: "User" },
-      text,
+      chat,
+      from: { id: fromId, is_bot: opts.isBot ?? false, first_name: "User", username: `user${fromId}` },
+      ...(text !== null ? { text } : {}),
       ...(command ? { entities: [{ type: "bot_command", offset: 0, length: command[0].length }] } : {}),
+      ...(opts.replyTo !== undefined
+        ? { reply_to_message: { message_id: opts.replyTo, date: 1, chat, text: "copy" } }
+        : {}),
+      ...opts.extra,
     };
     return { update_id: updateId++, message: message as unknown as NonNullable<Update["message"]> };
   }

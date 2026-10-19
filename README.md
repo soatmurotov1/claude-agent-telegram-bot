@@ -9,11 +9,23 @@ Replies are written by the **Claude Code CLI** (`claude -p`) installed next to t
 
 ## What it does
 
-- Connects to the company's account through Telegram Business → **Chatbots**.
-- **Preview mode is the default** (`AUTO_SEND=false`): replies are only printed to the log as
-  `PREVIEW, not sent` blocks and stored in `data/previews.jsonl`. Nothing is sent until you set `AUTO_SEND=true`.
-- **Which chats the bot sees is decided by Telegram only**: in Settings → Telegram Business → Chatbots the
-  account owner chooses the chats. There is no allowlist in the code.
+The bot works in two ways at the same time:
+
+- **Direct chats (no Telegram Premium needed).** Anyone who writes to the bot itself gets a reply prepared from
+  `company.md`. **Every such chat is copied to the admin** (`OWNER_ID`): the person's message plus what the bot
+  answered (or why it did not). Media is forwarded. The admin answers a person by **replying** to that copy; the bot
+  delivers the answer and stays silent in that chat for `OWNER_TAKEOVER_MINUTES`. At most
+  20 Claude calls per person per hour, to protect the subscription limit.
+- **Telegram Business (optional, needs Premium).** The bot can also be connected to the company's account through
+  Telegram Business → **Chatbots** and then answers the chats of that account.
+
+Common to both:
+
+- **Preview mode is the default** (`AUTO_SEND=false`): replies are not sent to anyone. They are printed to the log
+  as `PREVIEW, not sent` blocks, stored in `data/previews.jsonl`, and for direct chats shown to the admin as a
+  draft. Set `AUTO_SEND=true` to let the bot answer people.
+- There is no allowlist in the code: anyone may write to the bot; for Business, Telegram's Chatbots setting
+  decides which chats the bot sees.
 - **The bot never decides anything on behalf of the company.** It gives information from `company.md`, confirms
   that a request was received and refers to the responsible employee. It makes no promises or conclusions about
   prices, deadlines, contracts, permits, expert reviews or inspection results.
@@ -38,15 +50,19 @@ Replies are written by the **Claude Code CLI** (`claude -p`) installed next to t
 | Claude answers `[ESCALATE] …` | Owner gets an alert; the reply itself follows the normal preview/auto-send path |
 | Before an auto-send | Pause/limit/takeover are checked again, and the connection is re-read from Telegram (owner, enabled, reply right) |
 | History retention | Messages and previews older than `HISTORY_TTL_DAYS` (default 30) are deleted |
+| Someone writes to the bot directly | Claude answers from `company.md` (sent only with `AUTO_SEND=true`); the admin always gets a copy |
+| Admin replies to a copy | The answer is delivered to that person; the bot is silent there for `OWNER_TAKEOVER_MINUTES` |
+| More than 20 messages per hour from one person | Claude is not called; the admin still gets the copies |
+| Admin writes to the bot without replying to a copy | Short hint; Claude is never called for the admin's own messages |
+| Groups, channels, other people's `/pause` `/status` | Ignored |
 
 ### Owner commands (private chat with the bot, from the `OWNER_ID` account)
 
 - `/start` — guide in Uzbek: what the bot does, current mode and state, how to connect it, commands.
 - `/pause`, `/resume` (also clears the limit and takeover timers), `/status`.
 
-Anyone else who sends `/start` gets a short Uzbek note that this is a service bot and requests should go to the
-company's official account. Claude is not called and nothing from `company.md` is shown. All other direct messages
-from strangers are ignored silently.
+Anyone else who sends `/start` gets a short Uzbek welcome asking them to write their question (Claude is not
+called for `/start`).
 
 ## How Claude is called
 
@@ -82,6 +98,7 @@ Everything is stored in `data/` (on Railway: the volume at `/app/data`), directo
 | `previews.jsonl` | Replies prepared in preview mode (or not sent) |
 | `seen.json` | IDs of handled messages (for duplicates) |
 | `state.json` | Pause flag and usage-limit deadline |
+| `relay.json` | Which admin copy belongs to which person (for replies) |
 
 History and previews older than `HISTORY_TTL_DAYS` are deleted. Messages from the people who write to the company
 **are sent to Claude (Anthropic)** to generate replies and are stored on the Railway server. Agree on this with the
@@ -110,11 +127,12 @@ personal-data requirements, before you connect the bot.
    `/app/data` → *Deploy*. Without a volume, history, pause and limit state are lost on every deploy.
 7. **Logs** should show `Bot @… is running`, `Mode: PREVIEW` and
    `Claude auth: subscription token from environment variables`. Red lines in Railway are just stderr, not errors.
-8. From the company account send `/start` to the bot. Then in Telegram **Settings → Telegram Business → Chatbots**
-   (requires Telegram Premium) enter the bot's username, choose the chats, and allow replying. The log shows
+8. From the admin account (`OWNER_ID`) send `/start` to the bot. Test from **another** account by writing to the
+   bot: the admin gets a copy with the draft reply. After the replies have been checked for a few days, set
+   `AUTO_SEND=true`; then people get the answers.
+9. Optional, with Telegram Premium: in **Settings → Telegram Business → Chatbots** of the company account enter the
+   bot's username, choose the chats and allow replying (Business Mode must be on in @BotFather). The log shows
    `Business connection …: user=<id> enabled=True`.
-9. When someone writes, the log shows a `PREVIEW, not sent` block. After a responsible employee has checked the
-   replies for a few days, set `AUTO_SEND=true`.
 
 Notes:
 

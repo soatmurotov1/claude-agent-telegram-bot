@@ -170,6 +170,7 @@ async function runBot(settings: Settings): Promise<number> {
   } else {
     log("Mode: PREVIEW (replies are only shown in the logs, nothing is sent)");
   }
+  log(`Direct chats: anyone may write to the bot; copies go to OWNER_ID ${settings.ownerId}`);
   log(`Claude auth: ${settings.claudeAuthMode}`);
   log(`Claude binary: ${settings.claudeBin}`);
   if (assistant.state.paused) logError("WARNING: the bot is paused. Send /resume to the bot from the owner account.");

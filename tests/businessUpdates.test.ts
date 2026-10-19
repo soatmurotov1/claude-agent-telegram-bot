@@ -343,12 +343,14 @@ describe("owner commands", () => {
     expect(h.lastOutcome()).toBe(Outcome.previewed);
   });
 
-  it("ignores other commands and plain messages from strangers", async () => {
+  it("ignores owner commands sent by strangers", async () => {
     const h = makeHarness();
-    await h.send(h.directMessage("/status", { fromId: 3333 }));
-    await h.send(h.directMessage("Salom, ish vaqtingiz?", { fromId: 3333 }));
+    for (const command of ["/status", "/pause", "/resume"]) {
+      await h.send(h.directMessage(command, { fromId: 3333 }));
+    }
     expect(h.api.calls).toHaveLength(0);
     expect(h.generator.calls).toHaveLength(0);
+    expect(h.assistant.state.paused).toBe(false);
   });
 
   it("/status answers the owner", async () => {

@@ -234,3 +234,38 @@ export function pruneJsonl(file: string, ttlDays: number, clock: Clock): number 
   if (removed > 0) writeFileAtomic(file, kept.map((line) => `${line}\n`).join(""));
   return removed;
 }
+
+/**
+ * Maps the IDs of messages the bot sent to the owner (copies of people's chats) to the chat they came from,
+ * so the owner can answer a person by replying to that copy. Persisted and capped.
+ */
+export class RelayMap {
+  readonly #file: JsonFile<[number, number][]>;
+  readonly #map: Map<number, number>;
+
+  constructor(file: string, private readonly capacity = 5000) {
+    this.#file = new JsonFile<[number, number][]>(file, () => [], (value) =>
+      Array.isArray(value)
+        ? value.filter(
+            (entry): entry is [number, number] =>
+              Array.isArray(entry) && typeof entry[0] === "number" && typeof entry[1] === "number",
+          )
+        : null,
+    );
+    this.#map = new Map(this.#file.read());
+  }
+
+  get(ownerMessageId: number): number | undefined {
+    return this.#map.get(ownerMessageId);
+  }
+
+  set(ownerMessageId: number, chatId: number): void {
+    this.#map.set(ownerMessageId, chatId);
+    while (this.#map.size > this.capacity) {
+      const oldest = this.#map.keys().next();
+      if (oldest.done) break;
+      this.#map.delete(oldest.value);
+    }
+    this.#file.write([...this.#map.entries()]);
+  }
+}

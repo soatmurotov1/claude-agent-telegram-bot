@@ -12,6 +12,7 @@ import {
   ensurePrivateDir,
   HistoryStore,
   isRecord,
+  RelayMap,
   RuntimeState,
   SeenMessages,
 } from "./store.js";
@@ -31,6 +32,7 @@ export const Outcome = {
   limited: "limited",
   skipped: "skipped",
   permission_denied: "permission_denied",
+  throttled: "throttled",
   error: "error",
 } as const;
 export type Outcome = (typeof Outcome)[keyof typeof Outcome];
@@ -183,16 +185,45 @@ export interface AssistantOptions {
   previewSink?: (preview: Preview) => void;
 }
 
+/** Where a reply goes: a chat of the connected business account, or the bot's own private chat. */
+type Target = { kind: "business"; connectionId: string } | { kind: "direct" };
+
+interface ChatContext {
+  target: Target;
+  historyId: string;
+  chatId: number;
+  chatKey: string;
+  chatName: string;
+  incoming: string;
+  language: Language | null;
+}
+
+interface RespondResult {
+  outcome: Outcome;
+  reply: string;
+  escalated: boolean;
+  note: string;
+}
+
+export type OwnerReplyResult = "sent" | "not_found" | "failed";
+
+/** History namespace for people who write to the bot directly. */
+export const DIRECT_HISTORY_ID = "direct";
+/** Claude calls allowed per person per hour in direct chats (protects the subscription limit). */
+export const DIRECT_HOURLY_LIMIT = 20;
+
 export class Assistant {
   readonly history: HistoryStore;
   readonly seen: SeenMessages;
   readonly state: RuntimeState;
+  readonly relay: RelayMap;
   readonly outcomes: Outcome[] = [];
   readonly previewsFile: string;
   readonly #connections = new Map<string, BusinessConnection>();
   readonly #takeoverUntil = new Map<string, number>();
   readonly #locks = new KeyedMutex();
   readonly #ownerAlerts = new Map<string, number>();
+  readonly #directCalls = new Map<string, number[]>();
   readonly #clock: Clock;
   readonly #previewSink: (preview: Preview) => void;
 
@@ -213,14 +244,23 @@ export class Assistant {
     );
     this.seen = new SeenMessages(path.join(dir, "seen.json"));
     this.state = new RuntimeState(path.join(dir, "state.json"));
+    this.relay = new RelayMap(path.join(dir, "relay.json"));
     this.previewsFile = path.join(dir, "previews.jsonl");
   }
 
-  async onBusinessMessage(api: Api, message: Message): Promise<Outcome> {
-    const outcome = await this.#handle(api, message);
+  #record(outcome: Outcome): Outcome {
     this.outcomes.push(outcome);
     if (this.outcomes.length > 100) this.outcomes.splice(0, this.outcomes.length - 100);
     return outcome;
+  }
+
+  async onBusinessMessage(api: Api, message: Message): Promise<Outcome> {
+    return this.#record(await this.#handleBusiness(api, message));
+  }
+
+  /** A person (not the owner) wrote to the bot itself in a private chat. */
+  async onDirectMessage(api: Api, message: Message): Promise<Outcome> {
+    return this.#record(await this.#handleDirect(api, message));
   }
 
   onBusinessConnection(connection: BusinessConnection): void {
@@ -238,7 +278,7 @@ export class Assistant {
     );
   }
 
-  async #handle(api: Api, message: Message): Promise<Outcome> {
+  async #handleBusiness(api: Api, message: Message): Promise<Outcome> {
     // Everything up to the duplicate check must stay synchronous (no await before it).
     const connectionId = message.business_connection_id;
     if (!connectionId) return Outcome.no_connection;
@@ -262,19 +302,102 @@ export class Assistant {
         text,
         lang: detectLanguage(text),
       });
-      if (this.settings.ownerTakeoverMinutes > 0) {
-        this.#takeoverUntil.set(chatKey, this.#clock() + this.settings.ownerTakeoverMinutes * 60);
-      }
+      this.#startTakeover(chatKey);
       return Outcome.owner_message;
     }
 
     const language = detectLanguage(text) ?? this.history.lastLanguage(connectionId, chatId);
-    const chatName = chatTitle(message);
     this.history.add(connectionId, chatId, { role: "other", name: senderName(message), text, lang: language });
 
-    return this.#locks.run(chatKey, () =>
-      this.#respond(api, { connectionId, chatId, chatKey, chatName, incoming: text, language }),
-    );
+    const chat: ChatContext = {
+      target: { kind: "business", connectionId },
+      historyId: connectionId,
+      chatId,
+      chatKey,
+      chatName: chatTitle(message),
+      incoming: text,
+      language,
+    };
+    const result = await this.#locks.run(chatKey, () => this.#respond(api, chat));
+    return result.outcome;
+  }
+
+  async #handleDirect(api: Api, message: Message): Promise<Outcome> {
+    // Everything up to the duplicate check must stay synchronous (no await before it).
+    const chatId = message.chat.id;
+    if (message.chat.type !== "private") return Outcome.unsupported;
+    if (!this.seen.firstTime(`${DIRECT_HISTORY_ID}:${chatId}:${message.message_id}`)) return Outcome.duplicate;
+    if (message.from?.is_bot) return Outcome.ignored_bot;
+    const text = describe(message);
+    if (text === null) return Outcome.unsupported;
+
+    const chatKey = HistoryStore.key(DIRECT_HISTORY_ID, chatId);
+    const language = detectLanguage(text) ?? this.history.lastLanguage(DIRECT_HISTORY_ID, chatId);
+    this.history.add(DIRECT_HISTORY_ID, chatId, { role: "other", name: senderName(message), text, lang: language });
+
+    const chat: ChatContext = {
+      target: { kind: "direct" },
+      historyId: DIRECT_HISTORY_ID,
+      chatId,
+      chatKey,
+      chatName: chatTitle(message),
+      incoming: text,
+      language,
+    };
+    const result = await this.#locks.run(chatKey, () => {
+      if (!this.#allowDirectCall(chatKey)) {
+        log(`Chat ${chat.chatName} (${chatId}): more than ${DIRECT_HOURLY_LIMIT} messages this hour, not calling Claude.`);
+        return Promise.resolve<RespondResult>({ outcome: Outcome.throttled, reply: "", escalated: false, note: "" });
+      }
+      return this.#respond(api, chat);
+    });
+    await this.#copyToOwner(api, message, chat, result);
+    return result.outcome;
+  }
+
+  /**
+   * The owner replied (in the bot chat) to a copy of someone's message: deliver the owner's message to that
+   * person and keep the bot quiet in that chat for OWNER_TAKEOVER_MINUTES.
+   */
+  async onOwnerReply(api: Api, message: Message): Promise<OwnerReplyResult> {
+    const repliedTo = message.reply_to_message?.message_id;
+    if (repliedTo === undefined) return "not_found";
+    const chatId = this.relay.get(repliedTo);
+    if (chatId === undefined) return "not_found";
+    try {
+      await api.copyMessage(chatId, message.chat.id, message.message_id);
+    } catch (err) {
+      logError(`Could not deliver the owner's reply to chat ${chatId}: ${errorMessage(err)}`);
+      return "failed";
+    }
+    const text = describe(message) ?? "[message]";
+    this.history.add(DIRECT_HISTORY_ID, chatId, {
+      role: "owner",
+      name: this.settings.companyName,
+      text,
+      lang: detectLanguage(text),
+    });
+    this.#startTakeover(HistoryStore.key(DIRECT_HISTORY_ID, chatId));
+    log(`Delivered the owner's reply to chat ${chatId}.`);
+    return "sent";
+  }
+
+  #startTakeover(chatKey: string): void {
+    if (this.settings.ownerTakeoverMinutes > 0) {
+      this.#takeoverUntil.set(chatKey, this.#clock() + this.settings.ownerTakeoverMinutes * 60);
+    }
+  }
+
+  #allowDirectCall(chatKey: string): boolean {
+    const now = this.#clock();
+    const recent = (this.#directCalls.get(chatKey) ?? []).filter((ts) => ts > now - 3600);
+    if (recent.length >= DIRECT_HOURLY_LIMIT) {
+      this.#directCalls.set(chatKey, recent);
+      return false;
+    }
+    recent.push(now);
+    this.#directCalls.set(chatKey, recent);
+    return true;
   }
 
   async #lookupConnection(api: Api, connectionId: string): Promise<BusinessConnection | null> {
@@ -300,43 +423,44 @@ export class Assistant {
     return null;
   }
 
-  async #respond(
-    api: Api,
-    chat: {
-      connectionId: string;
-      chatId: number;
-      chatKey: string;
-      chatName: string;
-      incoming: string;
-      language: Language | null;
-    },
-  ): Promise<Outcome> {
+  async #respond(api: Api, chat: ChatContext): Promise<RespondResult> {
+    const result = (outcome: Outcome, reply = "", escalated = false, note = ""): RespondResult => ({
+      outcome,
+      reply,
+      escalated,
+      note,
+    });
+
     const blocked = this.#blocked(chat.chatKey);
-    if (blocked) return blocked;
+    if (blocked) return result(blocked);
 
     const system = buildSystemPrompt(
       this.settings.companyName,
       readProfile(this.settings.profilePath),
       new Date(this.#clock() * 1000),
     );
-    const user = buildUserPrompt(this.history.get(chat.connectionId, chat.chatId), chat.language);
+    const user = buildUserPrompt(this.history.get(chat.historyId, chat.chatId), chat.language);
 
     let raw: string;
     try {
       raw = await this.generator.generate(system, user);
     } catch (err) {
-      return this.#onGenerateError(api, chat.chatName, err);
+      const failure = await this.#onGenerateError(api, chat, err);
+      return result(failure.outcome, "", false, failure.note);
     }
 
     const { escalate, text: reply } = splitEscalation(raw);
     if (!reply || reply.startsWith(SKIP_TOKEN)) {
       log(`Chat ${chat.chatName} (${chat.chatId}): no reply needed ([SKIP]).`);
-      return Outcome.skipped;
+      return result(Outcome.skipped, "", escalate);
     }
-    if (escalate) await this.#alertEscalation(api, chat.chatKey, chat.chatName, chat.incoming);
+    // In direct mode the owner already gets a copy of every chat, marked when escalated.
+    if (escalate && chat.target.kind === "business") {
+      await this.#alertEscalation(api, chat.chatKey, chat.chatName, chat.incoming);
+    }
 
     const preview: Preview = {
-      connectionId: chat.connectionId,
+      connectionId: chat.target.kind === "business" ? chat.target.connectionId : DIRECT_HISTORY_ID,
       chatId: chat.chatId,
       chatName: chat.chatName,
       language: chat.language,
@@ -348,55 +472,66 @@ export class Assistant {
 
     if (!this.settings.autoSend) {
       this.#showPreview(preview);
-      return Outcome.previewed;
+      return result(Outcome.previewed, reply, escalate);
     }
 
     // Auto-send: the owner may have written, paused, or the limit may have hit while Claude was thinking.
     const blockedNow = this.#blocked(chat.chatKey);
     if (blockedNow) {
-      this.#showPreview({ ...preview, note: `not sent: ${blockedNow} (state changed while the reply was generated)` });
-      return blockedNow;
+      const note = `not sent: ${blockedNow} (state changed while the reply was generated)`;
+      this.#showPreview({ ...preview, note });
+      return result(blockedNow, reply, escalate, note);
     }
 
-    // Re-check the connection with Telegram itself right before sending, never from the cache.
-    let reason = "";
-    try {
-      const fresh = await api.getBusinessConnection(chat.connectionId);
-      this.#connections.set(chat.connectionId, fresh);
-      if (fresh.user.id !== this.settings.ownerId) reason = "the connection belongs to another account";
-      else if (!fresh.is_enabled) reason = "the connection is disabled";
-      else if (!canReply(fresh)) reason = "the bot has no permission to reply in this account";
-    } catch (err) {
-      reason = `could not re-check the connection (${errorMessage(err)})`;
-    }
-    if (reason) {
-      logError(`Not sending to chat ${chat.chatId}: ${reason}.`);
-      this.#showPreview({ ...preview, note: `not sent: ${reason}` });
-      return Outcome.permission_denied;
+    const sendOptions: { business_connection_id?: string } = {};
+    if (chat.target.kind === "business") {
+      // Re-check the connection with Telegram itself right before sending, never from the cache.
+      const reason = await this.#connectionProblem(api, chat.target.connectionId);
+      if (reason) {
+        logError(`Not sending to chat ${chat.chatId}: ${reason}.`);
+        this.#showPreview({ ...preview, note: `not sent: ${reason}` });
+        return result(Outcome.permission_denied, reply, escalate, `not sent: ${reason}`);
+      }
+      sendOptions.business_connection_id = chat.target.connectionId;
     }
 
     try {
       for (const chunk of splitMessage(reply)) {
-        await api.sendMessage(chat.chatId, chunk, { business_connection_id: chat.connectionId });
+        await api.sendMessage(chat.chatId, chunk, sendOptions);
       }
     } catch (err) {
       if (err instanceof GrammyError || err instanceof HttpError) {
         logError(`Sending the reply to chat ${chat.chatId} failed: ${errorMessage(err)}`);
-        return Outcome.error;
+        return result(Outcome.error, reply, escalate, `sending failed: ${errorMessage(err)}`);
       }
       throw err;
     }
-    this.history.add(chat.connectionId, chat.chatId, {
+    this.history.add(chat.historyId, chat.chatId, {
       role: "owner",
       name: this.settings.companyName,
       text: reply,
       lang: chat.language,
     });
     log(`Sent a reply to chat ${chat.chatName} (${chat.chatId})${escalate ? " [ESCALATED]" : ""}.`);
-    return Outcome.sent;
+    return result(Outcome.sent, reply, escalate);
   }
 
-  async #onGenerateError(api: Api, chatName: string, err: unknown): Promise<Outcome> {
+  async #connectionProblem(api: Api, connectionId: string): Promise<string> {
+    try {
+      const fresh = await api.getBusinessConnection(connectionId);
+      this.#connections.set(connectionId, fresh);
+      if (fresh.user.id !== this.settings.ownerId) return "the connection belongs to another account";
+      if (!fresh.is_enabled) return "the connection is disabled";
+      if (!canReply(fresh)) return "the bot has no permission to reply in this account";
+      return "";
+    } catch (err) {
+      return `could not re-check the connection (${errorMessage(err)})`;
+    }
+  }
+
+  async #onGenerateError(api: Api, chat: ChatContext, err: unknown): Promise<{ outcome: Outcome; note: string }> {
+    // In direct mode the copy sent to the owner already explains the failure.
+    const alertOwner = this.settings.autoSend && chat.target.kind === "business";
     if (err instanceof ClaudeLimitError) {
       const now = this.#clock();
       const until =
@@ -404,7 +539,7 @@ export class Assistant {
       this.state.limitUntil = until;
       const untilText = new Date(until * 1000).toISOString();
       logError(`${err.message}. No replies will be generated until ${untilText}. CLI said: ${err.detail}`);
-      if (this.settings.autoSend) {
+      if (alertOwner) {
         await this.#notifyOwner(
           api,
           "limit",
@@ -413,22 +548,22 @@ export class Assistant {
             `Limit oldinroq tiklansa, /resume yuboring.`,
         );
       }
-      return Outcome.limited;
+      return { outcome: Outcome.limited, note: `Claude limiti ${tashkentTime(until)} gacha` };
     }
     if (err instanceof ClaudeError) {
-      logError(`Claude failed for chat ${chatName}: ${errorMessage(err)}`);
-      if (this.settings.autoSend) {
+      logError(`Claude failed for chat ${chat.chatName}: ${errorMessage(err)}`);
+      if (alertOwner) {
         await this.#notifyOwner(
           api,
           "error",
-          `⚠️ Bot "${chatName}" chatidagi murojaatga javob tayyorlay olmadi, murojaatchiga hech narsa yuborilmadi. ` +
+          `⚠️ Bot "${chat.chatName}" chatidagi murojaatga javob tayyorlay olmadi, murojaatchiga hech narsa yuborilmadi. ` +
             `Iltimos, o'zingiz javob bering.\n\nSabab: ${truncate(err.message, 500)}`,
         );
       }
-      return Outcome.error;
+      return { outcome: Outcome.error, note: truncate(err.message, 300) };
     }
-    logError(`Unexpected error while generating a reply for chat ${chatName}: ${errorMessage(err)}`);
-    return Outcome.error;
+    logError(`Unexpected error while generating a reply for chat ${chat.chatName}: ${errorMessage(err)}`);
+    return { outcome: Outcome.error, note: "kutilmagan xato" };
   }
 
   async #alertEscalation(api: Api, chatKey: string, chatName: string, incoming: string): Promise<void> {
@@ -452,6 +587,61 @@ export class Assistant {
     } catch (err) {
       logError(`Could not notify the owner: ${errorMessage(err)}`);
     }
+  }
+
+  /** Sends the owner a copy of a direct chat message and what the bot did with it. */
+  async #copyToOwner(api: Api, message: Message, chat: ChatContext, result: RespondResult): Promise<void> {
+    try {
+      if (message.text === undefined) {
+        // Media: forward the original so the owner can see the photo, document or voice message.
+        const forwarded = await api.forwardMessage(this.settings.ownerId, chat.chatId, message.message_id);
+        this.relay.set(forwarded.message_id, chat.chatId);
+      }
+      const sent = await api.sendMessage(this.settings.ownerId, this.#ownerCopyText(message, chat, result));
+      this.relay.set(sent.message_id, chat.chatId);
+    } catch (err) {
+      logError(`Could not copy chat ${chat.chatId} to the owner: ${errorMessage(err)}`);
+    }
+  }
+
+  #ownerCopyText(message: Message, chat: ChatContext, result: RespondResult): string {
+    const from = message.from;
+    const who = [
+      chat.chatName,
+      from?.username ? `@${from.username}` : "",
+      `ID ${chat.chatId}`,
+    ].filter(Boolean);
+    const lines: string[] = [];
+    if (result.escalated) lines.push("🚨 MUHIM MUROJAAT — darhol ko'rib chiqing!", "");
+    lines.push(`📩 ${who.join(", ")}`, "", truncate(chat.incoming, 1500), "");
+    const reply = truncate(result.reply, 1500);
+    switch (result.outcome) {
+      case Outcome.sent:
+        lines.push("🤖 Bot javobi (yuborildi):", reply);
+        break;
+      case Outcome.previewed:
+        lines.push("🤖 Bot javobi (PREVIEW — foydalanuvchiga yuborilmadi, AUTO_SEND=false):", reply);
+        break;
+      case Outcome.skipped:
+        lines.push("🤖 Bot javob bermadi: javob kerak emas.");
+        break;
+      case Outcome.paused:
+        lines.push("⏸ Bot pauzada, javob berilmadi.");
+        break;
+      case Outcome.limited:
+        lines.push(`⚠️ Javob berilmadi: ${result.note || "Claude obunasi limiti tugagan"}.`);
+        break;
+      case Outcome.owner_active:
+        lines.push("👤 Siz shu chatda javob bergansiz, bot hozircha jim turibdi.");
+        break;
+      case Outcome.throttled:
+        lines.push(`⚠️ Bu foydalanuvchi bir soatda ${DIRECT_HOURLY_LIMIT} tadan ko'p xabar yubordi, bot javob bermadi.`);
+        break;
+      default:
+        lines.push(`⚠️ Javob tayyorlanmadi${result.note ? `: ${result.note}` : ""}.`);
+    }
+    lines.push("", "↩️ Javob yozish uchun shu xabarga Reply qiling.");
+    return lines.join("\n");
   }
 
   #showPreview(preview: Preview): void {
@@ -500,24 +690,23 @@ export class Assistant {
     const s = this.settings;
     const mode = s.autoSend
       ? "AUTO-SEND — javoblar murojaatchilarga avtomatik yuboriladi"
-      : "PREVIEW — javoblar faqat server logida ko'rsatiladi, hech kimga yuborilmaydi";
+      : "PREVIEW — javoblar murojaatchilarga yuborilmaydi, faqat sizga qoralama sifatida keladi";
     const state = this.state.paused ? "pauzada (/resume bilan yoqing)" : "ishlayapti";
     const lines = [
       "Assalomu alaykum!",
       "",
-      `Bu bot «${s.companyName}» korxonasining Telegram Business yordamchisi. U korxona akkauntiga kelgan ` +
-        `murojaatlarga korxona nomidan rasmiy va xushmuomala javob tayyorlaydi.`,
+      `Bu bot «${s.companyName}» korxonasining Telegram yordamchisi. Botga yozgan har bir odamga u company.md ` +
+        `dagi ma'lumotlar asosida korxona nomidan rasmiy va xushmuomala javob tayyorlaydi.`,
       "",
       "Hozirgi holat:",
       `• Rejim: ${mode}`,
       `• Holat: ${state}`,
       "",
-      "Qanday ulanadi (korxona akkauntida):",
-      "1. Telegram → Settings → Telegram Business → Chatbots.",
-      "2. Shu botning username'ini kiriting.",
-      "3. Bot qaysi chatlarni ko'rishini tanlang.",
-      "4. Javob berish (reply) ruxsatini yoqing.",
-      "Buning uchun akkauntda Telegram Premium bo'lishi kerak.",
+      "Siz (admin) uchun:",
+      "• Botga yozilgan har bir xabar va botning javobi shu chatga keladi.",
+      "• Murojaatchiga o'zingiz javob yozish uchun o'sha xabarga Reply qiling — javobingiz unga yuboriladi.",
+      `• Siz javob bergan chatda bot ${s.ownerTakeoverMinutes} daqiqa jim turadi.`,
+      "• Sinab ko'rish uchun botga boshqa akkauntdan yozing: sizning o'z xabarlaringizga bot javob bermaydi.",
       "",
       "Buyruqlar:",
       "/pause — botni to'xtatish",
@@ -525,12 +714,13 @@ export class Assistant {
       "/status — holat",
       "",
       "Bilib qo'ying:",
-      `• Chatda xodim o'zi yozsa, bot u yerda ${s.ownerTakeoverMinutes} daqiqa jim turadi.`,
       "• Bot narx, muddat, shartnoma, ruxsatnoma, ekspertiza yoki tekshiruv natijasi bo'yicha va'da bermaydi — " +
         "murojaatni qabul qilib, mas'ul xodimga yo'naltiradi.",
-      "• Favqulodda holat, shikoyat yoki rasmiy so'rovlarda sizga shu yerda alohida xabar yuboradi.",
+      "• Favqulodda holat, shikoyat yoki rasmiy so'rovlar 🚨 belgisi bilan keladi.",
+      `• Bir odamdan soatiga ${DIRECT_HOURLY_LIMIT} tadan ko'p xabarga bot javob bermaydi (obuna limitini tejash uchun).`,
       `• Suhbat tarixi ${s.historyTtlDays} kun saqlanadi, keyin o'chiriladi.`,
-      "• Korxona haqidagi ma'lumotlar company.md faylida turadi — uni to'ldirish kerak.",
+      "• Korxona haqidagi ma'lumotlar company.md faylida turadi.",
+      "• Telegram Premium bo'lsa, botni Settings → Telegram Business → Chatbots orqali korxona akkauntiga ham ulash mumkin.",
     ];
     if (!s.autoSend) {
       lines.push(
