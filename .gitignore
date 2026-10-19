@@ -1,0 +1,9 @@
+.env
+node_modules/
+dist/
+data/
+coverage/
+.DS_Store
+*.bak
+# Unrelated scaffold that was already in this folder; not part of the bot.
+claude-agent-teleram-bot/

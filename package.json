@@ -1,0 +1,29 @@
+{
+  "name": "sanoatgeokontexxizmat-assistant",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram Business assistant bot for Sanoatgeokontexxizmat, answering through the Claude Code CLI",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "start": "node dist/bot.js",
+    "check-claude": "tsx src/bot.ts --check-claude",
+    "try": "tsx src/bot.ts --try"
+  },
+  "dependencies": {
+    "@grammyjs/runner": "^2.0.3",
+    "dotenv": "^16.4.7",
+    "grammy": "^1.30.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  }
+}

@@ -1,0 +1,11 @@
+.env
+node_modules/
+dist/
+data/
+coverage/
+tests/
+.git/
+.DS_Store
+*.bak
+prompts/
+claude-agent-teleram-bot/
