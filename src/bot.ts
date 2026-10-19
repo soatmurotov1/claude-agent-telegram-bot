@@ -173,6 +173,12 @@ async function runBot(settings: Settings): Promise<number> {
   log(`Direct chats: anyone may write to the bot; copies go to OWNER_ID ${settings.ownerId}`);
   log(`Claude auth: ${settings.claudeAuthMode}`);
   log(`Claude binary: ${settings.claudeBin}`);
+  if (bot.botInfo.has_topics_enabled) {
+    logError(
+      "WARNING: Threaded Mode (topics in private chats) is ON for this bot, so Telegram opens a new topic for " +
+        "messages. Turn it off: @BotFather -> /mybots -> the bot -> Bot Settings -> Threaded Mode.",
+    );
+  }
   if (assistant.state.paused) logError("WARNING: the bot is paused. Send /resume to the bot from the owner account.");
   if (!profileIsFilled(readProfile(settings.profilePath))) {
     logError(`WARNING: ${settings.profilePath} is not filled in yet. Replies will contain almost no facts.`);

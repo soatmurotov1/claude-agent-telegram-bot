@@ -60,6 +60,11 @@ Common to both:
 
 - `/start` — guide in Uzbek: what the bot does, current mode and state, how to connect it, commands.
 - `/pause`, `/resume` (also clears the limit and takeover timers), `/status`.
+- **`users` button** (persistent keyboard, owner only; also `/users`): lists everyone who wrote to the bot in the
+  last `HISTORY_TTL_DAYS` days, newest first, with @username, ID, message count and last message time.
+
+Turn **Threaded Mode off** in @BotFather (Bot Settings → Threaded Mode). With it on, Telegram opens a new topic
+("folder") for messages; the bot warns about it in the log at startup.
 
 Anyone else who sends `/start` gets a short Uzbek welcome asking them to write their question (Claude is not
 called for `/start`).
@@ -99,6 +104,7 @@ Everything is stored in `data/` (on Railway: the volume at `/app/data`), directo
 | `seen.json` | IDs of handled messages (for duplicates) |
 | `state.json` | Pause flag and usage-limit deadline |
 | `relay.json` | Which admin copy belongs to which person (for replies) |
+| `users.json` | People who wrote to the bot (name, @username, ID, counts) for the `users` list |
 
 History and previews older than `HISTORY_TTL_DAYS` are deleted. Messages from the people who write to the company
 **are sent to Claude (Anthropic)** to generate replies and are stored on the Railway server. Agree on this with the

@@ -1,8 +1,19 @@
 import { Composer, type Context } from "grammy";
+import type { ReplyKeyboardMarkup } from "grammy/types";
 import type { Settings } from "./config.js";
-import type { Assistant } from "./service.js";
+import { type Assistant, describe } from "./service.js";
 
 export const ALLOWED_UPDATES = ["message", "business_connection", "business_message"] as const;
+
+/** Text of the owner's only keyboard button; pressing it lists everyone who wrote to the bot. */
+export const USERS_BUTTON = "users";
+
+/** Persistent keyboard shown to the owner only. */
+export const OWNER_KEYBOARD: ReplyKeyboardMarkup = {
+  keyboard: [[{ text: USERS_BUTTON }]],
+  resize_keyboard: true,
+  is_persistent: true,
+};
 
 /** /start text for people who write to the bot. Claude is not called and no company.md facts are shown. */
 export function welcomeText(companyName: string): string {
@@ -28,36 +39,56 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
   const direct = composer.on("message").filter((ctx) => ctx.chat.type === "private");
 
   direct.command("start", async (ctx) => {
-    if (ctx.from.id === settings.ownerId) await ctx.reply(assistant.startText());
-    else await ctx.reply(welcomeText(settings.companyName));
+    if (ctx.from.id === settings.ownerId) {
+      await ctx.reply(assistant.startText(), { reply_markup: OWNER_KEYBOARD });
+    } else {
+      await ctx.reply(welcomeText(settings.companyName));
+    }
   });
 
   const owner = direct.filter((ctx) => ctx.from.id === settings.ownerId);
+  const ownerReply = (ctx: Context, text: string) => ctx.reply(text, { reply_markup: OWNER_KEYBOARD });
 
   owner.command("pause", async (ctx) => {
     assistant.pause();
-    await ctx.reply("⏸ Bot pauzada: murojaatlarga javob tayyorlanmaydi. Qayta yoqish uchun /resume yuboring.");
+    await ownerReply(ctx, "⏸ Bot pauzada: murojaatlarga javob tayyorlanmaydi. Qayta yoqish uchun /resume yuboring.");
   });
 
   owner.command("resume", async (ctx) => {
     assistant.resume();
-    await ctx.reply(`▶️ Bot yana ishlayapti (rejim: ${assistant.modeText()}). Pauza va limit holati tozalandi.`);
+    await ownerReply(ctx, `▶️ Bot yana ishlayapti (rejim: ${assistant.modeText()}). Pauza va limit holati tozalandi.`);
   });
 
   owner.command("status", async (ctx) => {
-    await ctx.reply(assistant.statusText());
+    await ownerReply(ctx, assistant.statusText());
   });
+
+  const listUsers = async (ctx: Context): Promise<void> => {
+    for (const text of assistant.usersListMessages()) {
+      await ctx.reply(text, {
+        parse_mode: "HTML",
+        link_preview_options: { is_disabled: true },
+        reply_markup: OWNER_KEYBOARD,
+      });
+    }
+  };
+  owner.command("users", listUsers);
+  owner.filter((ctx) => ctx.message.text?.trim().toLowerCase() === USERS_BUTTON, listUsers);
 
   // Any other message from the owner: a reply to a copied chat is delivered to that person.
   owner.on("message", async (ctx) => {
+    // Service messages (e.g. "topic created") are not something the owner wrote: no answer, no duplicate hints.
+    if (describe(ctx.message) === null) return;
     const result = await assistant.onOwnerReply(ctx.api, ctx.message);
     if (result === "sent") {
-      await ctx.reply("✅ Javobingiz yuborildi.");
+      await ownerReply(ctx, "✅ Javobingiz yuborildi.");
     } else if (result === "failed") {
-      await ctx.reply("⚠️ Javobni yuborib bo'lmadi (foydalanuvchi botni bloklagan bo'lishi mumkin).");
+      await ownerReply(ctx, "⚠️ Javobni yuborib bo'lmadi (foydalanuvchi botni bloklagan bo'lishi mumkin).");
     } else {
-      await ctx.reply(
+      await ownerReply(
+        ctx,
         "Murojaatchiga javob yozish uchun bot yuborgan xabarga Reply qiling. " +
+          `Mijozlar ro'yxati uchun «${USERS_BUTTON}» tugmasini bosing. ` +
           "Botni sinab ko'rish uchun unga boshqa akkauntdan yozing.",
       );
     }

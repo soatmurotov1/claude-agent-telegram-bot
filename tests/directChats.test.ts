@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { ClaudeTimeout } from "../src/claudeCli.js";
 import { DIRECT_HISTORY_ID, DIRECT_HOURLY_LIMIT, Outcome } from "../src/service.js";
+import { OWNER_KEYBOARD, USERS_BUTTON } from "../src/handlers.js";
 import { cleanupHarnesses, makeHarness, OWNER_ID } from "./helpers.js";
 
 const PERSON = 4444;
@@ -184,5 +185,83 @@ describe("people writing to the bot directly", () => {
     expect(sends[0]?.payload.chat_id).toBe(PERSON);
     expect(String(sends[0]?.payload.text)).toContain("Savolingizni");
     expect(h.generator.calls).toHaveLength(0);
+  });
+
+  it("answers inside the topic the person wrote in", async () => {
+    const h = makeHarness({ AUTO_SEND: "true" });
+    await h.send(
+      h.directMessage("Salom", { fromId: PERSON, extra: { is_topic_message: true, message_thread_id: 77 } }),
+    );
+    const toPerson = h.api.byMethod("sendMessage").find((call) => call.payload.chat_id === PERSON);
+    expect(toPerson?.payload.message_thread_id).toBe(77);
+  });
+
+  it("does not answer the owner twice when Telegram also sends a service message", async () => {
+    const h = makeHarness();
+    await h.send(h.directMessage(null, { extra: { forum_topic_created: { name: "Salom", icon_color: 1 } } }));
+    await h.send(h.directMessage("Salom"));
+    expect(h.api.byMethod("sendMessage")).toHaveLength(1);
+    expect(h.generator.calls).toHaveLength(0);
+  });
+});
+
+describe("owner users button", () => {
+  it("shows the users button to the owner only", async () => {
+    const h = makeHarness();
+    await h.send(h.directMessage("/start"));
+    await h.send(h.directMessage("/start", { fromId: PERSON }));
+    const [owner, person] = h.api.byMethod("sendMessage");
+    expect(owner?.payload.reply_markup).toEqual(OWNER_KEYBOARD);
+    expect(person?.payload.reply_markup).toBeUndefined();
+  });
+
+  it("lists everyone who wrote, newest first, with message counts", async () => {
+    const h = makeHarness();
+    await h.send(h.directMessage(USERS_BUTTON));
+    expect(String(h.api.byMethod("sendMessage")[0]?.payload.text)).toContain("hech kim yozmagan");
+
+    await h.send(h.directMessage("Birinchi", { fromId: PERSON }));
+    h.clock.advance(60);
+    await h.send(h.directMessage("Ikkinchi", { fromId: PERSON }));
+    h.clock.advance(60);
+    await h.send(h.directMessage("Salom", { fromId: 5555 }));
+    h.api.clear();
+
+    await h.send(h.directMessage(USERS_BUTTON));
+    const sends = h.api.byMethod("sendMessage");
+    expect(sends).toHaveLength(1);
+    expect(sends[0]?.payload.parse_mode).toBe("HTML");
+    const text = String(sends[0]?.payload.text);
+    expect(text).toContain("Mijozlar: 2 ta");
+    expect(text.indexOf("ID 5555")).toBeLessThan(text.indexOf("ID 4444"));
+    expect(text).toContain("@user4444");
+    expect(text).toContain("2 ta xabar");
+    expect(text).toContain('href="tg://user?id=4444"');
+    expect(h.generator.calls).toHaveLength(3);
+
+    await h.send(h.directMessage("/users"));
+    expect(h.api.byMethod("sendMessage")).toHaveLength(2);
+  });
+
+  it("escapes names, survives a restart and forgets people after HISTORY_TTL_DAYS", async () => {
+    const h = makeHarness();
+    await h.send(h.directMessage("Salom", { fromId: PERSON, extra: { from: { id: PERSON, is_bot: false, first_name: "<b>Ali</b>" } } }));
+    h.restart();
+    h.api.clear();
+    await h.send(h.directMessage(USERS_BUTTON));
+    const text = String(h.api.byMethod("sendMessage")[0]?.payload.text);
+    expect(text).toContain("&lt;b&gt;Ali&lt;/b&gt;");
+    expect(text).not.toContain("<b>Ali</b>");
+
+    h.clock.advance(31 * 86400);
+    h.api.clear();
+    await h.send(h.directMessage(USERS_BUTTON));
+    expect(String(h.api.byMethod("sendMessage")[0]?.payload.text)).toContain("hech kim yozmagan");
+  });
+
+  it("is a normal question when someone else types users", async () => {
+    const h = makeHarness();
+    await h.send(h.directMessage(USERS_BUTTON, { fromId: PERSON }));
+    expect(h.generator.calls).toHaveLength(1);
   });
 });

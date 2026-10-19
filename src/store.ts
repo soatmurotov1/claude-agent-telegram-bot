@@ -269,3 +269,75 @@ export class RelayMap {
     this.#file.write([...this.#map.entries()]);
   }
 }
+
+export interface KnownUser {
+  id: number;
+  name: string;
+  username: string;
+  firstSeen: number;
+  lastSeen: number;
+  messages: number;
+}
+
+function toKnownUser(value: unknown): KnownUser | null {
+  if (!isRecord(value)) return null;
+  const { id, name, username, firstSeen, lastSeen, messages } = value;
+  if (typeof id !== "number" || typeof name !== "string" || typeof username !== "string") return null;
+  if (typeof firstSeen !== "number" || typeof lastSeen !== "number" || typeof messages !== "number") return null;
+  return { id, name, username, firstSeen, lastSeen, messages };
+}
+
+/** People who wrote to the bot, for the owner's "users" list. Forgotten after ttlDays without messages. */
+export class UserDirectory {
+  readonly #file: JsonFile<KnownUser[]>;
+  readonly #users: Map<number, KnownUser>;
+
+  constructor(
+    file: string,
+    private readonly ttlDays: number,
+    private readonly clock: Clock,
+  ) {
+    this.#file = new JsonFile<KnownUser[]>(file, () => [], (value) =>
+      Array.isArray(value) ? value.map(toKnownUser).filter((u): u is KnownUser => u !== null) : null,
+    );
+    this.#users = new Map(this.#file.read().map((user) => [user.id, user]));
+    if (this.#prune()) this.#save();
+  }
+
+  touch(id: number, name: string, username: string): void {
+    const now = this.clock();
+    const known = this.#users.get(id);
+    this.#users.set(id, {
+      id,
+      name,
+      username,
+      firstSeen: known?.firstSeen ?? now,
+      lastSeen: now,
+      messages: (known?.messages ?? 0) + 1,
+    });
+    this.#prune();
+    this.#save();
+  }
+
+  /** Most recently active first. */
+  list(): KnownUser[] {
+    if (this.#prune()) this.#save();
+    return [...this.#users.values()].sort((a, b) => b.lastSeen - a.lastSeen);
+  }
+
+  #prune(): boolean {
+    const cutoff = this.clock() - this.ttlDays * 86400;
+    let changed = false;
+    for (const [id, user] of this.#users) {
+      if (user.lastSeen < cutoff) {
+        this.#users.delete(id);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  #save(): void {
+    this.#file.write([...this.#users.values()]);
+  }
+}

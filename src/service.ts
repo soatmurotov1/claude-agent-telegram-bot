@@ -15,6 +15,7 @@ import {
   RelayMap,
   RuntimeState,
   SeenMessages,
+  UserDirectory,
 } from "./store.js";
 
 export const Outcome = {
@@ -196,6 +197,8 @@ interface ChatContext {
   chatName: string;
   incoming: string;
   language: Language | null;
+  /** Topic the person wrote in, when the bot has topics (BotFather "Threaded Mode") enabled. */
+  threadId?: number;
 }
 
 interface RespondResult {
@@ -217,6 +220,7 @@ export class Assistant {
   readonly seen: SeenMessages;
   readonly state: RuntimeState;
   readonly relay: RelayMap;
+  readonly users: UserDirectory;
   readonly outcomes: Outcome[] = [];
   readonly previewsFile: string;
   readonly #connections = new Map<string, BusinessConnection>();
@@ -245,6 +249,7 @@ export class Assistant {
     this.seen = new SeenMessages(path.join(dir, "seen.json"));
     this.state = new RuntimeState(path.join(dir, "state.json"));
     this.relay = new RelayMap(path.join(dir, "relay.json"));
+    this.users = new UserDirectory(path.join(dir, "users.json"), settings.historyTtlDays, clock);
     this.previewsFile = path.join(dir, "previews.jsonl");
   }
 
@@ -308,6 +313,7 @@ export class Assistant {
 
     const language = detectLanguage(text) ?? this.history.lastLanguage(connectionId, chatId);
     this.history.add(connectionId, chatId, { role: "other", name: senderName(message), text, lang: language });
+    this.#rememberUser(message);
 
     const chat: ChatContext = {
       target: { kind: "business", connectionId },
@@ -334,6 +340,7 @@ export class Assistant {
     const chatKey = HistoryStore.key(DIRECT_HISTORY_ID, chatId);
     const language = detectLanguage(text) ?? this.history.lastLanguage(DIRECT_HISTORY_ID, chatId);
     this.history.add(DIRECT_HISTORY_ID, chatId, { role: "other", name: senderName(message), text, lang: language });
+    this.#rememberUser(message);
 
     const chat: ChatContext = {
       target: { kind: "direct" },
@@ -343,6 +350,7 @@ export class Assistant {
       chatName: chatTitle(message),
       incoming: text,
       language,
+      threadId: message.is_topic_message ? message.message_thread_id : undefined,
     };
     const result = await this.#locks.run(chatKey, () => {
       if (!this.#allowDirectCall(chatKey)) {
@@ -483,7 +491,9 @@ export class Assistant {
       return result(blockedNow, reply, escalate, note);
     }
 
-    const sendOptions: { business_connection_id?: string } = {};
+    const sendOptions: { business_connection_id?: string; message_thread_id?: number } = {};
+    // Answer inside the topic the person wrote in, so no new topic is opened for every reply.
+    if (chat.threadId !== undefined) sendOptions.message_thread_id = chat.threadId;
     if (chat.target.kind === "business") {
       // Re-check the connection with Telegram itself right before sending, never from the cache.
       const reason = await this.#connectionProblem(api, chat.target.connectionId);
@@ -653,6 +663,44 @@ export class Assistant {
     }
   }
 
+  #rememberUser(message: Message): void {
+    const from = message.from;
+    if (!from || from.id === this.settings.ownerId) return;
+    try {
+      this.users.touch(from.id, senderName(message), from.username ?? "");
+    } catch (err) {
+      logError(`Could not update the users list: ${errorMessage(err)}`);
+    }
+  }
+
+  /** The owner's "users" list as HTML messages (each under Telegram's 4096-character limit). */
+  usersListMessages(): string[] {
+    const users = this.users.list();
+    if (users.length === 0) {
+      return [`👥 Hozircha botga hech kim yozmagan (oxirgi ${this.settings.historyTtlDays} kun).`];
+    }
+    const lines = users.map((user, i) => {
+      const name = `<a href="tg://user?id=${user.id}">${escapeHtml(user.name)}</a>`;
+      const username = user.username ? ` @${escapeHtml(user.username)}` : "";
+      return (
+        `${i + 1}. ${name}${username}\n` +
+        `    ID ${user.id} · ${user.messages} ta xabar · oxirgi: ${tashkentTime(user.lastSeen)}`
+      );
+    });
+    const header = `👥 Mijozlar: ${users.length} ta (oxirgi ${this.settings.historyTtlDays} kun, yangilari tepada)\n`;
+    const messages: string[] = [];
+    let current = header;
+    for (const line of lines) {
+      if (current.length + line.length + 1 > 3800) {
+        messages.push(current);
+        current = "";
+      }
+      current += `\n${line}`;
+    }
+    messages.push(current);
+    return messages;
+  }
+
   pause(): void {
     this.state.paused = true;
   }
@@ -772,4 +820,8 @@ export function buildAssistant(
   opts: AssistantOptions & { generator?: ReplyGenerator } = {},
 ): Assistant {
   return new Assistant(settings, opts.generator ?? makeClaudeCli(settings), opts);
+}
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
