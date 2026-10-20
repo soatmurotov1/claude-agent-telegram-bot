@@ -24,6 +24,17 @@ export function welcomeText(companyName: string): string {
   );
 }
 
+/** How the owner makes the admin group where every person gets a folder (topic). */
+export const SETUP_GUIDE = [
+  "📁 Har bir mijoz uchun alohida jild (admin guruhi):",
+  "1. Telegram'da yangi guruh yarating (faqat siz va xodimlaringiz).",
+  "2. Guruh sozlamalari → Topics ni yoqing.",
+  "3. Botni guruhga qo'shing va admin qiling, «Manage topics» huquqi bilan.",
+  "4. Guruhda /setup yuboring.",
+  "Shundan keyin har bir mijozga jild ochiladi, oldingi yozishmalar ham o'sha jildga ko'chiriladi. " +
+    "Mijozga javob berish uchun uning jildiga yozing. Mijozlarning o'zida jild ko'rinmaydi.",
+].join("\n");
+
 export function buildComposer(assistant: Assistant, settings: Settings): Composer<Context> {
   const composer = new Composer<Context>();
 
@@ -35,7 +46,53 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
     await assistant.onBusinessMessage(ctx.api, ctx.update.business_message);
   });
 
-  // Direct messages to the bot itself. Groups and channels are ignored.
+  // The admin group: a supergroup with topics where every person gets a folder. Other groups are ignored.
+  const groups = composer.on("message").filter((ctx) => ctx.chat.type === "supergroup");
+
+  groups.command("setup", async (ctx) => {
+    if (ctx.from?.id !== settings.ownerId) return;
+    const thread = ctx.message.message_thread_id;
+    const reply = (text: string) => ctx.reply(text, thread !== undefined ? { message_thread_id: thread } : {});
+    if (!ctx.chat.is_forum) {
+      await reply(
+        "⚠️ Bu guruhda Topics yoqilmagan. Guruh sozlamalari → Topics ni yoqing, keyin /setup ni qayta yuboring.",
+      );
+      return;
+    }
+    const me = await ctx.getChatMember(ctx.me.id);
+    if (me.status !== "administrator" || !me.can_manage_topics) {
+      await reply(
+        "⚠️ Botni shu guruhga admin qiling va unga «Manage topics» (mavzularni boshqarish) huquqini bering, " +
+          "keyin /setup ni qayta yuboring.",
+      );
+      return;
+    }
+    await reply("⏳ Mijozlar uchun jildlar ochilmoqda va oldingi yozishmalar ko'chirilmoqda...");
+    const count = await assistant.setupAdminGroup(ctx.api, ctx.chat.id);
+    await reply(
+      `✅ Tayyor: ${count} ta mijoz jildi ochildi. Endi har bir mijozning xabarlari va bot javoblari o'z jildiga ` +
+        "tushadi. Mijozga javob berish uchun uning jildiga yozing.",
+    );
+  });
+
+  groups.filter(
+    (ctx) => ctx.chat.id === assistant.topics.groupId,
+    async (ctx) => {
+      // The bot's own messages never arrive; other bots, service messages and commands are not replies.
+      if (ctx.from?.is_bot || describe(ctx.message) === null || ctx.message.text?.startsWith("/")) return;
+      const result = await assistant.onTopicMessage(ctx.api, ctx.message);
+      const thread = { message_thread_id: ctx.message.message_thread_id };
+      if (result === "sent") {
+        await ctx.react("👍").catch(() => undefined);
+      } else if (result === "failed") {
+        await ctx.reply("⚠️ Xabarni mijozga yuborib bo'lmadi (u botni bloklagan bo'lishi mumkin).", thread);
+      } else if (result === "unsupported") {
+        await ctx.reply("⚠️ Business akkaunt orqali yozgan mijozga bu yerdan faqat matn yuborish mumkin.", thread);
+      }
+    },
+  );
+
+  // Direct messages to the bot itself.
   const direct = composer.on("message").filter((ctx) => ctx.chat.type === "private");
 
   direct.command("start", async (ctx) => {
@@ -57,6 +114,10 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
   owner.command("resume", async (ctx) => {
     assistant.resume();
     await ownerReply(ctx, `▶️ Bot yana ishlayapti (rejim: ${assistant.modeText()}). Pauza va limit holati tozalandi.`);
+  });
+
+  owner.command("setup", async (ctx) => {
+    await ownerReply(ctx, SETUP_GUIDE);
   });
 
   owner.command("status", async (ctx) => {

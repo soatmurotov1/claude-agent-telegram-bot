@@ -65,6 +65,15 @@ Common to both:
   list is a 📁 button per person: pressing it shows the whole conversation with them (their messages, the bot's
   replies and the admin's replies, oldest first). A very long conversation arrives as a `.txt` file.
 
+- **Admin group, a folder per person** (`/setup`): create a Telegram group for the admin and employees, turn on
+  *Topics* in its settings, add the bot as an admin with the *Manage topics* right and send `/setup` in the group.
+  Every person who wrote in the last `HISTORY_TTL_DAYS` days gets a topic ("folder") with the whole conversation
+  so far, and from then on each new message, the bot's reply and what it did go into that person's folder instead
+  of the admin's private chat (🚨 important requests are also sent to the admin privately). Anything written in a
+  person's folder is delivered to that person (to people who wrote through the business account: text only), and
+  the bot stays quiet in that chat for `OWNER_TAKEOVER_MINUTES`. A deleted folder is opened again on the next
+  message. The people who write to the bot never see these folders. `/setup` in the private chat shows these steps.
+
 Turn **Threaded Mode off** in @BotFather (Bot Settings → Threaded Mode). It is a setting for the whole bot that the
 Bot API cannot change: while it is on, Telegram shows topics ("folders") to the people who write to the bot too. The
 admin's per-person folders are the 📁 buttons above and do not need it. The bot warns about it in the log at startup.
@@ -108,6 +117,7 @@ Everything is stored in `data/` (on Railway: the volume at `/app/data`), directo
 | `seen.json` | IDs of handled messages (for duplicates) |
 | `state.json` | Pause flag and usage-limit deadline |
 | `relay.json` | Which admin copy belongs to which person (for replies) |
+| `topics.json` | The admin group and each person's folder (topic) in it |
 | `users.json` | People who wrote to the bot (name, @username, ID, counts) for the `users` list |
 
 History and previews older than `HISTORY_TTL_DAYS` are deleted. Messages from the people who write to the company

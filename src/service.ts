@@ -16,6 +16,7 @@ import {
   RelayMap,
   RuntimeState,
   SeenMessages,
+  TopicStore,
   UserDirectory,
 } from "./store.js";
 
@@ -227,6 +228,7 @@ interface RespondResult {
 }
 
 export type OwnerReplyResult = "sent" | "not_found" | "failed";
+export type TopicReplyResult = OwnerReplyResult | "unsupported";
 
 /** History namespace for people who write to the bot directly. */
 export const DIRECT_HISTORY_ID = "direct";
@@ -241,11 +243,15 @@ export class Assistant {
   readonly state: RuntimeState;
   readonly relay: RelayMap;
   readonly users: UserDirectory;
+  /** The admin group with one topic ("folder") per person. */
+  readonly topics: TopicStore;
   readonly outcomes: Outcome[] = [];
   readonly previewsFile: string;
   readonly #connections = new Map<string, BusinessConnection>();
   readonly #takeoverUntil = new Map<string, number>();
   readonly #locks = new KeyedMutex();
+  /** Serializes writes to the admin group (Telegram allows about 20 messages a minute per group). */
+  readonly #groupLock = new KeyedMutex();
   readonly #ownerAlerts = new Map<string, number>();
   readonly #directCalls = new Map<string, number[]>();
   readonly #clock: Clock;
@@ -282,6 +288,7 @@ export class Assistant {
     this.state = new RuntimeState(path.join(dir, "state.json"));
     this.relay = new RelayMap(path.join(dir, "relay.json"));
     this.users = new UserDirectory(path.join(dir, "users.json"), settings.historyTtlDays, clock);
+    this.topics = new TopicStore(path.join(dir, "topics.json"));
     this.previewsFile = path.join(dir, "previews.jsonl");
   }
 
@@ -340,6 +347,11 @@ export class Assistant {
         lang: detectLanguage(text),
       });
       this.#startTakeover(chatKey);
+      await this.#toTopic(api, chatId, chatTitle(message), connectionId, (groupId, threadId) =>
+        api.sendMessage(groupId, `🏢 ${this.settings.companyName}:\n${truncate(text, 3500)}`, {
+          message_thread_id: threadId,
+        }),
+      );
       return Outcome.owner_message;
     }
 
@@ -357,6 +369,7 @@ export class Assistant {
       language,
     };
     const result = await this.#locks.run(chatKey, () => this.#respond(api, chat));
+    await this.#mirrorToTopic(api, message, chat, result);
     return result.outcome;
   }
 
@@ -391,7 +404,8 @@ export class Assistant {
       }
       return this.#respond(api, chat);
     });
-    await this.#copyToOwner(api, message, chat, result);
+    if (this.topics.groupId !== null) await this.#mirrorToTopic(api, message, chat, result);
+    else await this.#copyToOwner(api, message, chat, result);
     return result.outcome;
   }
 
@@ -418,6 +432,11 @@ export class Assistant {
       lang: detectLanguage(text),
     });
     this.#startTakeover(HistoryStore.key(DIRECT_HISTORY_ID, chatId));
+    await this.#toTopic(api, chatId, this.#personName(chatId), DIRECT_HISTORY_ID, (groupId, threadId) =>
+      api.sendMessage(groupId, `🏢 ${this.settings.companyName}:\n${truncate(text, 3500)}`, {
+        message_thread_id: threadId,
+      }),
+    );
     log(`Delivered the owner's reply to chat ${chatId}.`);
     return "sent";
   }
@@ -494,8 +513,8 @@ export class Assistant {
       log(`Chat ${chat.chatName} (${chat.chatId}): no reply needed ([SKIP]).`);
       return result(Outcome.skipped, "", escalate);
     }
-    // In direct mode the owner already gets a copy of every chat, marked when escalated.
-    if (escalate && chat.target.kind === "business") {
+    // Without an admin group the owner already gets a copy of every direct chat, marked when escalated.
+    if (escalate && (chat.target.kind === "business" || this.topics.groupId !== null)) {
       await this.#alertEscalation(api, chat.chatKey, chat.chatName, chat.incoming);
     }
 
@@ -656,6 +675,14 @@ export class Assistant {
     const lines: string[] = [];
     if (result.escalated) lines.push("🚨 MUHIM MUROJAAT — darhol ko'rib chiqing!", "");
     lines.push(`📩 ${who.join(", ")}`, "", truncate(chat.incoming, 1500), "");
+    lines.push(...this.#resultLines(result));
+    lines.push("", "↩️ Javob yozish uchun shu xabarga Reply qiling.");
+    return lines.join("\n");
+  }
+
+  /** What the bot did with a message, for the owner's copy and the person's folder. */
+  #resultLines(result: RespondResult): string[] {
+    const lines: string[] = [];
     const reply = truncate(result.reply, 1500);
     switch (result.outcome) {
       case Outcome.sent:
@@ -682,8 +709,142 @@ export class Assistant {
       default:
         lines.push(`⚠️ Javob tayyorlanmadi${result.note ? `: ${result.note}` : ""}.`);
     }
-    lines.push("", "↩️ Javob yozish uchun shu xabarga Reply qiling.");
-    return lines.join("\n");
+    return lines;
+  }
+
+  /** Writes a person's message and what the bot did with it into their folder in the admin group. */
+  async #mirrorToTopic(api: Api, message: Message, chat: ChatContext, result: RespondResult): Promise<void> {
+    const via = chat.target.kind === "business" ? chat.target.connectionId : DIRECT_HISTORY_ID;
+    const name = topicName(chat.chatName, message.from?.username);
+    const status = [
+      ...(result.escalated ? ["🚨 MUHIM MUROJAAT — darhol ko'rib chiqing!", ""] : []),
+      ...this.#resultLines(result),
+    ];
+    // Media from the bot's own chat is copied so the admin sees it; business chats cannot be copied from.
+    if (message.text === undefined && chat.target.kind === "direct") {
+      await this.#toTopic(api, chat.chatId, name, via, (groupId, threadId) =>
+        api.copyMessage(groupId, chat.chatId, message.message_id, { message_thread_id: threadId }),
+      );
+    } else {
+      status.unshift(`👤 ${truncate(chat.incoming, 3000)}`, "");
+    }
+    await this.#toTopic(api, chat.chatId, name, via, (groupId, threadId) =>
+      api.sendMessage(groupId, status.join("\n"), { message_thread_id: threadId }),
+    );
+  }
+
+  /**
+   * Sends something into a person's topic in the admin group, creating the topic first if needed (again if the
+   * admin deleted it). Does nothing without an admin group. Never throws.
+   */
+  async #toTopic(
+    api: Api,
+    personId: number,
+    name: string,
+    via: string,
+    send: (groupId: number, threadId: number) => Promise<unknown>,
+  ): Promise<boolean> {
+    const groupId = this.topics.groupId;
+    if (groupId === null) return false;
+    return this.#groupLock.run("group", async () => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const threadId = await this.#topicFor(api, groupId, personId, name, via);
+          await withRetry(() => send(groupId, threadId));
+          return true;
+        } catch (err) {
+          if (attempt === 0 && isMissingTopic(err)) {
+            this.topics.delete(personId);
+            continue;
+          }
+          logError(`Could not write to the folder of chat ${personId}: ${errorMessage(err)}`);
+          return false;
+        }
+      }
+      return false;
+    });
+  }
+
+  async #topicFor(api: Api, groupId: number, personId: number, name: string, via: string): Promise<number> {
+    const known = this.topics.get(personId);
+    if (known) {
+      if (known.via !== via) this.topics.set(personId, { ...known, via });
+      return known.threadId;
+    }
+    const topic = await withRetry(() => api.createForumTopic(groupId, truncate(name, 120)));
+    this.topics.set(personId, { threadId: topic.message_thread_id, via });
+    log(`Created the folder of chat ${personId} in the admin group.`);
+    return topic.message_thread_id;
+  }
+
+  #personName(personId: number): string {
+    const user = this.users.list().find((known) => known.id === personId);
+    return user ? topicName(user.name, user.username) : String(personId);
+  }
+
+  /**
+   * The owner ran /setup in a supergroup with topics: it becomes the admin group. Every person who wrote in the
+   * last HISTORY_TTL_DAYS days gets a folder there with the whole conversation so far. Returns how many.
+   */
+  async setupAdminGroup(api: Api, groupId: number): Promise<number> {
+    this.topics.setGroup(groupId);
+    let created = 0;
+    // Oldest first, so the most recently active people end up on top of the topic list.
+    for (const user of this.users.list().reverse()) {
+      if (this.topics.get(user.id)) continue;
+      const via = this.transcripts.latestSource(user.id) ?? DIRECT_HISTORY_ID;
+      const name = topicName(user.name, user.username);
+      for (const text of this.#folderMessages(user.id, this.transcripts.forChat(user.id))) {
+        const ok = await this.#toTopic(api, user.id, name, via, (gid, threadId) =>
+          api.sendMessage(gid, text, { parse_mode: "HTML", message_thread_id: threadId }),
+        );
+        if (!ok) break;
+      }
+      if (this.topics.get(user.id)) created++;
+    }
+    log(`Admin group ${groupId} set up: ${created} folder(s) created.`);
+    return created;
+  }
+
+  /**
+   * Someone wrote in a person's topic in the admin group: deliver it to that person and keep the bot quiet in
+   * that chat for OWNER_TAKEOVER_MINUTES.
+   */
+  async onTopicMessage(api: Api, message: Message): Promise<TopicReplyResult> {
+    const threadId = message.message_thread_id;
+    if (!message.is_topic_message || threadId === undefined) return "not_found";
+    const found = this.topics.personByThread(threadId);
+    if (!found) return "not_found";
+    const { personId, topic } = found;
+    try {
+      if (topic.via === DIRECT_HISTORY_ID) {
+        await api.copyMessage(personId, message.chat.id, message.message_id);
+      } else {
+        // The business account can only be answered with text from here.
+        if (message.text === undefined) return "unsupported";
+        const reason = await this.#connectionProblem(api, topic.via);
+        if (reason) {
+          logError(`Not sending the admin's reply to chat ${personId}: ${reason}.`);
+          return "failed";
+        }
+        for (const chunk of splitMessage(message.text)) {
+          await api.sendMessage(personId, chunk, { business_connection_id: topic.via });
+        }
+      }
+    } catch (err) {
+      logError(`Could not deliver the admin's reply to chat ${personId}: ${errorMessage(err)}`);
+      return "failed";
+    }
+    const text = describe(message) ?? "[message]";
+    this.#remember(topic.via, personId, {
+      role: "owner",
+      name: this.settings.companyName,
+      text,
+      lang: detectLanguage(text),
+    });
+    this.#startTakeover(HistoryStore.key(topic.via, personId));
+    log(`Delivered the admin's reply from the folder to chat ${personId}.`);
+    return "sent";
   }
 
   #showPreview(preview: Preview): void {
@@ -760,17 +921,41 @@ export class Assistant {
   userFolder(userId: number): UserFolder {
     const user = this.users.list().find((known) => known.id === userId);
     const title = user ? `${user.name}${user.username ? ` @${user.username}` : ""}, ID ${userId}` : `ID ${userId}`;
+    const topic = this.topics.get(userId);
+    if (topic && this.topics.groupId !== null) {
+      const link = topicLink(this.topics.groupId, topic.threadId);
+      return { kind: "messages", messages: [`📁 <a href="${link}">${escapeHtml(title)} — jildni ochish</a>`] };
+    }
     const items = this.transcripts.forChat(userId);
     if (items.length === 0) {
       return { kind: "messages", messages: [`📁 ${escapeHtml(title)}\n\nBu mijoz bilan yozishma topilmadi.`] };
     }
+    const messages = this.#folderMessages(userId, items);
+    if (messages.length <= FOLDER_MAX_MESSAGES) return { kind: "messages", messages };
 
     const header = `📁 ${title} — ${items.length} ta xabar`;
-    const entries = items.map((item) => {
+    const entries = this.#folderEntries(items);
+    const content = [header, "", ...entries.map((entry) => `${entry.who}\n${entry.text}\n`)].join("\n");
+    return {
+      kind: "file",
+      caption: `${header}. Yozishma uzun, shuning uchun fayl qilib yuborildi.`,
+      fileName: `yozishma-${userId}.txt`,
+      content,
+    };
+  }
+
+  #folderEntries(items: HistoryItem[]): { who: string; text: string }[] {
+    return items.map((item) => {
       const who = item.role === "other" ? `👤 ${item.name}` : `🏢 ${this.settings.companyName}`;
       return { who: `${who} · ${tashkentTime(item.ts)}`, text: item.text };
     });
+  }
 
+  /** The conversation as HTML messages under Telegram's length limit. */
+  #folderMessages(userId: number, items: HistoryItem[]): string[] {
+    if (items.length === 0) return ["📁 Bu mijoz bilan yozishma hali yo'q."];
+    const header = `📁 ${this.#personName(userId)} — ${items.length} ta xabar`;
+    const entries = this.#folderEntries(items);
     const messages: string[] = [];
     let current = `<b>${escapeHtml(header)}</b>\n`;
     for (const entry of entries) {
@@ -782,15 +967,7 @@ export class Assistant {
       current += block;
     }
     messages.push(current);
-    if (messages.length <= FOLDER_MAX_MESSAGES) return { kind: "messages", messages };
-
-    const content = [header, "", ...entries.map((entry) => `${entry.who}\n${entry.text}\n`)].join("\n");
-    return {
-      kind: "file",
-      caption: `${header}. Yozishma uzun, shuning uchun fayl qilib yuborildi.`,
-      fileName: `yozishma-${userId}.txt`,
-      content,
-    };
+    return messages;
   }
 
   pause(): void {
@@ -823,6 +1000,7 @@ export class Assistant {
       `Claude usage limit: ${limit}`,
       `Chats in history: ${this.history.chatCount()}`,
       `Data directory: ${this.settings.dataDir}`,
+      `Admin group: ${this.topics.groupId ?? "not set (/setup)"}`,
       `History is kept for ${this.settings.historyTtlDays} days`,
     ].join("\n");
   }
@@ -848,6 +1026,7 @@ export class Assistant {
       "• Murojaatchiga o'zingiz javob yozish uchun o'sha xabarga Reply qiling — javobingiz unga yuboriladi.",
       `• Siz javob bergan chatda bot ${s.ownerTakeoverMinutes} daqiqa jim turadi.`,
       "• «users» tugmasi mijozlar ro'yxatini ko'rsatadi: mijozning 📁 tugmasini bossangiz, u bilan butun yozishma ochiladi.",
+      "• Har bir mijoz uchun alohida jild kerak bo'lsa: /setup — admin guruhini qanday ochish.",
       `• «users» tugmasi mijozlar ro'yxatini ko'rsatadi; mijozning 📁 tugmasini bossangiz, u bilan butun yozishma ochiladi.`,
       "• Sinab ko'rish uchun botga boshqa akkauntdan yozing: sizning o'z xabarlaringizga bot javob bermaydi.",
       "",
@@ -915,6 +1094,32 @@ export function buildAssistant(
   opts: AssistantOptions & { generator?: ReplyGenerator } = {},
 ): Assistant {
   return new Assistant(settings, opts.generator ?? makeClaudeCli(settings), opts);
+}
+
+function topicName(name: string, username?: string): string {
+  return username ? `${name} @${username}` : name;
+}
+
+/** t.me link to a topic of a supergroup (-100… chat IDs). */
+function topicLink(groupId: number, threadId: number): string {
+  return `https://t.me/c/${String(groupId).replace(/^-100/, "")}/${threadId}`;
+}
+
+function isMissingTopic(err: unknown): boolean {
+  return err instanceof GrammyError && /thread not found|TOPIC_DELETED|TOPIC_ID_INVALID/i.test(err.description);
+}
+
+/** Retries a Bot API call after Telegram's 429 "Too Many Requests" wait (at most 3 tries). */
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const wait = err instanceof GrammyError && err.error_code === 429 ? err.parameters.retry_after : undefined;
+      if (wait === undefined || attempt >= 3) throw err;
+      await new Promise((resolve) => setTimeout(resolve, (wait + 1) * 1000));
+    }
+  }
 }
 
 function escapeHtml(text: string): string {

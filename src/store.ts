@@ -127,6 +127,18 @@ export class HistoryStore {
       .sort((a, b) => a.ts - b.ts);
   }
 
+  /** The connection ID ("direct" or a business connection) this chat last wrote through, or null. */
+  latestSource(chatId: number): string | null {
+    const suffix = `:${chatId}`;
+    let best: { source: string; ts: number } | null = null;
+    for (const [key, items] of Object.entries(this.#data)) {
+      const last = items.at(-1);
+      if (!key.endsWith(suffix) || !last) continue;
+      if (!best || last.ts > best.ts) best = { source: key.slice(0, -suffix.length), ts: last.ts };
+    }
+    return best?.source ?? null;
+  }
+
   chatCount(): number {
     if (this.#prune()) this.#file.write(this.#data);
     return Object.keys(this.#data).length;
@@ -349,5 +361,69 @@ export class UserDirectory {
 
   #save(): void {
     this.#file.write([...this.#users.values()]);
+  }
+}
+
+/** A person's topic ("folder") in the admin group. `via` is where replies go: "direct" or a business connection ID. */
+export interface PersonTopic {
+  threadId: number;
+  via: string;
+}
+
+interface TopicData {
+  groupId: number | null;
+  people: Record<string, PersonTopic>;
+}
+
+/** The admin group (a supergroup with topics) and the topic of every person in it. */
+export class TopicStore {
+  readonly #file: JsonFile<TopicData>;
+  #data: TopicData;
+
+  constructor(file: string) {
+    this.#file = new JsonFile<TopicData>(file, () => ({ groupId: null, people: {} }), (value) => {
+      if (!isRecord(value)) return null;
+      const people: Record<string, PersonTopic> = {};
+      if (isRecord(value.people)) {
+        for (const [id, topic] of Object.entries(value.people)) {
+          if (isRecord(topic) && typeof topic.threadId === "number" && typeof topic.via === "string") {
+            people[id] = { threadId: topic.threadId, via: topic.via };
+          }
+        }
+      }
+      return { groupId: typeof value.groupId === "number" ? value.groupId : null, people };
+    });
+    this.#data = this.#file.read();
+  }
+
+  get groupId(): number | null {
+    return this.#data.groupId;
+  }
+
+  /** Switches to another admin group; topics of the old group are forgotten. */
+  setGroup(groupId: number): void {
+    this.#data = { groupId, people: groupId === this.#data.groupId ? this.#data.people : {} };
+    this.#file.write(this.#data);
+  }
+
+  get(personId: number): PersonTopic | undefined {
+    return this.#data.people[String(personId)];
+  }
+
+  set(personId: number, topic: PersonTopic): void {
+    this.#data.people[String(personId)] = topic;
+    this.#file.write(this.#data);
+  }
+
+  delete(personId: number): void {
+    delete this.#data.people[String(personId)];
+    this.#file.write(this.#data);
+  }
+
+  personByThread(threadId: number): { personId: number; topic: PersonTopic } | undefined {
+    for (const [id, topic] of Object.entries(this.#data.people)) {
+      if (topic.threadId === threadId) return { personId: Number(id), topic };
+    }
+    return undefined;
   }
 }
