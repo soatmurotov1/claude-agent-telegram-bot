@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ClaudeTimeout } from "../src/claudeCli.js";
-import { DIRECT_HISTORY_ID, DIRECT_HOURLY_LIMIT, Outcome } from "../src/service.js";
+import { DIRECT_HISTORY_ID, DIRECT_HOURLY_LIMIT, Outcome, replyKeyboard } from "../src/service.js";
 import { OWNER_KEYBOARD, USERS_BUTTON } from "../src/handlers.js";
 import { cleanupHarnesses, makeHarness, OWNER_ID } from "./helpers.js";
 
@@ -10,18 +10,24 @@ const PERSON = 4444;
 
 afterEach(() => cleanupHarnesses());
 
-function ownerCopies(h: ReturnType<typeof makeHarness>) {
+function ownerSends(h: ReturnType<typeof makeHarness>) {
   return h.api.byMethod("sendMessage").filter((call) => call.payload.chat_id === OWNER_ID);
 }
 
-/** The fake API numbers sent messages from 5000; finds the owner's copy that points to this chat. */
-function relayIdFor(h: ReturnType<typeof makeHarness>, chatId: number): number | undefined {
-  for (let id = 5000; id < 5100; id++) if (h.assistant.relay.get(id) === chatId) return id;
-  return undefined;
+function press(h: ReturnType<typeof makeHarness>, data: string, fromId = OWNER_ID) {
+  return h.send({
+    update_id: 800_000 + Math.floor(Math.random() * 100_000),
+    callback_query: {
+      id: "cb",
+      chat_instance: "ci",
+      from: { id: fromId, is_bot: false, first_name: "User" },
+      data,
+    },
+  } as never);
 }
 
 describe("people writing to the bot directly", () => {
-  it("preview mode: nothing goes to the person, the owner gets the message and the draft", async () => {
+  it("preview mode: nothing goes to the person and nothing to the owner", async () => {
     const h = makeHarness();
     h.generator.push("Murojaatingiz qabul qilindi.");
     await h.send(h.directMessage("Salom, ish vaqtingiz qanday?", { fromId: PERSON }));
@@ -29,27 +35,20 @@ describe("people writing to the bot directly", () => {
     expect(h.lastOutcome()).toBe(Outcome.previewed);
     expect(h.generator.calls).toHaveLength(1);
     expect(h.generator.calls[0]?.user).toContain("Salom, ish vaqtingiz qanday?");
-    const sends = h.api.byMethod("sendMessage");
-    expect(sends.map((call) => call.payload.chat_id)).toEqual([OWNER_ID]);
-    const text = String(sends[0]?.payload.text);
-    expect(text).toContain("Salom, ish vaqtingiz qanday?");
-    expect(text).toContain("@user4444");
-    expect(text).toContain("PREVIEW");
-    expect(text).toContain("Murojaatingiz qabul qilindi.");
-    expect(text).toContain("Reply");
+    expect(h.api.byMethod("sendMessage")).toHaveLength(0);
+    expect(h.previews[0]?.reply).toBe("Murojaatingiz qabul qilindi.");
   });
 
-  it("auto-send: replies to the person without business_connection_id and copies to the owner", async () => {
+  it("auto-send: replies to the person and sends the owner no copy", async () => {
     const h = makeHarness({ AUTO_SEND: "true" });
     h.generator.push("Assalomu alaykum! Murojaatingiz qabul qilindi.");
     await h.send(h.directMessage("Gidrogeologik xulosa kerak", { fromId: PERSON }));
 
     expect(h.lastOutcome()).toBe(Outcome.sent);
     const sends = h.api.byMethod("sendMessage");
+    expect(sends).toHaveLength(1);
     expect(sends[0]?.payload).toMatchObject({ chat_id: PERSON, text: "Assalomu alaykum! Murojaatingiz qabul qilindi." });
     expect(sends[0]?.payload.business_connection_id).toBeUndefined();
-    expect(sends[1]?.payload.chat_id).toBe(OWNER_ID);
-    expect(String(sends[1]?.payload.text)).toContain("yuborildi");
     expect(h.api.byMethod("getBusinessConnection")).toHaveLength(0);
     expect(h.assistant.history.get(DIRECT_HISTORY_ID, PERSON).map((item) => item.role)).toEqual(["other", "owner"]);
   });
@@ -65,52 +64,93 @@ describe("people writing to the bot directly", () => {
     expect(last).not.toContain("Boshqa odam");
   });
 
-  it("the owner answers by replying to the copy; the bot then stays quiet in that chat", async () => {
+  it("the owner answers with ✍️: text, photos and files go to the person; the bot then stays quiet", async () => {
     const h = makeHarness({ AUTO_SEND: "true" });
     await h.send(h.directMessage("Narxi qancha?", { fromId: PERSON }));
-    const relayId = relayIdFor(h, PERSON);
-    expect(relayId).toBeDefined();
-
     h.api.clear();
-    await h.send(h.directMessage("Narx 1 mln so'm", { fromId: OWNER_ID, replyTo: relayId }));
+
+    await press(h, `reply:${PERSON}`);
+    expect(String(ownerSends(h)[0]?.payload.text)).toContain("javobingizni yozing");
+    h.api.clear();
+
+    await h.send(h.directMessage("Narx 1 mln so'm", { fromId: OWNER_ID }));
+    await h.send(h.directMessage(null, { fromId: OWNER_ID, extra: { photo: [{ file_id: "p" }], caption: "Shartnoma" } }));
     const copies = h.api.byMethod("copyMessage");
-    expect(copies).toHaveLength(1);
+    expect(copies).toHaveLength(2);
     expect(copies[0]?.payload).toMatchObject({ chat_id: PERSON, from_chat_id: OWNER_ID });
-    expect(String(h.api.byMethod("sendMessage")[0]?.payload.text)).toContain("yuborildi");
+    expect(String(ownerSends(h)[0]?.payload.text)).toContain("yuborildi");
 
     h.api.clear();
     await h.send(h.directMessage("Rahmat, yana savol bor", { fromId: PERSON }));
     expect(h.lastOutcome()).toBe(Outcome.owner_active);
-    expect(h.api.byMethod("sendMessage").map((call) => call.payload.chat_id)).toEqual([OWNER_ID]);
-    expect(h.generator.calls.at(-1)?.user).not.toContain("Rahmat, yana savol bor");
+    expect(h.api.byMethod("sendMessage")).toHaveLength(0);
 
     h.clock.advance(15 * 60 + 1);
     await h.send(h.directMessage("Yana bir savol", { fromId: PERSON }));
     expect(h.lastOutcome()).toBe(Outcome.sent);
-    expect(h.generator.calls.at(-1)?.user).toContain("[Company]: Narx 1 mln so'm");
+    const user = h.generator.calls.at(-1)?.user ?? "";
+    expect(user).toContain("[Company]: Narx 1 mln so'm");
+    expect(user).toContain("[Company]: [photo] Shartnoma");
   });
 
-  it("tells the owner how to answer when the message is not a reply, and never calls Claude", async () => {
+  it("✖️ ends reply mode, and it also closes by itself", async () => {
+    const h = makeHarness();
+    await h.send(h.directMessage("Salom", { fromId: PERSON }));
+    await press(h, `reply:${PERSON}`);
+    await press(h, "reply-done");
+    h.api.clear();
+    await h.send(h.directMessage("Bu hech kimga bormaydi", { fromId: OWNER_ID }));
+    expect(h.api.byMethod("copyMessage")).toHaveLength(0);
+    expect(String(ownerSends(h)[0]?.payload.text)).toContain("Javob yozish");
+
+    await press(h, `reply:${PERSON}`);
+    h.clock.advance(16 * 60);
+    h.api.clear();
+    await h.send(h.directMessage("Kech qoldi", { fromId: OWNER_ID }));
+    expect(h.api.byMethod("copyMessage")).toHaveLength(0);
+  });
+
+  it("answers people who wrote through the business account via that account, text only", async () => {
+    const h = makeHarness();
+    await h.connect();
+    await h.send(h.businessMessage("Business savol", { fromId: PERSON, chatId: PERSON }));
+    await press(h, `reply:${PERSON}`);
+    h.api.clear();
+    await h.send(h.directMessage("Javobimiz", { fromId: OWNER_ID }));
+    const toPerson = h.api.byMethod("sendMessage").find((call) => call.payload.chat_id === PERSON);
+    expect(toPerson?.payload).toMatchObject({ text: "Javobimiz", business_connection_id: "conn-1" });
+
+    h.api.clear();
+    await h.send(h.directMessage(null, { fromId: OWNER_ID, extra: { photo: [{ file_id: "p" }] } }));
+    expect(h.api.byMethod("copyMessage")).toHaveLength(0);
+    expect(String(ownerSends(h)[0]?.payload.text)).toContain("faqat matn");
+  });
+
+  it("only the owner can press ✍️", async () => {
+    const h = makeHarness();
+    await press(h, `reply:${PERSON}`, 5555);
+    await h.send(h.directMessage("Salom", { fromId: OWNER_ID }));
+    expect(h.api.byMethod("copyMessage")).toHaveLength(0);
+  });
+
+  it("tells the owner how to answer and never calls Claude for the owner", async () => {
     const h = makeHarness();
     await h.send(h.directMessage("Salom, test", { fromId: OWNER_ID }));
-    await h.send(h.directMessage("Javob", { fromId: OWNER_ID, replyTo: 999_999 }));
     expect(h.generator.calls).toHaveLength(0);
-    const texts = h.api.byMethod("sendMessage").map((call) => String(call.payload.text));
-    expect(texts).toHaveLength(2);
-    for (const text of texts) expect(text).toContain("Reply");
+    expect(String(ownerSends(h)[0]?.payload.text)).toContain("✍️ Javob yozish");
   });
 
   it("reports when the owner's reply cannot be delivered", async () => {
     const h = makeHarness();
     await h.send(h.directMessage("Salom", { fromId: PERSON }));
-    const relayId = relayIdFor(h, PERSON);
+    await press(h, `reply:${PERSON}`);
     h.api.failCopy = true;
     h.api.clear();
-    await h.send(h.directMessage("Javob", { fromId: OWNER_ID, replyTo: relayId }));
-    expect(String(h.api.byMethod("sendMessage")[0]?.payload.text)).toContain("yuborib bo'lmadi");
+    await h.send(h.directMessage("Javob", { fromId: OWNER_ID }));
+    expect(String(ownerSends(h)[0]?.payload.text)).toContain("yuborib bo'lmadi");
   });
 
-  it("forwards media to the owner before the summary", async () => {
+  it("passes files and photos on to the owner with a reply button", async () => {
     const h = makeHarness();
     await h.send(
       h.directMessage(null, {
@@ -120,29 +160,27 @@ describe("people writing to the bot directly", () => {
     );
     expect(h.api.calls.map((call) => call.method)).toEqual(["forwardMessage", "sendMessage"]);
     expect(h.api.calls[0]?.payload).toMatchObject({ chat_id: OWNER_ID, from_chat_id: PERSON });
-    expect(String(h.api.calls[1]?.payload.text)).toContain("[document] ariza.pdf Arizam");
+    expect(h.api.calls[1]?.payload.reply_markup).toEqual(replyKeyboard(PERSON));
   });
 
-  it("marks escalations in the owner's copy and sends no separate alert", async () => {
+  it("alerts the owner about escalations, with a reply button", async () => {
     const h = makeHarness();
     h.generator.push("[ESCALATE] Darhol 104 ga qo'ng'iroq qiling.");
     await h.send(h.directMessage("Gaz hidi kelyapti!", { fromId: PERSON }));
-    const sends = h.api.byMethod("sendMessage");
+    const sends = ownerSends(h);
     expect(sends).toHaveLength(1);
-    const text = String(sends[0]?.payload.text);
-    expect(text).toContain("🚨");
-    expect(text).toContain("Darhol 104 ga qo'ng'iroq qiling.");
-    expect(text).not.toContain("[ESCALATE]");
+    expect(String(sends[0]?.payload.text)).toContain("🚨");
+    expect(String(sends[0]?.payload.text)).toContain("Gaz hidi kelyapti!");
+    expect(sends[0]?.payload.reply_markup).toEqual(replyKeyboard(PERSON));
   });
 
-  it("does not call Claude more than the hourly limit per person, but still copies to the owner", async () => {
+  it("does not call Claude more than the hourly limit per person", async () => {
     const h = makeHarness();
     for (let i = 0; i <= DIRECT_HOURLY_LIMIT; i++) {
       await h.send(h.directMessage(`Savol ${i}`, { fromId: PERSON }));
     }
     expect(h.generator.calls).toHaveLength(DIRECT_HOURLY_LIMIT);
     expect(h.lastOutcome()).toBe(Outcome.throttled);
-    expect(String(ownerCopies(h).at(-1)?.payload.text)).toContain("ko'p xabar");
     h.clock.advance(3601);
     await h.send(h.directMessage("Yangi soat", { fromId: PERSON }));
     expect(h.lastOutcome()).toBe(Outcome.previewed);
@@ -160,14 +198,14 @@ describe("people writing to the bot directly", () => {
     expect(h.generator.calls).toHaveLength(1);
   });
 
-  it("respects /pause and reports Claude errors only in the owner's copy", async () => {
+  it("respects /pause and alerts the owner about Claude errors in auto-send mode", async () => {
     const h = makeHarness({ AUTO_SEND: "true" });
     await h.send(h.directMessage("/pause"));
     h.api.clear();
     await h.send(h.directMessage("Salom", { fromId: PERSON }));
     expect(h.lastOutcome()).toBe(Outcome.paused);
     expect(h.generator.calls).toHaveLength(0);
-    expect(String(ownerCopies(h)[0]?.payload.text)).toContain("pauzada");
+    expect(h.api.byMethod("sendMessage")).toHaveLength(0);
 
     await h.send(h.directMessage("/resume"));
     h.api.clear();
@@ -176,7 +214,7 @@ describe("people writing to the bot directly", () => {
     expect(h.lastOutcome()).toBe(Outcome.error);
     const sends = h.api.byMethod("sendMessage");
     expect(sends.map((call) => call.payload.chat_id)).toEqual([OWNER_ID]);
-    expect(String(sends[0]?.payload.text)).toContain("Javob tayyorlanmadi");
+    expect(String(sends[0]?.payload.text)).toContain("javob tayyorlay olmadi");
   });
 
   it("/start greets people without calling Claude", async () => {
@@ -312,6 +350,7 @@ describe("owner user folders", () => {
       expect(text).toContain(part);
     }
     expect(text.indexOf("Savol 1")).toBeLessThan(text.indexOf("Javob 1"));
+    expect(sends[0]?.payload.reply_markup).toEqual(replyKeyboard(PERSON));
     expect(text).not.toContain("Boshqa odam");
   });
 

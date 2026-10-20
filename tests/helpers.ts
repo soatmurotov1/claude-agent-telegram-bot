@@ -39,11 +39,6 @@ export class RecordingApi {
     const transformer: Transformer = async (_prev, method, payload) => {
       const record: Record<string, unknown> = { ...payload };
       this.calls.push({ method, payload: record });
-      if (this.failOnce && this.failOnce.method === method) {
-        const { description } = this.failOnce;
-        this.failOnce = null;
-        return { ok: false, error_code: 400, description } as never;
-      }
       return this.#respond(method, record) as never;
     };
     bot.api.config.use(transformer);
@@ -74,12 +69,6 @@ export class RecordingApi {
       };
       return { ok: true, result: message };
     }
-    if (method === "createForumTopic") {
-      return { ok: true, result: { message_thread_id: this.#nextMessageId++, name: payload.name, icon_color: 1 } };
-    }
-    if (method === "getChatMember") {
-      return { ok: true, result: { status: "administrator", user: { id: payload.user_id }, can_manage_topics: true } };
-    }
     if (method === "copyMessage") {
       if (this.failCopy) return { ok: false, error_code: 403, description: "Forbidden: bot was blocked by the user" };
       return { ok: true, result: { message_id: this.#nextMessageId++ } };
@@ -88,8 +77,6 @@ export class RecordingApi {
   }
 
   failCopy = false;
-  /** The next call of this method fails with this description. */
-  failOnce: { method: string; description: string } | null = null;
 
   byMethod(method: string): ApiCall[] {
     return this.calls.filter((call) => call.method === method);

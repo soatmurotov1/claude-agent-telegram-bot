@@ -257,41 +257,6 @@ export function pruneJsonl(file: string, ttlDays: number, clock: Clock): number 
   return removed;
 }
 
-/**
- * Maps the IDs of messages the bot sent to the owner (copies of people's chats) to the chat they came from,
- * so the owner can answer a person by replying to that copy. Persisted and capped.
- */
-export class RelayMap {
-  readonly #file: JsonFile<[number, number][]>;
-  readonly #map: Map<number, number>;
-
-  constructor(file: string, private readonly capacity = 5000) {
-    this.#file = new JsonFile<[number, number][]>(file, () => [], (value) =>
-      Array.isArray(value)
-        ? value.filter(
-            (entry): entry is [number, number] =>
-              Array.isArray(entry) && typeof entry[0] === "number" && typeof entry[1] === "number",
-          )
-        : null,
-    );
-    this.#map = new Map(this.#file.read());
-  }
-
-  get(ownerMessageId: number): number | undefined {
-    return this.#map.get(ownerMessageId);
-  }
-
-  set(ownerMessageId: number, chatId: number): void {
-    this.#map.set(ownerMessageId, chatId);
-    while (this.#map.size > this.capacity) {
-      const oldest = this.#map.keys().next();
-      if (oldest.done) break;
-      this.#map.delete(oldest.value);
-    }
-    this.#file.write([...this.#map.entries()]);
-  }
-}
-
 export interface KnownUser {
   id: number;
   name: string;
@@ -361,69 +326,5 @@ export class UserDirectory {
 
   #save(): void {
     this.#file.write([...this.#users.values()]);
-  }
-}
-
-/** A person's topic ("folder") in the admin group. `via` is where replies go: "direct" or a business connection ID. */
-export interface PersonTopic {
-  threadId: number;
-  via: string;
-}
-
-interface TopicData {
-  groupId: number | null;
-  people: Record<string, PersonTopic>;
-}
-
-/** The admin group (a supergroup with topics) and the topic of every person in it. */
-export class TopicStore {
-  readonly #file: JsonFile<TopicData>;
-  #data: TopicData;
-
-  constructor(file: string) {
-    this.#file = new JsonFile<TopicData>(file, () => ({ groupId: null, people: {} }), (value) => {
-      if (!isRecord(value)) return null;
-      const people: Record<string, PersonTopic> = {};
-      if (isRecord(value.people)) {
-        for (const [id, topic] of Object.entries(value.people)) {
-          if (isRecord(topic) && typeof topic.threadId === "number" && typeof topic.via === "string") {
-            people[id] = { threadId: topic.threadId, via: topic.via };
-          }
-        }
-      }
-      return { groupId: typeof value.groupId === "number" ? value.groupId : null, people };
-    });
-    this.#data = this.#file.read();
-  }
-
-  get groupId(): number | null {
-    return this.#data.groupId;
-  }
-
-  /** Switches to another admin group; topics of the old group are forgotten. */
-  setGroup(groupId: number): void {
-    this.#data = { groupId, people: groupId === this.#data.groupId ? this.#data.people : {} };
-    this.#file.write(this.#data);
-  }
-
-  get(personId: number): PersonTopic | undefined {
-    return this.#data.people[String(personId)];
-  }
-
-  set(personId: number, topic: PersonTopic): void {
-    this.#data.people[String(personId)] = topic;
-    this.#file.write(this.#data);
-  }
-
-  delete(personId: number): void {
-    delete this.#data.people[String(personId)];
-    this.#file.write(this.#data);
-  }
-
-  personByThread(threadId: number): { personId: number; topic: PersonTopic } | undefined {
-    for (const [id, topic] of Object.entries(this.#data.people)) {
-      if (topic.threadId === threadId) return { personId: Number(id), topic };
-    }
-    return undefined;
   }
 }

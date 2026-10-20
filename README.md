@@ -12,10 +12,10 @@ Replies are written by the **Claude Code CLI** (`claude -p`) installed next to t
 The bot works in two ways at the same time:
 
 - **Direct chats (no Telegram Premium needed).** Anyone who writes to the bot itself gets a reply prepared from
-  `company.md`. **Every such chat is copied to the admin** (`OWNER_ID`): the person's message plus what the bot
-  answered (or why it did not). Media is forwarded. The admin answers a person by **replying** to that copy; the bot
-  delivers the answer and stays silent in that chat for `OWNER_TAKEOVER_MINUTES`. At most
-  20 Claude calls per person per hour, to protect the subscription limit.
+  `company.md`. The admin (`OWNER_ID`) is **not** sent every message: only 🚨 important requests and the files,
+  photos and voice messages people send (forwarded, as `company.md` promises them). The admin reads a conversation
+  and answers it from the `users` button (see below); the bot then stays silent in that chat for
+  `OWNER_TAKEOVER_MINUTES`. At most 20 Claude calls per person per hour, to protect the subscription limit.
 - **Telegram Business (optional, needs Premium).** The bot can also be connected to the company's account through
   Telegram Business → **Chatbots** and then answers the chats of that account.
 
@@ -47,13 +47,13 @@ Common to both:
 | Subscription usage limit | No Claude calls until the reset time (or `LIMIT_COOLDOWN_MINUTES`); kept across restarts; owner is told in auto-send mode |
 | Timeout or login error | Nothing is sent to the chat; owner is told in auto-send mode (at most every 10 minutes) |
 | Claude answers `[SKIP]` | Nothing is shown or sent ("thanks", "ok", stickers) |
-| Claude answers `[ESCALATE] …` | Owner gets an alert; the reply itself follows the normal preview/auto-send path |
+| Claude answers `[ESCALATE] …` | Owner gets an alert with a ✍️ reply button; the reply itself follows the normal preview/auto-send path |
 | Before an auto-send | Pause/limit/takeover are checked again, and the connection is re-read from Telegram (owner, enabled, reply right) |
 | History retention | Messages and previews older than `HISTORY_TTL_DAYS` (default 30) are deleted |
-| Someone writes to the bot directly | Claude answers from `company.md` (sent only with `AUTO_SEND=true`); the admin always gets a copy |
-| Admin replies to a copy | The answer is delivered to that person; the bot is silent there for `OWNER_TAKEOVER_MINUTES` |
-| More than 20 messages per hour from one person | Claude is not called; the admin still gets the copies |
-| Admin writes to the bot without replying to a copy | Short hint; Claude is never called for the admin's own messages |
+| Someone writes to the bot directly | Claude answers from `company.md` (sent only with `AUTO_SEND=true`); the admin gets no copy (files and photos are forwarded) |
+| Admin writes after pressing ✍️ | Text, photo, file or voice goes to that person; the bot is silent there for `OWNER_TAKEOVER_MINUTES` |
+| More than 20 messages per hour from one person | Claude is not called |
+| Admin writes without pressing ✍️ | Short hint; Claude is never called for the admin's own messages |
 | Groups, channels, other people's `/pause` `/status` | Ignored |
 
 ### Owner commands (private chat with the bot, from the `OWNER_ID` account)
@@ -63,20 +63,16 @@ Common to both:
 - **`users` button** (persistent keyboard, owner only; also `/users`): lists everyone who wrote to the bot in the
   last `HISTORY_TTL_DAYS` days, newest first, with @username, ID, message count and last message time. Under the
   list is a 📁 button per person: pressing it shows the whole conversation with them (their messages, the bot's
-  replies and the admin's replies, oldest first). A very long conversation arrives as a `.txt` file.
-
-- **Admin group, a folder per person** (`/setup`): create a Telegram group for the admin and employees, turn on
-  *Topics* in its settings, add the bot as an admin with the *Manage topics* right and send `/setup` in the group.
-  Every person who wrote in the last `HISTORY_TTL_DAYS` days gets a topic ("folder") with the whole conversation
-  so far, and from then on each new message, the bot's reply and what it did go into that person's folder instead
-  of the admin's private chat (🚨 important requests are also sent to the admin privately). Anything written in a
-  person's folder is delivered to that person (to people who wrote through the business account: text only), and
-  the bot stays quiet in that chat for `OWNER_TAKEOVER_MINUTES`. A deleted folder is opened again on the next
-  message. The people who write to the bot never see these folders. `/setup` in the private chat shows these steps.
+  replies and the admin's replies, oldest first; a very long one arrives as a `.txt` file) and a **✍️ Javob yozish**
+  button under it.
+- **Answering a person:** press ✍️ (under the conversation, a 🚨 alert or a forwarded file), then send the answer —
+  text, photo, file, voice, anything. Everything sent goes to that person until **✖️ Tugatish** (or `/cancel`) is
+  pressed or `REPLY_MODE_MINUTES` (15) pass without a message. People who wrote through the business account are
+  answered through it, text only.
 
 Turn **Threaded Mode off** in @BotFather (Bot Settings → Threaded Mode). It is a setting for the whole bot that the
-Bot API cannot change: while it is on, Telegram shows topics ("folders") to the people who write to the bot too. The
-admin's per-person folders are the 📁 buttons above and do not need it. The bot warns about it in the log at startup.
+Bot API cannot change: while it is on, Telegram shows topics ("folders") to the people who write to the bot. The bot
+warns about it in the log at startup.
 
 Anyone else who sends `/start` gets a short Uzbek welcome asking them to write their question (Claude is not
 called for `/start`).
@@ -116,8 +112,6 @@ Everything is stored in `data/` (on Railway: the volume at `/app/data`), directo
 | `previews.jsonl` | Replies prepared in preview mode (or not sent) |
 | `seen.json` | IDs of handled messages (for duplicates) |
 | `state.json` | Pause flag and usage-limit deadline |
-| `relay.json` | Which admin copy belongs to which person (for replies) |
-| `topics.json` | The admin group and each person's folder (topic) in it |
 | `users.json` | People who wrote to the bot (name, @username, ID, counts) for the `users` list |
 
 History and previews older than `HISTORY_TTL_DAYS` are deleted. Messages from the people who write to the company
@@ -151,8 +145,8 @@ personal-data requirements, before you connect the bot.
 7. **Logs** should show `Bot @… is running`, `Mode: PREVIEW` and
    `Claude auth: subscription token from environment variables`. Red lines in Railway are just stderr, not errors.
 8. From the admin account (`OWNER_ID`) send `/start` to the bot. Test from **another** account by writing to the
-   bot: the admin gets a copy with the draft reply. After the replies have been checked for a few days, set
-   `AUTO_SEND=true`; then people get the answers.
+   bot. In `PREVIEW` mode the drafts are only in the Railway log and `previews.jsonl`, and people get no answer;
+   after the drafts have been checked for a few days, set `AUTO_SEND=true`.
 9. Optional, with Telegram Premium: in **Settings → Telegram Business → Chatbots** of the company account enter the
    bot's username, choose the chats and allow replying (Business Mode must be on in @BotFather). The log shows
    `Business connection …: user=<id> enabled=True`.

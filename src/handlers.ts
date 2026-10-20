@@ -1,7 +1,16 @@
 import { Composer, type Context, InputFile } from "grammy";
 import type { ReplyKeyboardMarkup } from "grammy/types";
 import type { Settings } from "./config.js";
-import { type Assistant, describe, FOLDER_CALLBACK_PREFIX } from "./service.js";
+import {
+  type Assistant,
+  describe,
+  FOLDER_CALLBACK_PREFIX,
+  REPLY_CALLBACK_PREFIX,
+  REPLY_DONE_CALLBACK,
+  REPLY_DONE_KEYBOARD,
+  REPLY_MODE_MINUTES,
+  replyKeyboard,
+} from "./service.js";
 
 export const ALLOWED_UPDATES = ["message", "callback_query", "business_connection", "business_message"] as const;
 
@@ -24,17 +33,6 @@ export function welcomeText(companyName: string): string {
   );
 }
 
-/** How the owner makes the admin group where every person gets a folder (topic). */
-export const SETUP_GUIDE = [
-  "📁 Har bir mijoz uchun alohida jild (admin guruhi):",
-  "1. Telegram'da yangi guruh yarating (faqat siz va xodimlaringiz).",
-  "2. Guruh sozlamalari → Topics ni yoqing.",
-  "3. Botni guruhga qo'shing va admin qiling, «Manage topics» huquqi bilan.",
-  "4. Guruhda /setup yuboring.",
-  "Shundan keyin har bir mijozga jild ochiladi, oldingi yozishmalar ham o'sha jildga ko'chiriladi. " +
-    "Mijozga javob berish uchun uning jildiga yozing. Mijozlarning o'zida jild ko'rinmaydi.",
-].join("\n");
-
 export function buildComposer(assistant: Assistant, settings: Settings): Composer<Context> {
   const composer = new Composer<Context>();
 
@@ -46,53 +44,7 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
     await assistant.onBusinessMessage(ctx.api, ctx.update.business_message);
   });
 
-  // The admin group: a supergroup with topics where every person gets a folder. Other groups are ignored.
-  const groups = composer.on("message").filter((ctx) => ctx.chat.type === "supergroup");
-
-  groups.command("setup", async (ctx) => {
-    if (ctx.from?.id !== settings.ownerId) return;
-    const thread = ctx.message.message_thread_id;
-    const reply = (text: string) => ctx.reply(text, thread !== undefined ? { message_thread_id: thread } : {});
-    if (!ctx.chat.is_forum) {
-      await reply(
-        "⚠️ Bu guruhda Topics yoqilmagan. Guruh sozlamalari → Topics ni yoqing, keyin /setup ni qayta yuboring.",
-      );
-      return;
-    }
-    const me = await ctx.getChatMember(ctx.me.id);
-    if (me.status !== "administrator" || !me.can_manage_topics) {
-      await reply(
-        "⚠️ Botni shu guruhga admin qiling va unga «Manage topics» (mavzularni boshqarish) huquqini bering, " +
-          "keyin /setup ni qayta yuboring.",
-      );
-      return;
-    }
-    await reply("⏳ Mijozlar uchun jildlar ochilmoqda va oldingi yozishmalar ko'chirilmoqda...");
-    const count = await assistant.setupAdminGroup(ctx.api, ctx.chat.id);
-    await reply(
-      `✅ Tayyor: ${count} ta mijoz jildi ochildi. Endi har bir mijozning xabarlari va bot javoblari o'z jildiga ` +
-        "tushadi. Mijozga javob berish uchun uning jildiga yozing.",
-    );
-  });
-
-  groups.filter(
-    (ctx) => ctx.chat.id === assistant.topics.groupId,
-    async (ctx) => {
-      // The bot's own messages never arrive; other bots, service messages and commands are not replies.
-      if (ctx.from?.is_bot || describe(ctx.message) === null || ctx.message.text?.startsWith("/")) return;
-      const result = await assistant.onTopicMessage(ctx.api, ctx.message);
-      const thread = { message_thread_id: ctx.message.message_thread_id };
-      if (result === "sent") {
-        await ctx.react("👍").catch(() => undefined);
-      } else if (result === "failed") {
-        await ctx.reply("⚠️ Xabarni mijozga yuborib bo'lmadi (u botni bloklagan bo'lishi mumkin).", thread);
-      } else if (result === "unsupported") {
-        await ctx.reply("⚠️ Business akkaunt orqali yozgan mijozga bu yerdan faqat matn yuborish mumkin.", thread);
-      }
-    },
-  );
-
-  // Direct messages to the bot itself.
+  // Direct messages to the bot itself. Groups and channels are ignored.
   const direct = composer.on("message").filter((ctx) => ctx.chat.type === "private");
 
   direct.command("start", async (ctx) => {
@@ -116,10 +68,6 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
     await ownerReply(ctx, `▶️ Bot yana ishlayapti (rejim: ${assistant.modeText()}). Pauza va limit holati tozalandi.`);
   });
 
-  owner.command("setup", async (ctx) => {
-    await ownerReply(ctx, SETUP_GUIDE);
-  });
-
   owner.command("status", async (ctx) => {
     await ownerReply(ctx, assistant.statusText());
   });
@@ -139,47 +87,78 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
   owner.command("users", listUsers);
   owner.filter((ctx) => ctx.message.text?.trim().toLowerCase() === USERS_BUTTON, listUsers);
 
-  // A 📁 button under the users list: show the whole conversation with that person.
+  // A person's button under the users list: their whole conversation, with a ✍️ reply button at the end.
   composer.callbackQuery(new RegExp(`^${FOLDER_CALLBACK_PREFIX}(\\d+)$`), async (ctx) => {
     await ctx.answerCallbackQuery();
     if (ctx.from.id !== settings.ownerId) return;
-    const folder = assistant.userFolder(Number(ctx.match[1]));
+    const userId = Number(ctx.match[1]);
+    const folder = assistant.userFolder(userId);
     if (folder.kind === "file") {
       await ctx.api.sendDocument(settings.ownerId, new InputFile(Buffer.from(folder.content, "utf8"), folder.fileName), {
         caption: folder.caption,
-        reply_markup: OWNER_KEYBOARD,
+        reply_markup: replyKeyboard(userId),
       });
       return;
     }
-    for (const text of folder.messages) {
+    for (const [i, text] of folder.messages.entries()) {
+      const last = i === folder.messages.length - 1;
       await ctx.api.sendMessage(settings.ownerId, text, {
         parse_mode: "HTML",
         link_preview_options: { is_disabled: true },
-        reply_markup: OWNER_KEYBOARD,
+        reply_markup: last ? replyKeyboard(userId) : OWNER_KEYBOARD,
       });
     }
   });
 
-  // Any other message from the owner: a reply to a copied chat is delivered to that person.
+  // ✍️ Javob yozish: the owner's next messages go to that person.
+  composer.callbackQuery(new RegExp(`^${REPLY_CALLBACK_PREFIX}(\\d+)$`), async (ctx) => {
+    await ctx.answerCallbackQuery();
+    if (ctx.from.id !== settings.ownerId) return;
+    const name = assistant.startReply(Number(ctx.match[1]));
+    await ctx.api.sendMessage(
+      settings.ownerId,
+      `✍️ ${name} uchun javobingizni yozing. Matn, rasm, fayl yoki ovozli xabar yuborishingiz mumkin — ` +
+        `hammasi shu mijozga boradi. Tugatgach «✖️ Tugatish» ni bosing (${REPLY_MODE_MINUTES} daqiqadan keyin ` +
+        "o'zi yopiladi).",
+      { reply_markup: REPLY_DONE_KEYBOARD },
+    );
+  });
+
+  const endReply = async (ctx: Context): Promise<void> => {
+    const name = assistant.endReply();
+    await ctx.api.sendMessage(
+      settings.ownerId,
+      name ? `✅ ${name} bilan javob rejimi yopildi.` : "Javob rejimi ochiq emas.",
+      { reply_markup: OWNER_KEYBOARD },
+    );
+  };
+  composer.callbackQuery(REPLY_DONE_CALLBACK, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    if (ctx.from.id === settings.ownerId) await endReply(ctx);
+  });
+  owner.command("cancel", endReply);
+
+  // Any other message from the owner: delivered to the person chosen with ✍️, otherwise a short hint.
   owner.on("message", async (ctx) => {
-    // Service messages (e.g. "topic created") are not something the owner wrote: no answer, no duplicate hints.
+    // Service messages are not something the owner wrote: no answer, no duplicate hints.
     if (describe(ctx.message) === null) return;
-    const result = await assistant.onOwnerReply(ctx.api, ctx.message);
+    const { result, to } = await assistant.sendOwnerReply(ctx.api, ctx.message);
     if (result === "sent") {
-      await ownerReply(ctx, "✅ Javobingiz yuborildi.");
+      await ctx.reply(`✅ ${to} ga yuborildi.`, { reply_markup: REPLY_DONE_KEYBOARD });
     } else if (result === "failed") {
-      await ownerReply(ctx, "⚠️ Javobni yuborib bo'lmadi (foydalanuvchi botni bloklagan bo'lishi mumkin).");
+      await ownerReply(ctx, `⚠️ ${to} ga yuborib bo'lmadi (u botni bloklagan bo'lishi mumkin).`);
+    } else if (result === "unsupported") {
+      await ownerReply(ctx, `⚠️ ${to} Business akkaunt orqali yozgan: unga bu yerdan faqat matn yuborish mumkin.`);
     } else {
       await ownerReply(
         ctx,
-        "Murojaatchiga javob yozish uchun bot yuborgan xabarga Reply qiling. " +
-          `Mijozlar ro'yxati uchun «${USERS_BUTTON}» tugmasini bosing. ` +
+        `Mijozga javob yozish uchun «${USERS_BUTTON}» ni bosing, mijozni tanlang va «✍️ Javob yozish» ni bosing. ` +
           "Botni sinab ko'rish uchun unga boshqa akkauntdan yozing.",
       );
     }
   });
 
-  // Everyone else: the bot answers from company.md and sends the owner a copy.
+  // Everyone else: the bot answers from company.md. The owner is not sent a copy.
   // Other people's commands (/pause, /status ...) are ignored silently.
   direct.on("message", async (ctx) => {
     if (ctx.message.text?.startsWith("/")) return;
