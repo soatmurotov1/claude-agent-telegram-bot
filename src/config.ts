@@ -188,7 +188,7 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
     claudeTimeoutSeconds: int("CLAUDE_TIMEOUT_SECONDS", 120, 1),
     limitCooldownMinutes: int("LIMIT_COOLDOWN_MINUTES", 30, 1),
     ownerTakeoverMinutes: int("OWNER_TAKEOVER_MINUTES", 15, 0),
-    historyLimit: int("HISTORY_LIMIT", 30, 1),
+    historyLimit: int("HISTORY_LIMIT", 50, 1),
     historyTtlDays: int("HISTORY_TTL_DAYS", 30, 1),
     dataDir: path.resolve(baseDir, get("DATA_DIR") || "data"),
     profilePath: path.resolve(baseDir, get("PROFILE_PATH") || "company.md"),

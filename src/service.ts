@@ -10,6 +10,7 @@ import {
   appendJsonl,
   type Clock,
   ensurePrivateDir,
+  type HistoryItem,
   HistoryStore,
   isRecord,
   RelayMap,
@@ -55,6 +56,23 @@ export interface ReplyGenerator {
 
 const MAX_MESSAGE_LENGTH = 4000;
 const OWNER_ALERT_INTERVAL_SECONDS = 600;
+/** Messages kept per chat for the owner's user folders. */
+const TRANSCRIPT_LIMIT = 5000;
+/** Users per "users" list message; Telegram allows at most 100 inline buttons per message. */
+const USERS_PER_PAGE = 40;
+/** A user folder longer than this many Telegram messages is sent as a .txt file instead. */
+export const FOLDER_MAX_MESSAGES = 10;
+/** callback_data prefix of the folder buttons in the "users" list. */
+export const FOLDER_CALLBACK_PREFIX = "folder:";
+
+export interface UsersListPage {
+  text: string;
+  buttons: { text: string; data: string }[];
+}
+
+export type UserFolder =
+  | { kind: "messages"; messages: string[] }
+  | { kind: "file"; caption: string; fileName: string; content: string };
 
 export function log(message: string): void {
   console.log(`${new Date().toISOString()} ${message}`);
@@ -217,6 +235,8 @@ export const DIRECT_HOURLY_LIMIT = 20;
 
 export class Assistant {
   readonly history: HistoryStore;
+  /** Full conversations for the owner's user folders (history only keeps the last HISTORY_LIMIT for Claude). */
+  readonly transcripts: HistoryStore;
   readonly seen: SeenMessages;
   readonly state: RuntimeState;
   readonly relay: RelayMap;
@@ -243,6 +263,18 @@ export class Assistant {
     this.history = new HistoryStore(
       path.join(dir, "history.json"),
       settings.historyLimit,
+      settings.historyTtlDays,
+      clock,
+    );
+    const transcriptsFile = path.join(dir, "transcripts.json");
+    // First start with transcripts: begin them with the existing history so no earlier conversation is lost.
+    if (!fs.existsSync(transcriptsFile) && fs.existsSync(path.join(dir, "history.json"))) {
+      fs.copyFileSync(path.join(dir, "history.json"), transcriptsFile);
+      fs.chmodSync(transcriptsFile, 0o600);
+    }
+    this.transcripts = new HistoryStore(
+      transcriptsFile,
+      TRANSCRIPT_LIMIT,
       settings.historyTtlDays,
       clock,
     );
@@ -301,7 +333,7 @@ export class Assistant {
 
     const chatKey = HistoryStore.key(connectionId, chatId);
     if (message.from?.id === this.settings.ownerId) {
-      this.history.add(connectionId, chatId, {
+      this.#remember(connectionId, chatId, {
         role: "owner",
         name: this.settings.companyName,
         text,
@@ -312,7 +344,7 @@ export class Assistant {
     }
 
     const language = detectLanguage(text) ?? this.history.lastLanguage(connectionId, chatId);
-    this.history.add(connectionId, chatId, { role: "other", name: senderName(message), text, lang: language });
+    this.#remember(connectionId, chatId, { role: "other", name: senderName(message), text, lang: language });
     this.#rememberUser(message);
 
     const chat: ChatContext = {
@@ -339,7 +371,7 @@ export class Assistant {
 
     const chatKey = HistoryStore.key(DIRECT_HISTORY_ID, chatId);
     const language = detectLanguage(text) ?? this.history.lastLanguage(DIRECT_HISTORY_ID, chatId);
-    this.history.add(DIRECT_HISTORY_ID, chatId, { role: "other", name: senderName(message), text, lang: language });
+    this.#remember(DIRECT_HISTORY_ID, chatId, { role: "other", name: senderName(message), text, lang: language });
     this.#rememberUser(message);
 
     const chat: ChatContext = {
@@ -379,7 +411,7 @@ export class Assistant {
       return "failed";
     }
     const text = describe(message) ?? "[message]";
-    this.history.add(DIRECT_HISTORY_ID, chatId, {
+    this.#remember(DIRECT_HISTORY_ID, chatId, {
       role: "owner",
       name: this.settings.companyName,
       text,
@@ -447,7 +479,7 @@ export class Assistant {
       readProfile(this.settings.profilePath),
       new Date(this.#clock() * 1000),
     );
-    const user = buildUserPrompt(this.history.get(chat.historyId, chat.chatId), chat.language);
+    const user = buildUserPrompt(this.#memory(chat), chat.language);
 
     let raw: string;
     try {
@@ -516,7 +548,7 @@ export class Assistant {
       }
       throw err;
     }
-    this.history.add(chat.historyId, chat.chatId, {
+    this.#remember(chat.historyId, chat.chatId, {
       role: "owner",
       name: this.settings.companyName,
       text: reply,
@@ -663,6 +695,26 @@ export class Assistant {
     }
   }
 
+  /**
+   * What Claude sees: the last HISTORY_LIMIT messages with this person, from earlier conversations too and from
+   * both the bot's own chat and the business account.
+   */
+  #memory(chat: ChatContext): HistoryItem[] {
+    const items = this.transcripts.forChat(chat.chatId);
+    // Only if the transcripts could not be written: fall back to this chat's short history.
+    if (items.length === 0) return this.history.get(chat.historyId, chat.chatId);
+    return items.slice(-this.settings.historyLimit);
+  }
+
+  #remember(historyId: string, chatId: number, item: Omit<HistoryItem, "ts">): void {
+    this.history.add(historyId, chatId, item);
+    try {
+      this.transcripts.add(historyId, chatId, item);
+    } catch (err) {
+      logError(`Could not update the transcripts: ${errorMessage(err)}`);
+    }
+  }
+
   #rememberUser(message: Message): void {
     const from = message.from;
     if (!from || from.id === this.settings.ownerId) return;
@@ -673,32 +725,72 @@ export class Assistant {
     }
   }
 
-  /** The owner's "users" list as HTML messages (each under Telegram's 4096-character limit). */
-  usersListMessages(): string[] {
+  /**
+   * The owner's "users" list as HTML messages, each with one 📁 folder button per user
+   * (under Telegram's 4096-character and 100-button limits).
+   */
+  usersListMessages(): UsersListPage[] {
     const users = this.users.list();
     if (users.length === 0) {
-      return [`👥 Hozircha botga hech kim yozmagan (oxirgi ${this.settings.historyTtlDays} kun).`];
+      return [{ text: `👥 Hozircha botga hech kim yozmagan (oxirgi ${this.settings.historyTtlDays} kun).`, buttons: [] }];
     }
-    const lines = users.map((user, i) => {
+    const header =
+      `👥 Mijozlar: ${users.length} ta (oxirgi ${this.settings.historyTtlDays} kun, yangilari tepada)\n` +
+      "📁 Yozishmani ko'rish uchun mijoz tugmasini bosing.\n";
+    const pages: UsersListPage[] = [];
+    let current: UsersListPage = { text: header, buttons: [] };
+    users.forEach((user, i) => {
       const name = `<a href="tg://user?id=${user.id}">${escapeHtml(user.name)}</a>`;
       const username = user.username ? ` @${escapeHtml(user.username)}` : "";
-      return (
+      const line =
         `${i + 1}. ${name}${username}\n` +
-        `    ID ${user.id} · ${user.messages} ta xabar · oxirgi: ${tashkentTime(user.lastSeen)}`
-      );
+        `    ID ${user.id} · ${user.messages} ta xabar · oxirgi: ${tashkentTime(user.lastSeen)}`;
+      if (current.text.length + line.length + 1 > 3800 || current.buttons.length >= USERS_PER_PAGE) {
+        pages.push(current);
+        current = { text: "", buttons: [] };
+      }
+      current.text += `\n${line}`;
+      current.buttons.push({ text: truncate(`📁 ${i + 1}. ${user.name}`, 60), data: `${FOLDER_CALLBACK_PREFIX}${user.id}` });
     });
-    const header = `👥 Mijozlar: ${users.length} ta (oxirgi ${this.settings.historyTtlDays} kun, yangilari tepada)\n`;
+    pages.push(current);
+    return pages;
+  }
+
+  /** Everything this person and the bot (or the owner) wrote to each other, for the owner's 📁 folder. */
+  userFolder(userId: number): UserFolder {
+    const user = this.users.list().find((known) => known.id === userId);
+    const title = user ? `${user.name}${user.username ? ` @${user.username}` : ""}, ID ${userId}` : `ID ${userId}`;
+    const items = this.transcripts.forChat(userId);
+    if (items.length === 0) {
+      return { kind: "messages", messages: [`📁 ${escapeHtml(title)}\n\nBu mijoz bilan yozishma topilmadi.`] };
+    }
+
+    const header = `📁 ${title} — ${items.length} ta xabar`;
+    const entries = items.map((item) => {
+      const who = item.role === "other" ? `👤 ${item.name}` : `🏢 ${this.settings.companyName}`;
+      return { who: `${who} · ${tashkentTime(item.ts)}`, text: item.text };
+    });
+
     const messages: string[] = [];
-    let current = header;
-    for (const line of lines) {
-      if (current.length + line.length + 1 > 3800) {
+    let current = `<b>${escapeHtml(header)}</b>\n`;
+    for (const entry of entries) {
+      const block = `\n<b>${escapeHtml(entry.who)}</b>\n${escapeHtml(truncate(entry.text, 3000))}\n`;
+      if (current.length + block.length > 3800) {
         messages.push(current);
         current = "";
       }
-      current += `\n${line}`;
+      current += block;
     }
     messages.push(current);
-    return messages;
+    if (messages.length <= FOLDER_MAX_MESSAGES) return { kind: "messages", messages };
+
+    const content = [header, "", ...entries.map((entry) => `${entry.who}\n${entry.text}\n`)].join("\n");
+    return {
+      kind: "file",
+      caption: `${header}. Yozishma uzun, shuning uchun fayl qilib yuborildi.`,
+      fileName: `yozishma-${userId}.txt`,
+      content,
+    };
   }
 
   pause(): void {
@@ -730,6 +822,7 @@ export class Assistant {
       `State: ${this.state.paused ? "paused" : "running"}`,
       `Claude usage limit: ${limit}`,
       `Chats in history: ${this.history.chatCount()}`,
+      `Data directory: ${this.settings.dataDir}`,
       `History is kept for ${this.settings.historyTtlDays} days`,
     ].join("\n");
   }
@@ -754,6 +847,8 @@ export class Assistant {
       "• Botga yozilgan har bir xabar va botning javobi shu chatga keladi.",
       "• Murojaatchiga o'zingiz javob yozish uchun o'sha xabarga Reply qiling — javobingiz unga yuboriladi.",
       `• Siz javob bergan chatda bot ${s.ownerTakeoverMinutes} daqiqa jim turadi.`,
+      "• «users» tugmasi mijozlar ro'yxatini ko'rsatadi: mijozning 📁 tugmasini bossangiz, u bilan butun yozishma ochiladi.",
+      `• «users» tugmasi mijozlar ro'yxatini ko'rsatadi; mijozning 📁 tugmasini bossangiz, u bilan butun yozishma ochiladi.`,
       "• Sinab ko'rish uchun botga boshqa akkauntdan yozing: sizning o'z xabarlaringizga bot javob bermaydi.",
       "",
       "Buyruqlar:",

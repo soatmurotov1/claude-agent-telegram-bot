@@ -173,6 +173,19 @@ async function runBot(settings: Settings): Promise<number> {
   log(`Direct chats: anyone may write to the bot; copies go to OWNER_ID ${settings.ownerId}`);
   log(`Claude auth: ${settings.claudeAuthMode}`);
   log(`Claude binary: ${settings.claudeBin}`);
+  log(`Data directory: ${settings.dataDir} (${assistant.history.chatCount()} chat(s) in memory)`);
+  // Railway sets RAILWAY_VOLUME_MOUNT_PATH only when a volume is attached to the service.
+  if (process.env.RAILWAY_ENVIRONMENT_NAME && !process.env.RAILWAY_VOLUME_MOUNT_PATH) {
+    logError(
+      "WARNING: no Railway volume is attached, so the bot's memory (chat history, users, pause state) is lost on " +
+        "every deploy. Add a volume mounted at /app/data to this service.",
+    );
+  } else if (process.env.RAILWAY_VOLUME_MOUNT_PATH && path.resolve(process.env.RAILWAY_VOLUME_MOUNT_PATH) !== settings.dataDir) {
+    logError(
+      `WARNING: the Railway volume is mounted at ${process.env.RAILWAY_VOLUME_MOUNT_PATH}, but the bot writes to ` +
+        `${settings.dataDir}. Change the volume's mount path to ${settings.dataDir}.`,
+    );
+  }
   if (bot.botInfo.has_topics_enabled) {
     logError(
       "WARNING: Threaded Mode (topics in private chats) is ON for this bot, so Telegram opens a new topic for " +

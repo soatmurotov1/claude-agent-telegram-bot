@@ -61,10 +61,13 @@ Common to both:
 - `/start` — guide in Uzbek: what the bot does, current mode and state, how to connect it, commands.
 - `/pause`, `/resume` (also clears the limit and takeover timers), `/status`.
 - **`users` button** (persistent keyboard, owner only; also `/users`): lists everyone who wrote to the bot in the
-  last `HISTORY_TTL_DAYS` days, newest first, with @username, ID, message count and last message time.
+  last `HISTORY_TTL_DAYS` days, newest first, with @username, ID, message count and last message time. Under the
+  list is a 📁 button per person: pressing it shows the whole conversation with them (their messages, the bot's
+  replies and the admin's replies, oldest first). A very long conversation arrives as a `.txt` file.
 
-Turn **Threaded Mode off** in @BotFather (Bot Settings → Threaded Mode). With it on, Telegram opens a new topic
-("folder") for messages; the bot warns about it in the log at startup.
+Turn **Threaded Mode off** in @BotFather (Bot Settings → Threaded Mode). It is a setting for the whole bot that the
+Bot API cannot change: while it is on, Telegram shows topics ("folders") to the people who write to the bot too. The
+admin's per-person folders are the 📁 buttons above and do not need it. The bot warns about it in the log at startup.
 
 Anyone else who sends `/start` gets a short Uzbek welcome asking them to write their question (Claude is not
 called for `/start`).
@@ -99,7 +102,8 @@ Everything is stored in `data/` (on Railway: the volume at `/app/data`), directo
 
 | File | Content |
 | --- | --- |
-| `history.json` | Last `HISTORY_LIMIT` messages per connection and chat |
+| `history.json` | Last `HISTORY_LIMIT` messages per connection and chat (fallback only) |
+| `transcripts.json` | Every message per chat: the bot's memory (Claude gets the last `HISTORY_LIMIT` messages with the person, earlier conversations included) and the admin's 📁 folders |
 | `previews.jsonl` | Replies prepared in preview mode (or not sent) |
 | `seen.json` | IDs of handled messages (for duplicates) |
 | `state.json` | Pause flag and usage-limit deadline |
@@ -129,8 +133,11 @@ personal-data requirements, before you connect the bot.
    Optional: `COMPANY_NAME`, `CLAUDE_MODEL`, `CLAUDE_EFFORT`, `CLAUDE_TIMEOUT_SECONDS`, `LIMIT_COOLDOWN_MINUTES`,
    `OWNER_TAKEOVER_MINUTES`, `HISTORY_LIMIT`, `HISTORY_TTL_DAYS`. `CLAUDE_BIN`, `DATA_DIR` and `PROFILE_PATH` are
    not needed.
-6. **Volume.** Right-click the canvas (or Cmd+K / Ctrl+K) → *Volume* → choose the service → mount path exactly
-   `/app/data` → *Deploy*. Without a volume, history, pause and limit state are lost on every deploy.
+6. **Volume (the bot's memory).** Right-click the canvas (or Cmd+K / Ctrl+K) → *Volume* → choose the service →
+   mount path exactly `/app/data` → *Deploy*. Everything in the table above is written there and survives
+   redeploys. Without a volume, the memory, users, pause and limit state are lost on every deploy; the log then
+   says `WARNING: no Railway volume is attached`. With the volume the log shows
+   `Data directory: /app/data (N chat(s) in memory)`.
 7. **Logs** should show `Bot @… is running`, `Mode: PREVIEW` and
    `Claude auth: subscription token from environment variables`. Red lines in Railway are just stderr, not errors.
 8. From the admin account (`OWNER_ID`) send `/start` to the bot. Test from **another** account by writing to the

@@ -54,7 +54,7 @@ describe("loadSettings", () => {
     expect(s.autoSend).toBe(false);
     expect(s.companyName).toBe("Sanoatgeokontexxizmat");
     expect(s.historyTtlDays).toBe(30);
-    expect(s.historyLimit).toBe(30);
+    expect(s.historyLimit).toBe(50);
     expect(s.claudeEffort).toBe("low");
     expect(s.claudeTimeoutSeconds).toBe(120);
     expect(s.limitCooldownMinutes).toBe(30);

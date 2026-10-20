@@ -1,9 +1,9 @@
-import { Composer, type Context } from "grammy";
+import { Composer, type Context, InputFile } from "grammy";
 import type { ReplyKeyboardMarkup } from "grammy/types";
 import type { Settings } from "./config.js";
-import { type Assistant, describe } from "./service.js";
+import { type Assistant, describe, FOLDER_CALLBACK_PREFIX } from "./service.js";
 
-export const ALLOWED_UPDATES = ["message", "business_connection", "business_message"] as const;
+export const ALLOWED_UPDATES = ["message", "callback_query", "business_connection", "business_message"] as const;
 
 /** Text of the owner's only keyboard button; pressing it lists everyone who wrote to the bot. */
 export const USERS_BUTTON = "users";
@@ -64,16 +64,40 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
   });
 
   const listUsers = async (ctx: Context): Promise<void> => {
-    for (const text of assistant.usersListMessages()) {
-      await ctx.reply(text, {
+    for (const page of assistant.usersListMessages()) {
+      await ctx.reply(page.text, {
         parse_mode: "HTML",
         link_preview_options: { is_disabled: true },
-        reply_markup: OWNER_KEYBOARD,
+        reply_markup:
+          page.buttons.length > 0
+            ? { inline_keyboard: page.buttons.map((button) => [{ text: button.text, callback_data: button.data }]) }
+            : OWNER_KEYBOARD,
       });
     }
   };
   owner.command("users", listUsers);
   owner.filter((ctx) => ctx.message.text?.trim().toLowerCase() === USERS_BUTTON, listUsers);
+
+  // A 📁 button under the users list: show the whole conversation with that person.
+  composer.callbackQuery(new RegExp(`^${FOLDER_CALLBACK_PREFIX}(\\d+)$`), async (ctx) => {
+    await ctx.answerCallbackQuery();
+    if (ctx.from.id !== settings.ownerId) return;
+    const folder = assistant.userFolder(Number(ctx.match[1]));
+    if (folder.kind === "file") {
+      await ctx.api.sendDocument(settings.ownerId, new InputFile(Buffer.from(folder.content, "utf8"), folder.fileName), {
+        caption: folder.caption,
+        reply_markup: OWNER_KEYBOARD,
+      });
+      return;
+    }
+    for (const text of folder.messages) {
+      await ctx.api.sendMessage(settings.ownerId, text, {
+        parse_mode: "HTML",
+        link_preview_options: { is_disabled: true },
+        reply_markup: OWNER_KEYBOARD,
+      });
+    }
+  });
 
   // Any other message from the owner: a reply to a copied chat is delivered to that person.
   owner.on("message", async (ctx) => {

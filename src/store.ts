@@ -117,6 +117,16 @@ export class HistoryStore {
     return null;
   }
 
+  /** Every item of this chat across all connections (direct and business), oldest first. */
+  forChat(chatId: number): HistoryItem[] {
+    if (this.#prune()) this.#file.write(this.#data);
+    const suffix = `:${chatId}`;
+    return Object.entries(this.#data)
+      .filter(([key]) => key.endsWith(suffix))
+      .flatMap(([, items]) => items)
+      .sort((a, b) => a.ts - b.ts);
+  }
+
   chatCount(): number {
     if (this.#prune()) this.#file.write(this.#data);
     return Object.keys(this.#data).length;
