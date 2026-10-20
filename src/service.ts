@@ -406,8 +406,10 @@ export class Assistant {
       }
       return this.#respond(api, chat);
     });
-    // Text stays in the person's folder; a file or photo is passed on, as company.md promises them.
-    if (message.text === undefined) await this.#forwardFile(api, message, chat);
+    // Text normally stays in the person's folder. It is passed on while the bot is quiet because the owner is
+    // answering (otherwise nobody would see it); a file or photo always is, as company.md promises them.
+    const ownerActive = result.outcome === Outcome.owner_active;
+    if (ownerActive || message.text === undefined) await this.#passToOwner(api, message, chat, ownerActive);
     return result.outcome;
   }
 
@@ -418,10 +420,18 @@ export class Assistant {
   }
 
   /** Ends reply mode. Returns the name of the person it was open for, or null. */
+  /**
+   * Ends reply mode (also after it timed out) and lets the bot answer that person again right away.
+   * Returns their name, or null when the owner was not answering anyone.
+   */
   endReply(): string | null {
-    const userId = this.#replyTarget();
+    const userId = this.#replyTo?.userId ?? null;
     this.#replyTo = null;
-    return userId === null ? null : this.personTitle(userId);
+    if (userId === null) return null;
+    for (const key of [...this.#takeoverUntil.keys()]) {
+      if (key.endsWith(`:${userId}`)) this.#takeoverUntil.delete(key);
+    }
+    return this.personTitle(userId);
   }
 
   #replyTarget(): number | null {
@@ -679,15 +689,23 @@ export class Assistant {
     }
   }
 
-  /** Passes a file, photo or voice message someone sent to the bot on to the owner, with a ✍️ reply button. */
-  async #forwardFile(api: Api, message: Message, chat: ChatContext): Promise<void> {
+  /** Passes a message someone sent to the bot on to the owner, with a ✍️ reply button. */
+  async #passToOwner(api: Api, message: Message, chat: ChatContext, ownerActive: boolean): Promise<void> {
+    const who = this.personTitle(chat.chatId);
+    const quiet = ownerActive ? "\n(Siz javob berayotganingiz uchun bot jim turibdi. Tugatsangiz, «✖️ Tugatish» ni bosing.)" : "";
     try {
+      if (message.text !== undefined) {
+        await api.sendMessage(this.settings.ownerId, `💬 ${who}:\n${truncate(message.text, 3500)}${quiet}`, {
+          reply_markup: replyKeyboard(chat.chatId),
+        });
+        return;
+      }
       await api.forwardMessage(this.settings.ownerId, chat.chatId, message.message_id);
-      await api.sendMessage(this.settings.ownerId, `📎 ${this.personTitle(chat.chatId)} fayl yubordi.`, {
+      await api.sendMessage(this.settings.ownerId, `📎 ${who} fayl yubordi.${quiet}`, {
         reply_markup: replyKeyboard(chat.chatId),
       });
     } catch (err) {
-      logError(`Could not pass the file from chat ${chat.chatId} to the owner: ${errorMessage(err)}`);
+      logError(`Could not pass the message from chat ${chat.chatId} to the owner: ${errorMessage(err)}`);
     }
   }
 
@@ -853,7 +871,8 @@ export class Assistant {
       "• «users» tugmasi mijozlar ro'yxatini ko'rsatadi. Mijozni bossangiz, u bilan butun yozishma ochiladi.",
       "• Mijozga javob berish: yozishma ostidagi «✍️ Javob yozish» ni bosing va javobni yuboring — matn, rasm, " +
         "fayl yoki ovozli xabar bo'lishi mumkin. Tugatgach «✖️ Tugatish» ni bosing.",
-      `• Siz javob bergan chatda bot ${s.ownerTakeoverMinutes} daqiqa jim turadi.`,
+      `• Siz javob bergan chatda bot ${s.ownerTakeoverMinutes} daqiqa jim turadi, shu vaqtda mijozning xabarlari ` +
+        "sizga keladi. «✖️ Tugatish» ni bossangiz, bot darhol yana o'zi javob beradi.",
       "• Sinab ko'rish uchun botga boshqa akkauntdan yozing: sizning o'z xabarlaringizga bot javob bermaydi.",
       "",
       "Buyruqlar:",

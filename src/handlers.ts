@@ -128,7 +128,7 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
     const name = assistant.endReply();
     await ctx.api.sendMessage(
       settings.ownerId,
-      name ? `✅ ${name} bilan javob rejimi yopildi.` : "Javob rejimi ochiq emas.",
+      name ? `✅ ${name} bilan javob rejimi yopildi. Endi bot unga yana o'zi javob beradi.` : "Javob rejimi ochiq emas.",
       { reply_markup: OWNER_KEYBOARD },
     );
   };

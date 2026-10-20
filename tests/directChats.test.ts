@@ -83,7 +83,12 @@ describe("people writing to the bot directly", () => {
     h.api.clear();
     await h.send(h.directMessage("Rahmat, yana savol bor", { fromId: PERSON }));
     expect(h.lastOutcome()).toBe(Outcome.owner_active);
-    expect(h.api.byMethod("sendMessage")).toHaveLength(0);
+    // The bot is quiet, so the owner gets the person's message instead.
+    const passed = h.api.byMethod("sendMessage");
+    expect(passed).toHaveLength(1);
+    expect(passed[0]?.payload.chat_id).toBe(OWNER_ID);
+    expect(String(passed[0]?.payload.text)).toContain("Rahmat, yana savol bor");
+    expect(passed[0]?.payload.reply_markup).toEqual(replyKeyboard(PERSON));
 
     h.clock.advance(15 * 60 + 1);
     await h.send(h.directMessage("Yana bir savol", { fromId: PERSON }));
@@ -124,6 +129,19 @@ describe("people writing to the bot directly", () => {
     await h.send(h.directMessage(null, { fromId: OWNER_ID, extra: { photo: [{ file_id: "p" }] } }));
     expect(h.api.byMethod("copyMessage")).toHaveLength(0);
     expect(String(ownerSends(h)[0]?.payload.text)).toContain("faqat matn");
+  });
+
+  it("✖️ lets the bot answer that person again right away", async () => {
+    const h = makeHarness({ AUTO_SEND: "true" });
+    await h.send(h.directMessage("Savol", { fromId: PERSON }));
+    await press(h, `reply:${PERSON}`);
+    await h.send(h.directMessage("Admin javobi", { fromId: OWNER_ID }));
+    await press(h, "reply-done");
+    expect(String(ownerSends(h).at(-1)?.payload.text)).toContain("yana o'zi javob beradi");
+    h.api.clear();
+    await h.send(h.directMessage("Keyingi savol", { fromId: PERSON }));
+    expect(h.lastOutcome()).toBe(Outcome.sent);
+    expect(h.api.byMethod("sendMessage").map((call) => call.payload.chat_id)).toEqual([PERSON]);
   });
 
   it("only the owner can press ✍️", async () => {

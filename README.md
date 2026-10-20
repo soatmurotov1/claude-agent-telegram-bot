@@ -52,6 +52,8 @@ Common to both:
 | History retention | Messages and previews older than `HISTORY_TTL_DAYS` (default 30) are deleted |
 | Someone writes to the bot directly | Claude answers from `company.md` (sent only with `AUTO_SEND=true`); the admin gets no copy (files and photos are forwarded) |
 | Admin writes after pressing ✍️ | Text, photo, file or voice goes to that person; the bot is silent there for `OWNER_TAKEOVER_MINUTES` |
+| The person writes while the bot is silent | The message is passed to the admin with a ✍️ button, so nothing is missed |
+| Admin presses ✖️ Tugatish | The silence ends at once: the bot answers that person again |
 | More than 20 messages per hour from one person | Claude is not called |
 | Admin writes without pressing ✍️ | Short hint; Claude is never called for the admin's own messages |
 | Groups, channels, other people's `/pause` `/status` | Ignored |
