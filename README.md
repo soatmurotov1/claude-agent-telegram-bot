@@ -26,9 +26,13 @@ Common to both:
   draft. Set `AUTO_SEND=true` to let the bot answer people.
 - There is no allowlist in the code: anyone may write to the bot; for Business, Telegram's Chatbots setting
   decides which chats the bot sees.
-- **The bot never decides anything on behalf of the company.** It gives information from `company.md`, confirms
-  that a request was received and refers to the responsible employee. It makes no promises or conclusions about
-  prices, deadlines, contracts, permits, expert reviews or inspection results.
+- **It works towards a deal.** It answers from `company.md` and moves the person to the next step: it sends the
+  express questionnaire (anketa with NDA, Uzbek or Russian), asks them to fill in and sign it and to send the
+  documents listed in it. "A responsible employee will answer" is kept for serious cases only (exact prices, the
+  company's own deadlines, guarantees, complaints, emergencies, official requests). It still makes no promises
+  about prices, deadlines, permits, expert reviews or inspection results.
+- **It checks documents.** Files clients send are checked against the template, saved per client and summed up
+  as percentages (see [Documents](#documents)).
 - **Escalation**: for emergencies (accident, gas leak, fire, injury, collapse), complaints, official requests,
   or mentions of courts, prosecutors or media, Claude starts its answer with `[ESCALATE]`. The bot then sends the
   owner a private alert (in Uzbek) in the bot chat — also in preview mode — at most once per 10 minutes per chat.
@@ -50,7 +54,13 @@ Common to both:
 | Claude answers `[ESCALATE] …` | Owner gets an alert with a ✍️ reply button; the reply itself follows the normal preview/auto-send path |
 | Before an auto-send | Pause/limit/takeover are checked again, and the connection is re-read from Telegram (owner, enabled, reply right) |
 | History retention | Messages and previews older than `HISTORY_TTL_DAYS` (default 30) are deleted |
-| Someone writes to the bot directly | Claude answers from `company.md` (sent only with `AUTO_SEND=true`); the admin gets no copy (files and photos are forwarded) |
+| Someone writes to the bot directly | Claude answers from `company.md` (sent only with `AUTO_SEND=true`); the admin gets no copy |
+| A client sends files or photos (also 10-50 at once) | Collected for `REVIEW_BATCH_SECONDS` (15 s) after the last one, then each is checked against the template; one summary goes to the client, a short note to the admin |
+| A file cannot be checked (bad JSON from Claude, CLI error) | Saved in `rejected/` and sent to the admin with ⚠️ |
+| A file is larger than 20 MB | Not downloaded (Bot API limit); the client is asked to compress or split it |
+| Client writes "holat" / "статус" / presses 📊 | Their document status, without Claude |
+| Client writes "anketa" / "анкета" / presses 📄, or Claude adds `[SEND_TEMPLATE]` | The blank questionnaire is sent (Russian for Russian and English speakers) |
+| More than `REVIEW_DAILY_LIMIT` document checks in 24 h | Remaining files wait in the inbox and are retried an hour later |
 | Admin writes after pressing ✍️ | Text, photo, file or voice goes to that person; the bot is silent there for `OWNER_TAKEOVER_MINUTES` |
 | The person writes while the bot is silent | The message is passed to the admin with a ✍️ button, so nothing is missed |
 | Admin presses ✖️ Tugatish | The silence ends at once: the bot answers that person again |
@@ -64,9 +74,11 @@ Common to both:
 - `/pause`, `/resume` (also clears the limit and takeover timers), `/status`.
 - **`users` button** (persistent keyboard, owner only; also `/users`): lists everyone who wrote to the bot in the
   last `HISTORY_TTL_DAYS` days, newest first, with @username, ID, message count and last message time. Under the
-  list is a 📁 button per person: pressing it shows the whole conversation with them (their messages, the bot's
-  replies and the admin's replies, oldest first; a very long one arrives as a `.txt` file) and a **✍️ Javob yozish**
-  button under it.
+  list is a 📁 button per person (with `📊 N%` when they have sent documents): pressing it shows their document
+  status and the whole conversation with them (oldest first; a very long one arrives as a `.txt` file), with
+  **✍️ Javob yozish**, **📄 chat.txt**, **📎 Qabul qilingan fayllar** and **🗑 Chatni o'chirish** under it.
+- **🗑 Chatni o'chirish** asks for confirmation, then deletes the person's history, transcript, users-list entry
+  and the whole `data/clients/<id>/` folder. It cannot be undone. Only the owner can do this.
 - **Answering a person:** press ✍️ (under the conversation, a 🚨 alert or a forwarded file), then send the answer —
   text, photo, file, voice, anything. Everything sent goes to that person until **✖️ Tugatish** (or `/cancel`) is
   pressed or `REPLY_MODE_MINUTES` (15) pass without a message. People who wrote through the business account are
@@ -76,8 +88,45 @@ Turn **Threaded Mode off** in @BotFather (Bot Settings → Threaded Mode). It is
 Bot API cannot change: while it is on, Telegram shows topics ("folders") to the people who write to the bot. The bot
 warns about it in the log at startup.
 
-Anyone else who sends `/start` gets a short Uzbek welcome asking them to write their question (Claude is not
-called for `/start`).
+Anyone else who sends `/start` gets a short Uzbek welcome and a keyboard with **📊 Hujjatlar holati** and
+**📄 Anketa shabloni** (Claude is not called for `/start`).
+
+## Documents
+
+The documents asked for are defined in [`templates/investment-checklist/template.json`](templates/investment-checklist/template.json),
+taken from the company's express questionnaire «Инвестициялар учун объект тайёргарлигининг экспресс-анкетаси»
+(`uz.docx`) / «Экспресс-анкета готовности объекта к инвестициям» (`ru.docx`):
+
+| Key | Document | Optional when the questionnaire marks item |
+| --- | --- | --- |
+| `anketa` | The filled-in questionnaire with the signed NDA | never |
+| `ustav`, `egrpo` | Charter, register extract (≤ 3 months old) | 1, 2 |
+| `ruxsatnoma`, `litsenziya_kelishuvi` | Subsoil use permit, licence agreement | 3 |
+| `loyiha_hujjatlari`, `5gr_tasdiq` | Project documents (UTER, TEO, mining allotment), proof of form 5-GR | 5, 6 |
+| `ekologik_paket` | ZVOS/ZEP, PDV, limits, environmental review conclusion | 7 |
+| `epb_dalolatnoma`, `yer_ajratmasi` | Industrial safety review, land allotment decision | 8, 9 |
+
+How a file is checked (`src/documentReview.ts`):
+
+1. It is downloaded into `data/clients/<id>/inbox/` (kept across restarts and usage limits).
+2. DOCX and XLSX text is extracted in the bot (checkbox states ☐/☒ and highlighted text are kept); TXT/CSV are
+   read as is. PDF and images are opened by Claude itself: the CLI runs in a fresh 0700 folder holding only that
+   file, with `--tools Read --restricted --allowedTools Read --permission-prompts none`, so it can read nothing
+   else. Other formats (DOC, ZIP …) are rejected with a request for PDF/DOCX/XLSX/JPG/PNG.
+3. Claude gets the template (each document's acceptance checks), the summaries in [`laws/`](laws/), the company
+   from the accepted questionnaire and the file, and answers with JSON: which document it is, accepted or
+   rejected, reasons in the client's language.
+4. Accepted → `accepted/<key>/`; rejected → `rejected/` with `reasons.jsonl`. A later wrong copy never undoes an
+   accepted document. The accepted questionnaire also records the company and the items marked "NA".
+5. Progress = accepted / required (documents of NA items are not required): `Tayyor 60% · Xato 20% · Yetishmaydi 20%`
+   and one line per document with ✅ ❌ ⬜ ➖ and the reason.
+
+To add a document or change a check, edit `template.json` (read fresh for every file) and push. A new template
+goes into its own folder with the same layout; `DEFAULT_TEMPLATE_ID` in `src/templates.ts` picks the active one.
+The service contract template can be added the same way later.
+
+`npm run review -- path/to/file.pdf --lang ru` checks one local file and prints the verdict, without Telegram and
+without saving anything.
 
 ## How Claude is called
 
@@ -115,8 +164,14 @@ Everything is stored in `data/` (on Railway: the volume at `/app/data`), directo
 | `seen.json` | IDs of handled messages (for duplicates) |
 | `state.json` | Pause flag and usage-limit deadline |
 | `users.json` | People who wrote to the bot (name, @username, ID, counts) for the `users` list |
+| `clients/<id>/chat.txt` | The whole conversation with this person as plain text |
+| `clients/<id>/accepted/<doc>/` | Files that passed the template check |
+| `clients/<id>/rejected/` | Files that did not, with `reasons.jsonl` |
+| `clients/<id>/status.json` | Per-document state, used for the percentages |
+| `clients/<id>/inbox/` | Files waiting for review |
 
-History and previews older than `HISTORY_TTL_DAYS` are deleted. Messages from the people who write to the company
+History and previews older than `HISTORY_TTL_DAYS` are deleted. Client folders are kept until the owner deletes
+the chat with 🗑; the client's documents (licences, charters …) are confidential under the questionnaire's NDA. Messages from the people who write to the company
 **are sent to Claude (Anthropic)** to generate replies and are stored on the Railway server. Agree on this with the
 company's management and the person responsible for information security, and align it with the company's
 personal-data requirements, before you connect the bot.
@@ -137,7 +192,7 @@ personal-data requirements, before you connect the bot.
    AUTO_SEND=false
    ```
    Optional: `COMPANY_NAME`, `CLAUDE_MODEL`, `CLAUDE_EFFORT`, `CLAUDE_TIMEOUT_SECONDS`, `LIMIT_COOLDOWN_MINUTES`,
-   `OWNER_TAKEOVER_MINUTES`, `HISTORY_LIMIT`, `HISTORY_TTL_DAYS`. `CLAUDE_BIN`, `DATA_DIR` and `PROFILE_PATH` are
+   `OWNER_TAKEOVER_MINUTES`, `HISTORY_LIMIT`, `HISTORY_TTL_DAYS`, `REVIEW_DAILY_LIMIT`. `CLAUDE_BIN`, `DATA_DIR`, `PROFILE_PATH`, `TEMPLATES_DIR` and `LAWS_DIR` are
    not needed.
 6. **Volume (the bot's memory).** Right-click the canvas (or Cmd+K / Ctrl+K) → *Volume* → choose the service →
    mount path exactly `/app/data` → *Deploy*. Everything in the table above is written there and survives
@@ -183,15 +238,17 @@ variables are ignored and nothing is written to `process.env`.
 | `node dist/bot.js --settings-from-env` | Container mode (Railway): settings from environment variables, which are then removed from `process.env` | same |
 | `npm run check-claude` | Checks the Claude CLI without Telegram | 0 ok, 1 check failed, 2 config error |
 | `npm run try -- "text"` | Shows the reply to a made-up message (language, escalation, reply) | 0 ok, 1 Claude failed, 2 config error |
+| `npm run review -- file [--lang uz\|ru\|en]` | Checks one local file against the template and prints the verdict | 0 ok, 1 Claude failed, 2 config error or no file |
 | `npm run typecheck` / `npm test` / `npm run build` | TypeScript check, tests (offline), compile to `dist/` | |
 
 `--check-claude` and `--try` also work with `--settings-from-env` and do not need Telegram settings.
 
 ### Tests
 
-`npm test` runs offline: Telegram calls go to a recording transformer and the Claude CLI is replaced by a fake
-script. The CLI tests use POSIX process groups and file modes and are skipped on Windows; run them on Linux or
-macOS (or in Docker) for full coverage.
+`npm test` runs offline: Telegram calls go to a recording transformer (`tests/harness.ts`), file downloads are
+served from memory and Claude is replaced by a scripted generator. `tests/documents.test.ts` covers the template,
+DOCX/XLSX text, review answers, batches of many files, preview mode, usage limits across restarts, business
+chats, chat.txt, the questionnaire, the client status and deleting a chat.
 
 ### Files
 
@@ -200,11 +257,16 @@ src/bot.ts         entry point, CLI flags, startup checks, long polling with @gr
 src/config.ts      settings from .env or environment variables
 src/claudeCli.ts   claude -p wrapper, isolation, errors
 src/language.ts    language hint (uz/ru/en)
-src/prompts.ts     system and user prompts, [SKIP]/[ESCALATE]
+src/prompts.ts     system and user prompts, [SKIP]/[ESCALATE]/[SEND_TEMPLATE], document review prompts
 src/store.ts       history, duplicates, state, previews (atomic JSON files)
-src/service.ts     Assistant: business message flow, owner commands
+src/templates.ts   loads templates/<id>/template.json
+src/clientFolder.ts  data/clients/<id>/: chat.txt, accepted/rejected files, status, percentages
+src/documentReview.ts  DOCX/XLSX text, inbox, one-file check with Claude, JSON verdict
+src/service.ts     Assistant: message flow, review batches, owner commands
 src/handlers.ts    grammY router
 company.md         company profile (fill in)
+templates/         document templates (blank questionnaire uz/ru + template.json)
+laws/              lex.uz summaries used by document checks
 tests/             vitest tests
 Dockerfile, railway.json, .dockerignore
 ```

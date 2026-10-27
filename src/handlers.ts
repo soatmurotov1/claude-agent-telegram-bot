@@ -3,13 +3,20 @@ import type { ReplyKeyboardMarkup } from "grammy/types";
 import type { Settings } from "./config.js";
 import {
   type Assistant,
+  CHAT_TXT_CALLBACK_PREFIX,
+  CLIENT_KEYBOARD,
+  DELETE_CALLBACK_PREFIX,
+  DELETE_CANCEL_CALLBACK,
+  DELETE_CONFIRM_CALLBACK_PREFIX,
+  deleteConfirmKeyboard,
   describe,
+  FILES_CALLBACK_PREFIX,
   FOLDER_CALLBACK_PREFIX,
+  folderKeyboard,
   REPLY_CALLBACK_PREFIX,
   REPLY_DONE_CALLBACK,
   REPLY_DONE_KEYBOARD,
   REPLY_MODE_MINUTES,
-  replyKeyboard,
 } from "./service.js";
 
 export const ALLOWED_UPDATES = ["message", "callback_query", "business_connection", "business_message"] as const;
@@ -28,8 +35,11 @@ export const OWNER_KEYBOARD: ReplyKeyboardMarkup = {
 export function welcomeText(companyName: string): string {
   return (
     `Assalomu alaykum! Bu «${companyName}» korxonasining rasmiy yordamchi boti. ` +
-    `Savolingizni shu yerga yozing: bot korxona ma'lumotlari asosida javob beradi, kerak bo'lsa mas'ul xodim ` +
-    `ham javob beradi. Bu avtomatik yordamchi ekanini inobatga oling.`
+    `Savolingizni shu yerga yozing yoki hujjatlaringizni fayl qilib yuboring: bot har bir hujjatni shablon ` +
+    `bo'yicha tekshiradi va paketingiz necha foiz tayyorligini ko'rsatadi.\n\n` +
+    `«📄 Anketa shabloni» — to'ldirish uchun anketa (NDA bilan).\n` +
+    `«📊 Hujjatlar holati» — qaysi hujjatlar qabul qilingani va qaysilari yetishmayotgani.\n\n` +
+    `Bu avtomatik yordamchi ekanini inobatga oling.`
   );
 }
 
@@ -51,7 +61,7 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
     if (ctx.from.id === settings.ownerId) {
       await ctx.reply(assistant.startText(), { reply_markup: OWNER_KEYBOARD });
     } else {
-      await ctx.reply(welcomeText(settings.companyName));
+      await ctx.reply(welcomeText(settings.companyName), { reply_markup: CLIENT_KEYBOARD });
     }
   });
 
@@ -96,7 +106,7 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
     if (folder.kind === "file") {
       await ctx.api.sendDocument(settings.ownerId, new InputFile(Buffer.from(folder.content, "utf8"), folder.fileName), {
         caption: folder.caption,
-        reply_markup: replyKeyboard(userId),
+        reply_markup: folderKeyboard(userId),
       });
       return;
     }
@@ -105,9 +115,73 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
       await ctx.api.sendMessage(settings.ownerId, text, {
         parse_mode: "HTML",
         link_preview_options: { is_disabled: true },
-        reply_markup: last ? replyKeyboard(userId) : OWNER_KEYBOARD,
+        reply_markup: last ? folderKeyboard(userId) : OWNER_KEYBOARD,
       });
     }
+  });
+
+  // 📄 chat.txt: the whole conversation with this client as a text file.
+  composer.callbackQuery(new RegExp(`^${CHAT_TXT_CALLBACK_PREFIX}(\\d+)$`), async (ctx) => {
+    await ctx.answerCallbackQuery();
+    if (ctx.from.id !== settings.ownerId) return;
+    const userId = Number(ctx.match[1]);
+    const text = assistant.folders.chatText(userId);
+    if (!text) {
+      await ctx.api.sendMessage(settings.ownerId, "Bu mijozning chat.txt fayli hali yo'q.", { reply_markup: OWNER_KEYBOARD });
+      return;
+    }
+    await ctx.api.sendDocument(settings.ownerId, new InputFile(Buffer.from(text, "utf8"), `chat-${userId}.txt`), {
+      caption: `📄 ${assistant.personTitle(userId)} bilan yozishma`,
+      reply_markup: folderKeyboard(userId),
+    });
+  });
+
+  // 📎 The files of this client that passed the template check.
+  composer.callbackQuery(new RegExp(`^${FILES_CALLBACK_PREFIX}(\\d+)$`), async (ctx) => {
+    await ctx.answerCallbackQuery();
+    if (ctx.from.id !== settings.ownerId) return;
+    const userId = Number(ctx.match[1]);
+    const files = assistant.folders.acceptedFiles(userId);
+    if (files.length === 0) {
+      await ctx.api.sendMessage(settings.ownerId, "Bu mijozdan hali birorta hujjat qabul qilinmagan.", {
+        reply_markup: OWNER_KEYBOARD,
+      });
+      return;
+    }
+    await ctx.api.sendMessage(settings.ownerId, assistant.clientProgressText(userId, "uz"));
+    for (const { docKey, file } of files) {
+      await ctx.api.sendDocument(settings.ownerId, new InputFile(file), { caption: `✅ ${docKey}` });
+    }
+  });
+
+  // 🗑 Chatni o'chirish: asks first, then deletes everything about this client.
+  composer.callbackQuery(new RegExp(`^${DELETE_CALLBACK_PREFIX}(\\d+)$`), async (ctx) => {
+    await ctx.answerCallbackQuery();
+    if (ctx.from.id !== settings.ownerId) return;
+    const userId = Number(ctx.match[1]);
+    await ctx.api.sendMessage(
+      settings.ownerId,
+      `🗑 ${assistant.personTitle(userId)} bilan butun yozishma, chat.txt, qabul qilingan va rad etilgan fayllar ` +
+        "hamda hujjatlar statistikasi butunlay o'chiriladi. Buni qaytarib bo'lmaydi. O'chirilsinmi?",
+      { reply_markup: deleteConfirmKeyboard(userId) },
+    );
+  });
+
+  composer.callbackQuery(new RegExp(`^${DELETE_CONFIRM_CALLBACK_PREFIX}(\\d+)$`), async (ctx) => {
+    await ctx.answerCallbackQuery();
+    if (ctx.from.id !== settings.ownerId) return;
+    const name = assistant.deleteChat(Number(ctx.match[1]));
+    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => undefined);
+    await ctx.api.sendMessage(settings.ownerId, `✅ ${name} bilan chat va uning papkasi o'chirildi.`, {
+      reply_markup: OWNER_KEYBOARD,
+    });
+  });
+
+  composer.callbackQuery(DELETE_CANCEL_CALLBACK, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    if (ctx.from.id !== settings.ownerId) return;
+    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => undefined);
+    await ctx.api.sendMessage(settings.ownerId, "O'chirish bekor qilindi.", { reply_markup: OWNER_KEYBOARD });
   });
 
   // ✍️ Javob yozish: the owner's next messages go to that person.

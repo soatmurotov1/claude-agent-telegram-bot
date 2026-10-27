@@ -8,7 +8,7 @@ import type { Effort } from "./config.js";
 import { ensurePrivateDir, isRecord } from "./store.js";
 
 /**
- * Builtin plugins of Claude Code 2.1.303, taken from the `plugins` field of the
+ * Builtin plugins of Claude Code 2.1.303 (still the same in 2.1.310), taken from the `plugins` field of the
  * stream-json init event. All of them are switched off for the bot.
  */
 export const BUILTIN_PLUGINS = [
@@ -137,17 +137,30 @@ export function buildEnv(oauthToken?: string, base: NodeJS.ProcessEnv = process.
 
 export type OutputFormat = "json" | "stream-json";
 
+/**
+ * Flags of a document review: only the Read tool, confined by --restricted to the working directory (the review
+ * folder with the client's files), allowed without a prompt; anything else that would ask is denied.
+ */
+export const REVIEW_TOOL_ARGS = [
+  "--tools",
+  "Read",
+  "--restricted",
+  "--allowedTools",
+  "Read",
+  "--permission-prompts",
+  "none",
+] as const;
+
 export function buildArgs(
   promptFile: string,
-  opts: { outputFormat: OutputFormat; effort: Effort; model?: string },
+  opts: { outputFormat: OutputFormat; effort: Effort; model?: string; review?: boolean },
 ): string[] {
   const args = [
     "-p",
     "--safe-mode",
     "--settings",
     JSON.stringify(ISOLATION_SETTINGS),
-    "--tools",
-    "",
+    ...(opts.review ? REVIEW_TOOL_ARGS : ["--tools", ""]),
     "--strict-mcp-config",
     "--setting-sources",
     "",
@@ -242,7 +255,16 @@ export class ClaudeCLI {
   }
 
   async generate(system: string, user: string, opts: { signal?: AbortSignal } = {}): Promise<string> {
-    const run = await this.#run(system, user, "json", opts.signal);
+    const run = await this.#run(system, user, "json", { signal: opts.signal });
+    return this.#parse(run);
+  }
+
+  /**
+   * Checks the client's files in `dir` (a fresh 0700 folder holding only those files): Claude runs there and may
+   * only read files inside it. The timeout is doubled, since scanned PDFs take longer.
+   */
+  async review(system: string, user: string, dir: string, opts: { signal?: AbortSignal } = {}): Promise<string> {
+    const run = await this.#run(system, user, "json", { signal: opts.signal, cwd: dir, review: true });
     return this.#parse(run);
   }
 
@@ -294,7 +316,12 @@ export class ClaudeCLI {
     }
   }
 
-  async #run(system: string, user: string, outputFormat: OutputFormat, signal?: AbortSignal): Promise<RunResult> {
+  async #run(
+    system: string,
+    user: string,
+    outputFormat: OutputFormat,
+    opts: { signal?: AbortSignal; cwd?: string; review?: boolean } = {},
+  ): Promise<RunResult> {
     ensurePrivateDir(this.workdir);
     const promptFile = path.join(this.workdir, `system-${crypto.randomBytes(12).toString("hex")}.txt`);
     const handle = await fs.promises.open(promptFile, "wx", 0o600);
@@ -304,14 +331,19 @@ export class ClaudeCLI {
       } finally {
         await handle.close();
       }
-      const args = buildArgs(promptFile, { outputFormat, effort: this.effort, model: this.model });
-      return await this.#spawn(args, user, signal);
+      const args = buildArgs(promptFile, { outputFormat, effort: this.effort, model: this.model, review: opts.review });
+      const timeout = opts.review ? this.timeoutSeconds * 2 : this.timeoutSeconds;
+      return await this.#spawn(args, user, { signal: opts.signal, cwd: opts.cwd ?? this.workdir, timeoutSeconds: timeout });
     } finally {
       await fs.promises.rm(promptFile, { force: true });
     }
   }
 
-  #spawn(args: string[], input: string, signal?: AbortSignal): Promise<RunResult> {
+  #spawn(
+    args: string[],
+    input: string,
+    { signal, cwd, timeoutSeconds }: { signal?: AbortSignal; cwd: string; timeoutSeconds: number },
+  ): Promise<RunResult> {
     return new Promise<RunResult>((resolve, reject) => {
       if (signal?.aborted) {
         reject(new ClaudeError("Claude call was aborted before it started"));
@@ -320,7 +352,7 @@ export class ClaudeCLI {
       let child: ChildProcessByStdio<Writable, Readable, Readable>;
       try {
         child = spawn(this.claudeBin, args, {
-          cwd: this.workdir,
+          cwd,
           env: buildEnv(this.#oauthToken || undefined),
           stdio: ["pipe", "pipe", "pipe"],
           detached: true,
@@ -348,8 +380,8 @@ export class ClaudeCLI {
       };
       const timer = setTimeout(() => {
         killGroup(child.pid);
-        finish(() => reject(new ClaudeTimeout(`Claude did not answer within ${this.timeoutSeconds} s`)));
-      }, this.timeoutSeconds * 1000);
+        finish(() => reject(new ClaudeTimeout(`Claude did not answer within ${timeoutSeconds} s`)));
+      }, timeoutSeconds * 1000);
       signal?.addEventListener("abort", onAbort, { once: true });
 
       child.stdout.on("data", (chunk: Buffer) => out.push(chunk));

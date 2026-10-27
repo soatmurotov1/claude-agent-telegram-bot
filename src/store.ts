@@ -144,6 +144,19 @@ export class HistoryStore {
     return Object.keys(this.#data).length;
   }
 
+  /** Forgets this chat in every connection. Returns the number of items removed. */
+  removeChat(chatId: number): number {
+    const suffix = `:${chatId}`;
+    let removed = 0;
+    for (const [key, items] of Object.entries(this.#data)) {
+      if (!key.endsWith(suffix)) continue;
+      removed += items.length;
+      delete this.#data[key];
+    }
+    if (removed > 0) this.#file.write(this.#data);
+    return removed;
+  }
+
   /** Drops expired and overflowing items and empty chats. Returns true when something changed. */
   #prune(): boolean {
     const cutoff = this.clock() - this.ttlDays * 86400;
@@ -304,6 +317,12 @@ export class UserDirectory {
     });
     this.#prune();
     this.#save();
+  }
+
+  remove(id: number): boolean {
+    if (!this.#users.delete(id)) return false;
+    this.#save();
+    return true;
   }
 
   /** Most recently active first. */

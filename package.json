@@ -13,12 +13,14 @@
     "test": "vitest run",
     "start": "node dist/bot.js",
     "check-claude": "tsx src/bot.ts --check-claude",
-    "try": "tsx src/bot.ts --try"
+    "try": "tsx src/bot.ts --try",
+    "review": "tsx src/bot.ts --review"
   },
   "dependencies": {
     "@grammyjs/runner": "^2.0.3",
     "dotenv": "^16.4.7",
-    "grammy": "^1.30.0"
+    "grammy": "^1.30.0",
+    "jszip": "^3.10.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

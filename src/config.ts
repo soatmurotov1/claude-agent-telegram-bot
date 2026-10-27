@@ -19,8 +19,11 @@ export const SETTING_KEYS = [
   "OWNER_TAKEOVER_MINUTES",
   "HISTORY_LIMIT",
   "HISTORY_TTL_DAYS",
+  "REVIEW_DAILY_LIMIT",
   "DATA_DIR",
   "PROFILE_PATH",
+  "TEMPLATES_DIR",
+  "LAWS_DIR",
 ] as const;
 
 export type SettingKey = (typeof SETTING_KEYS)[number];
@@ -56,8 +59,12 @@ export interface Settings {
   readonly ownerTakeoverMinutes: number;
   readonly historyLimit: number;
   readonly historyTtlDays: number;
+  /** Claude calls for document checks allowed per 24 hours across all clients. */
+  readonly reviewDailyLimit: number;
   readonly dataDir: string;
   readonly profilePath: string;
+  readonly templatesDir: string;
+  readonly lawsDir: string;
   readonly envFile: string;
   readonly fromEnvironment: boolean;
   readonly claudeAuthMode: ClaudeAuthMode;
@@ -190,8 +197,11 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
     ownerTakeoverMinutes: int("OWNER_TAKEOVER_MINUTES", 15, 0),
     historyLimit: int("HISTORY_LIMIT", 50, 1),
     historyTtlDays: int("HISTORY_TTL_DAYS", 30, 1),
+    reviewDailyLimit: int("REVIEW_DAILY_LIMIT", 100, 1),
     dataDir: path.resolve(baseDir, get("DATA_DIR") || "data"),
     profilePath: path.resolve(baseDir, get("PROFILE_PATH") || "company.md"),
+    templatesDir: path.resolve(baseDir, get("TEMPLATES_DIR") || "templates"),
+    lawsDir: path.resolve(baseDir, get("LAWS_DIR") || "laws"),
     envFile: envPath,
     fromEnvironment,
   };

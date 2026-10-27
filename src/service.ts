@@ -1,11 +1,23 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GrammyError, HttpError, type Api } from "grammy";
-import type { BusinessConnection, InlineKeyboardMarkup, Message } from "grammy/types";
+import crypto from "node:crypto";
+import { GrammyError, HttpError, InputFile, type Api } from "grammy";
+import type { BusinessConnection, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup } from "grammy/types";
 import { ClaudeCLI, ClaudeError, ClaudeLimitError } from "./claudeCli.js";
+import { ClientFolders, progress, progressText, safeFileName } from "./clientFolder.js";
 import type { Settings } from "./config.js";
+import {
+  type FileVerdict,
+  Inbox,
+  MAX_FILE_BYTES,
+  readLaws,
+  type ReviewChat,
+  type ReviewGenerator,
+  reviewFile,
+} from "./documentReview.js";
 import { detectLanguage, type Language } from "./language.js";
-import { buildSystemPrompt, buildUserPrompt, SKIP_TOKEN, splitEscalation } from "./prompts.js";
+import { buildSystemPrompt, buildUserPrompt, SKIP_TOKEN, splitEscalation, splitTemplate } from "./prompts.js";
+import { blankFor, loadTemplate, type Template } from "./templates.js";
 import {
   appendJsonl,
   type Clock,
@@ -34,6 +46,9 @@ export const Outcome = {
   skipped: "skipped",
   permission_denied: "permission_denied",
   throttled: "throttled",
+  review_queued: "review_queued",
+  status_shown: "status_shown",
+  template_sent: "template_sent",
   error: "error",
 } as const;
 export type Outcome = (typeof Outcome)[keyof typeof Outcome];
@@ -49,9 +64,8 @@ export interface Preview {
   note: string;
 }
 
-export interface ReplyGenerator {
-  generate(system: string, user: string): Promise<string>;
-}
+/** Writes replies; `review` (Claude with read access to one folder) is needed only for PDF and image checks. */
+export type ReplyGenerator = ReviewGenerator;
 
 const MAX_MESSAGE_LENGTH = 4000;
 const OWNER_ALERT_INTERVAL_SECONDS = 600;
@@ -69,6 +83,75 @@ export const REPLY_CALLBACK_PREFIX = "reply:";
 export const REPLY_DONE_CALLBACK = "reply-done";
 /** How long the owner's reply mode stays open after the last message sent in it. */
 export const REPLY_MODE_MINUTES = 15;
+/** callback_data prefixes of the buttons under a client's folder. */
+export const CHAT_TXT_CALLBACK_PREFIX = "chattxt:";
+export const FILES_CALLBACK_PREFIX = "files:";
+export const DELETE_CALLBACK_PREFIX = "delete:";
+export const DELETE_CONFIRM_CALLBACK_PREFIX = "delete-yes:";
+export const DELETE_CANCEL_CALLBACK = "delete-no";
+/** Files a client sends are reviewed this long after the last one arrives, as one batch. */
+export const REVIEW_BATCH_SECONDS = 15;
+
+/** Texts of the client's keyboard buttons in the bot's own chat. */
+export const CLIENT_STATUS_BUTTON = "📊 Hujjatlar holati";
+export const CLIENT_TEMPLATE_BUTTON = "📄 Anketa shabloni";
+
+/** Persistent keyboard for clients in the bot's own chat. */
+export const CLIENT_KEYBOARD: ReplyKeyboardMarkup = {
+  keyboard: [[{ text: CLIENT_STATUS_BUTTON }, { text: CLIENT_TEMPLATE_BUTTON }]],
+  resize_keyboard: true,
+  is_persistent: true,
+};
+
+const STATUS_WORDS = new Set([
+  "hujjatlar holati", "holat", "holati", "status", "статус", "статус документов", "ҳужжатлар ҳолати", "ҳолат",
+  "document status",
+]);
+const TEMPLATE_WORDS = new Set([
+  "anketa shabloni", "anketa", "shablon", "анкета", "шаблон", "анкета шаблони", "шаблон анкеты", "questionnaire",
+  "template",
+]);
+
+/** A client's short request that is answered without Claude: their document status or the blank form. */
+export function quickRequest(text: string): "status" | "template" | null {
+  const normalized = text
+    .toLowerCase()
+    .replace(/[\p{Extended_Pictographic}\uFE0F]/gu, "")
+    .replace(/[.!?,:;]+/g, "")
+    .trim();
+  if (STATUS_WORDS.has(normalized)) return "status";
+  if (TEMPLATE_WORDS.has(normalized)) return "template";
+  return null;
+}
+
+/** Buttons under a client's folder for the owner. */
+export function folderKeyboard(userId: number): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: "✍️ Javob yozish", callback_data: `${REPLY_CALLBACK_PREFIX}${userId}` }],
+      [
+        { text: "📄 chat.txt", callback_data: `${CHAT_TXT_CALLBACK_PREFIX}${userId}` },
+        { text: "📎 Qabul qilingan fayllar", callback_data: `${FILES_CALLBACK_PREFIX}${userId}` },
+      ],
+      [{ text: "🗑 Chatni o'chirish", callback_data: `${DELETE_CALLBACK_PREFIX}${userId}` }],
+    ],
+  };
+}
+
+/** The confirmation asked before a client's chat is deleted. */
+export function deleteConfirmKeyboard(userId: number): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [
+        { text: "🗑 Ha, o'chirilsin", callback_data: `${DELETE_CONFIRM_CALLBACK_PREFIX}${userId}` },
+        { text: "Bekor qilish", callback_data: DELETE_CANCEL_CALLBACK },
+      ],
+    ],
+  };
+}
+
+/** Downloads a Telegram file to `target`. Replaced in tests. */
+export type FileDownloader = (api: Api, fileId: string, target: string) => Promise<void>;
 
 /** The ✍️ button that starts writing to a person. */
 export function replyKeyboard(userId: number): InlineKeyboardMarkup {
@@ -217,6 +300,9 @@ export class KeyedMutex {
 export interface AssistantOptions {
   clock?: Clock;
   previewSink?: (preview: Preview) => void;
+  downloadFile?: FileDownloader;
+  /** Wait after the last file before a batch is reviewed (default REVIEW_BATCH_SECONDS). */
+  reviewDelayMs?: number;
 }
 
 /** Where a reply goes: a chat of the connected business account, or the bot's own private chat. */
@@ -255,6 +341,10 @@ export class Assistant {
   readonly seen: SeenMessages;
   readonly state: RuntimeState;
   readonly users: UserDirectory;
+  /** data/clients/<id>/: chat.txt, accepted and rejected files, document status. */
+  readonly folders: ClientFolders;
+  /** Client files waiting for review. */
+  readonly inbox: Inbox;
   readonly outcomes: Outcome[] = [];
   readonly previewsFile: string;
   readonly #connections = new Map<string, BusinessConnection>();
@@ -266,14 +356,25 @@ export class Assistant {
   #replyTo: { userId: number; until: number } | null = null;
   readonly #clock: Clock;
   readonly #previewSink: (preview: Preview) => void;
+  readonly #downloadFile: FileDownloader;
+  readonly #reviewDelayMs: number;
+  readonly #reviewTimers = new Map<number, NodeJS.Timeout>();
+  /** Batches running now, so tests and /resume can wait for them. */
+  readonly #reviewRuns = new Map<number, Promise<void>>();
+  /** Times of document-check Claude calls in the last 24 hours (REVIEW_DAILY_LIMIT). */
+  #reviewCalls: number[] = [];
+  /** The API of the latest update, for batches that start later from a timer. */
+  #api: Api | null = null;
 
   constructor(
     readonly settings: Settings,
     private readonly generator: ReplyGenerator,
-    { clock = () => Date.now() / 1000, previewSink = printPreview }: AssistantOptions = {},
+    { clock = () => Date.now() / 1000, previewSink = printPreview, downloadFile, reviewDelayMs }: AssistantOptions = {},
   ) {
     this.#clock = clock;
     this.#previewSink = previewSink;
+    this.#downloadFile = downloadFile ?? ((api, fileId, target) => telegramDownload(api, settings.botToken, fileId, target));
+    this.#reviewDelayMs = reviewDelayMs ?? REVIEW_BATCH_SECONDS * 1000;
     const dir = settings.dataDir;
     ensurePrivateDir(dir);
     this.history = new HistoryStore(
@@ -297,6 +398,8 @@ export class Assistant {
     this.seen = new SeenMessages(path.join(dir, "seen.json"));
     this.state = new RuntimeState(path.join(dir, "state.json"));
     this.users = new UserDirectory(path.join(dir, "users.json"), settings.historyTtlDays, clock);
+    this.folders = new ClientFolders(path.join(dir, "clients"), clock);
+    this.inbox = new Inbox(this.folders);
     this.previewsFile = path.join(dir, "previews.jsonl");
   }
 
@@ -307,11 +410,13 @@ export class Assistant {
   }
 
   async onBusinessMessage(api: Api, message: Message): Promise<Outcome> {
+    this.#api = api;
     return this.#record(await this.#handleBusiness(api, message));
   }
 
   /** A person (not the owner) wrote to the bot itself in a private chat. */
   async onDirectMessage(api: Api, message: Message): Promise<Outcome> {
+    this.#api = api;
     return this.#record(await this.#handleDirect(api, message));
   }
 
@@ -358,7 +463,7 @@ export class Assistant {
       return Outcome.owner_message;
     }
 
-    const language = detectLanguage(text) ?? this.history.lastLanguage(connectionId, chatId);
+    const language = languageOf(message) ?? this.history.lastLanguage(connectionId, chatId);
     this.#remember(connectionId, chatId, { role: "other", name: senderName(message), text, lang: language });
     this.#rememberUser(message);
 
@@ -371,8 +476,31 @@ export class Assistant {
       incoming: text,
       language,
     };
+    const handled = await this.#handleFileOrQuick(api, message, chat);
+    if (handled) return handled;
     const result = await this.#locks.run(chatKey, () => this.#respond(api, chat));
     return result.outcome;
+  }
+
+  /**
+   * Files and photos go to the review queue (the batch summary is the answer), and "status" / "anketa" requests
+   * are answered without Claude. Returns null for everything else.
+   */
+  async #handleFileOrQuick(api: Api, message: Message, chat: ChatContext): Promise<Outcome | null> {
+    if (fileOf(message)) {
+      await this.#queueFile(api, message, chat);
+      return Outcome.review_queued;
+    }
+    const quick = message.text !== undefined ? quickRequest(message.text) : null;
+    if (quick === null) return null;
+    const blocked = this.#blocked(chat.chatKey);
+    if (blocked === Outcome.owner_active || blocked === Outcome.paused) return null;
+    if (quick === "status") {
+      await this.#deliver(api, chat, this.clientProgressText(chat.chatId, chat.language));
+      return Outcome.status_shown;
+    }
+    await this.#sendTemplate(api, chat);
+    return Outcome.template_sent;
   }
 
   async #handleDirect(api: Api, message: Message): Promise<Outcome> {
@@ -385,7 +513,7 @@ export class Assistant {
     if (text === null) return Outcome.unsupported;
 
     const chatKey = HistoryStore.key(DIRECT_HISTORY_ID, chatId);
-    const language = detectLanguage(text) ?? this.history.lastLanguage(DIRECT_HISTORY_ID, chatId);
+    const language = languageOf(message) ?? this.history.lastLanguage(DIRECT_HISTORY_ID, chatId);
     this.#remember(DIRECT_HISTORY_ID, chatId, { role: "other", name: senderName(message), text, lang: language });
     this.#rememberUser(message);
 
@@ -399,6 +527,8 @@ export class Assistant {
       language,
       threadId: message.is_topic_message ? message.message_thread_id : undefined,
     };
+    const handled = await this.#handleFileOrQuick(api, message, chat);
+    if (handled) return handled;
     const result = await this.#locks.run(chatKey, () => {
       if (!this.#allowDirectCall(chatKey)) {
         log(`Chat ${chat.chatName} (${chatId}): more than ${DIRECT_HOURLY_LIMIT} messages this hour, not calling Claude.`);
@@ -550,7 +680,8 @@ export class Assistant {
       return result(failure.outcome, "", false, failure.note);
     }
 
-    const { escalate, text: reply } = splitEscalation(raw);
+    const { escalate, text: withMarkers } = splitEscalation(raw);
+    const { sendTemplate, text: reply } = splitTemplate(withMarkers);
     if (!reply || reply.startsWith(SKIP_TOKEN)) {
       log(`Chat ${chat.chatName} (${chat.chatId}): no reply needed ([SKIP]).`);
       return result(Outcome.skipped, "", escalate);
@@ -565,7 +696,7 @@ export class Assistant {
       incoming: chat.incoming,
       reply,
       escalated: escalate,
-      note: "",
+      note: sendTemplate ? "the blank questionnaire is sent after this reply" : "",
     };
 
     if (!this.settings.autoSend) {
@@ -613,7 +744,374 @@ export class Assistant {
       lang: chat.language,
     });
     log(`Sent a reply to chat ${chat.chatName} (${chat.chatId})${escalate ? " [ESCALATED]" : ""}.`);
+    if (sendTemplate) await this.#sendTemplate(api, chat, false);
     return result(Outcome.sent, reply, escalate);
+  }
+
+  /** Telegram send options for a chat: business connection and topic. */
+  #sendOptions(chat: Pick<ChatContext, "target" | "threadId">): { business_connection_id?: string; message_thread_id?: number } {
+    const options: { business_connection_id?: string; message_thread_id?: number } = {};
+    if (chat.threadId !== undefined) options.message_thread_id = chat.threadId;
+    if (chat.target.kind === "business") options.business_connection_id = chat.target.connectionId;
+    return options;
+  }
+
+  /**
+   * Sends a text the bot wrote without Claude's reply flow (status, review summary) to the client. In PREVIEW mode,
+   * or when the owner is answering this chat, it goes to the logs instead. Returns true when it was sent.
+   */
+  async #deliver(api: Api, chat: ChatContext, text: string, keyboard?: InlineKeyboardMarkup | ReplyKeyboardMarkup): Promise<boolean> {
+    const preview: Preview = {
+      connectionId: chat.target.kind === "business" ? chat.target.connectionId : DIRECT_HISTORY_ID,
+      chatId: chat.chatId,
+      chatName: chat.chatName,
+      language: chat.language,
+      incoming: chat.incoming,
+      reply: text,
+      escalated: false,
+      note: "",
+    };
+    if (!this.settings.autoSend) {
+      this.#showPreview(preview);
+      return false;
+    }
+    if (chat.target.kind === "business") {
+      const reason = await this.#connectionProblem(api, chat.target.connectionId);
+      if (reason) {
+        logError(`Not sending to chat ${chat.chatId}: ${reason}.`);
+        this.#showPreview({ ...preview, note: `not sent: ${reason}` });
+        return false;
+      }
+    }
+    try {
+      const chunks = splitMessage(text);
+      for (const [i, chunk] of chunks.entries()) {
+        const last = i === chunks.length - 1;
+        await api.sendMessage(chat.chatId, chunk, {
+          ...this.#sendOptions(chat),
+          ...(last && keyboard ? { reply_markup: keyboard } : {}),
+        });
+      }
+    } catch (err) {
+      logError(`Sending to chat ${chat.chatId} failed: ${errorMessage(err)}`);
+      return false;
+    }
+    this.#remember(chat.historyId, chat.chatId, {
+      role: "owner",
+      name: this.settings.companyName,
+      text,
+      lang: chat.language,
+    });
+    return true;
+  }
+
+  /** Sends the blank questionnaire in the client's language (Uzbek, otherwise Russian). */
+  async #sendTemplate(api: Api, chat: ChatContext, withText = true): Promise<boolean> {
+    let template: Template;
+    try {
+      template = loadTemplate(this.settings.templatesDir);
+    } catch (err) {
+      logError(`Cannot send the questionnaire: ${errorMessage(err)}`);
+      return false;
+    }
+    const file = blankFor(template, chat.language);
+    if (!file) {
+      logError(`Cannot send the questionnaire: no blank form in ${template.dir}.`);
+      return false;
+    }
+    const caption = TEMPLATE_CAPTION[chat.language ?? "uz"];
+    if (!this.settings.autoSend) {
+      this.#showPreview({
+        connectionId: chat.target.kind === "business" ? chat.target.connectionId : DIRECT_HISTORY_ID,
+        chatId: chat.chatId,
+        chatName: chat.chatName,
+        language: chat.language,
+        incoming: chat.incoming,
+        reply: `[file ${path.basename(file)}] ${withText ? caption : ""}`.trim(),
+        escalated: false,
+        note: "the blank questionnaire would be sent",
+      });
+      return false;
+    }
+    if (chat.target.kind === "business") {
+      const reason = await this.#connectionProblem(api, chat.target.connectionId);
+      if (reason) {
+        logError(`Not sending the questionnaire to chat ${chat.chatId}: ${reason}.`);
+        return false;
+      }
+    }
+    const fileName = `${template.title[chat.language === "ru" || chat.language === "en" ? "ru" : "uz"]}${path.extname(file)}`;
+    try {
+      await api.sendDocument(chat.chatId, new InputFile(file, fileName), {
+        ...this.#sendOptions(chat),
+        ...(withText ? { caption } : {}),
+      });
+    } catch (err) {
+      logError(`Sending the questionnaire to chat ${chat.chatId} failed: ${errorMessage(err)}`);
+      return false;
+    }
+    this.#remember(chat.historyId, chat.chatId, {
+      role: "owner",
+      name: this.settings.companyName,
+      text: `[document] ${fileName}${withText ? ` ${caption}` : ""}`,
+      lang: chat.language,
+    });
+    log(`Sent the blank questionnaire to chat ${chat.chatName} (${chat.chatId}).`);
+    return true;
+  }
+
+  /** The client's document status in their language, without Claude. */
+  clientProgressText(userId: number, language: Language | null): string {
+    try {
+      const template = loadTemplate(this.settings.templatesDir);
+      return progressText(progress(this.folders.status(userId), template), language);
+    } catch (err) {
+      logError(`Cannot build the document status: ${errorMessage(err)}`);
+      return STATUS_UNAVAILABLE[language ?? "uz"];
+    }
+  }
+
+  /** "60%" for the owner's users list, or null when the client has not sent anything for the template yet. */
+  #readyPercent(userId: number): string | null {
+    if (!this.folders.exists(userId)) return null;
+    const status = this.folders.status(userId);
+    if (Object.keys(status.docs).length === 0 && !status.applicant) return null;
+    try {
+      return `${progress(status, loadTemplate(this.settings.templatesDir)).readyPct}%`;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Downloads a client's file into their inbox and (re)starts the batch timer. */
+  async #queueFile(api: Api, message: Message, chat: ChatContext): Promise<void> {
+    const file = fileOf(message);
+    if (!file) return;
+    const lang = chat.language ?? "uz";
+    if (file.size !== undefined && file.size > MAX_FILE_BYTES) {
+      log(`Chat ${chat.chatName} (${chat.chatId}): ${file.name} is larger than 20 MB, not downloaded.`);
+      this.folders.reject(chat.chatId, "", null, null, file.name, [TOO_LARGE_REASON[lang]]);
+      await this.#deliver(api, chat, `❌ ${file.name}: ${TOO_LARGE_REASON[lang]}.`);
+      return;
+    }
+    const workdir = path.join(this.settings.dataDir, "claude-run");
+    ensurePrivateDir(workdir);
+    const tmp = path.join(workdir, `download-${crypto.randomBytes(8).toString("hex")}`);
+    try {
+      await this.#downloadFile(api, file.fileId, tmp);
+      const reviewChat: ReviewChat = {
+        target: chat.target,
+        chatId: chat.chatId,
+        chatName: chat.chatName,
+        language: chat.language,
+        ...(chat.threadId !== undefined ? { threadId: chat.threadId } : {}),
+      };
+      this.inbox.add(reviewChat, tmp, file.name, message.message_id, this.#clock());
+    } catch (err) {
+      fs.rmSync(tmp, { force: true });
+      logError(`Could not download ${file.name} from chat ${chat.chatId}: ${errorMessage(err)}`);
+      if (chat.target.kind === "direct") await this.#passToOwner(api, message, chat, false);
+      return;
+    }
+    log(`Chat ${chat.chatName} (${chat.chatId}): ${file.name} queued for review.`);
+    this.#scheduleReview(chat.chatId, this.#reviewDelayMs);
+  }
+
+  #scheduleReview(userId: number, delayMs: number): void {
+    const existing = this.#reviewTimers.get(userId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.#reviewTimers.delete(userId);
+      void this.#startReview(userId);
+    }, Math.max(0, delayMs));
+    timer.unref();
+    this.#reviewTimers.set(userId, timer);
+  }
+
+  #startReview(userId: number): Promise<void> {
+    const run = this.#locks
+      .run(`review:${userId}`, () => this.#reviewBatch(userId))
+      .catch((err: unknown) => logError(`Document review for chat ${userId} failed: ${errorMessage(err)}`))
+      .finally(() => {
+        if (this.#reviewRuns.get(userId) === run) this.#reviewRuns.delete(userId);
+      });
+    this.#reviewRuns.set(userId, run);
+    return run;
+  }
+
+  /** Reviews waiting files now instead of after the batch delay, and waits until every batch is done (tests, /resume). */
+  async flushReviews(api?: Api): Promise<void> {
+    if (api) this.#api = api;
+    for (const [userId, timer] of this.#reviewTimers) {
+      clearTimeout(timer);
+      this.#reviewTimers.delete(userId);
+    }
+    const waiting = new Set([...this.inbox.pending(), ...this.#reviewRuns.keys()]);
+    await Promise.all([...waiting].map((userId) => this.#reviewRuns.get(userId) ?? this.#startReview(userId)));
+  }
+
+  /** After a restart: files that were waiting for review are reviewed again. */
+  resumePendingReviews(api: Api): void {
+    this.#api = api;
+    for (const userId of this.inbox.pending()) this.#scheduleReview(userId, this.#reviewDelayMs);
+  }
+
+  #allowReview(): boolean {
+    const now = this.#clock();
+    this.#reviewCalls = this.#reviewCalls.filter((ts) => ts > now - 86400);
+    if (this.#reviewCalls.length >= this.settings.reviewDailyLimit) return false;
+    this.#reviewCalls.push(now);
+    return true;
+  }
+
+  /** Reviews every file in a client's inbox, saves the results and sends one summary. */
+  async #reviewBatch(userId: number): Promise<void> {
+    const api = this.#api;
+    const data = this.inbox.read(userId);
+    if (!api || !data.chat || data.files.length === 0) return;
+    if (this.state.paused) return; // reviewed after /resume
+    const now = this.#clock();
+    if (this.state.limitUntil > now) {
+      this.#scheduleReview(userId, (this.state.limitUntil - now) * 1000 + 1000);
+      return;
+    }
+
+    const saved = data.chat;
+    const historyId = saved.target.kind === "business" ? saved.target.connectionId : DIRECT_HISTORY_ID;
+    const chat: ChatContext = {
+      target: saved.target,
+      historyId,
+      chatId: saved.chatId,
+      chatKey: HistoryStore.key(historyId, saved.chatId),
+      chatName: saved.chatName,
+      incoming: data.files.map((f) => `[document] ${f.name}`).join(", "),
+      language: saved.language,
+      ...(saved.threadId !== undefined ? { threadId: saved.threadId } : {}),
+    };
+    const lang = chat.language ?? "uz";
+
+    let template: Template;
+    try {
+      template = loadTemplate(this.settings.templatesDir);
+    } catch (err) {
+      logError(`Cannot review files of chat ${userId}: ${errorMessage(err)}`);
+      return;
+    }
+    const laws = readLaws(this.settings.lawsDir);
+    log(`Chat ${chat.chatName} (${userId}): reviewing ${data.files.length} file(s).`);
+    if (data.files.length >= 3) await this.#deliver(api, chat, REVIEW_STARTED[lang](data.files.length));
+
+    const verdicts: FileVerdict[] = [];
+    let stopped: "limit" | "daily" | null = null;
+    for (const file of data.files) {
+      if (!this.#allowReview()) {
+        stopped = "daily";
+        logError(`REVIEW_DAILY_LIMIT (${this.settings.reviewDailyLimit}) reached; the remaining files wait an hour.`);
+        this.#scheduleReview(userId, 3600 * 1000);
+        break;
+      }
+      let verdict: FileVerdict;
+      try {
+        verdict = await reviewFile({
+          generator: this.generator,
+          companyName: this.settings.companyName,
+          template,
+          laws,
+          folders: this.folders,
+          inbox: this.inbox,
+          userId,
+          file,
+          language: lang,
+          workdir: path.join(this.settings.dataDir, "claude-run"),
+          now: new Date(this.#clock() * 1000),
+        });
+      } catch (err) {
+        if (err instanceof ClaudeLimitError) {
+          await this.#onGenerateError(api, chat, err);
+          stopped = "limit";
+          this.#scheduleReview(userId, Math.max(0, this.state.limitUntil - this.#clock()) * 1000 + 1000);
+          break;
+        }
+        verdict = { kind: "unchecked", file, reason: err instanceof ClaudeError ? err.message : errorMessage(err) };
+      }
+      this.#saveVerdict(userId, template, verdict);
+      verdicts.push(verdict);
+      // The owner deleted this chat while it was being reviewed.
+      if (!this.folders.exists(userId)) return;
+    }
+    if (verdicts.length === 0) return;
+
+    const left = this.inbox.read(userId).files.length;
+    const p = progress(this.folders.status(userId), template);
+    const summary = reviewSummaryText(verdicts, lang, left, stopped) + "\n\n" + progressText(p, lang);
+    // While the owner is answering this client, the summary goes to the owner only.
+    const ownerActive = this.#blocked(chat.chatKey) === Outcome.owner_active;
+    const sent =
+      !ownerActive &&
+      (await this.#deliver(api, chat, summary, chat.target.kind === "direct" ? CLIENT_KEYBOARD : undefined));
+    log(
+      `Chat ${chat.chatName} (${userId}): ${verdicts.length} file(s) reviewed, ready ${p.readyPct}%` +
+        `${sent ? "" : " (summary not sent)"}.`,
+    );
+    await this.#reportReviewToOwner(api, userId, verdicts, p.readyPct, sent ? "" : summary);
+  }
+
+  #saveVerdict(userId: number, template: Template, verdict: FileVerdict): void {
+    const source = this.inbox.path(userId, verdict.file);
+    try {
+      if (verdict.kind === "accepted") {
+        this.folders.accept(userId, template.id, verdict.doc.key, source, verdict.file.name);
+        if (verdict.applicant) this.folders.setApplicant(userId, template.id, verdict.applicant);
+      } else if (verdict.kind === "rejected") {
+        this.folders.reject(userId, template.id, verdict.doc?.key ?? null, source, verdict.file.name, verdict.reasons);
+      } else {
+        this.folders.reject(userId, template.id, null, source, verdict.file.name, [`not checked: ${verdict.reason}`]);
+      }
+    } catch (err) {
+      logError(`Could not save the review of ${verdict.file.name} for chat ${userId}: ${errorMessage(err)}`);
+    }
+    this.inbox.remove(userId, verdict.file);
+  }
+
+  /** A short note to the owner; files that could not be checked are sent along so someone looks at them. */
+  async #reportReviewToOwner(
+    api: Api,
+    userId: number,
+    verdicts: FileVerdict[],
+    readyPct: number,
+    unsentSummary: string,
+  ): Promise<void> {
+    const count = (kind: FileVerdict["kind"]): number => verdicts.filter((v) => v.kind === kind).length;
+    const unchecked = verdicts.filter((v): v is Extract<FileVerdict, { kind: "unchecked" }> => v.kind === "unchecked");
+    let text =
+      `📎 ${this.personTitle(userId)}: ${verdicts.length} ta fayl tekshirildi — ✅ ${count("accepted")}, ` +
+      `❌ ${count("rejected")}${unchecked.length ? `, ⚠️ ${unchecked.length} ta tekshirib bo'lmadi` : ""}. ` +
+      `Tayyor: ${readyPct}%.`;
+    if (unsentSummary) text += `\n\nMijozga yuborilmadi (PREVIEW yoki siz javob beryapsiz). Xulosa:\n${truncate(unsentSummary, 3000)}`;
+    try {
+      await api.sendMessage(this.settings.ownerId, text, { reply_markup: folderKeyboard(userId) });
+      for (const verdict of unchecked) {
+        const saved = this.#rejectedPath(userId, verdict.file.name);
+        if (!saved) continue;
+        await api.sendDocument(this.settings.ownerId, new InputFile(saved, verdict.file.name), {
+          caption: truncate(`⚠️ Tekshirib bo'lmadi: ${verdict.reason}`, 1000),
+        });
+      }
+    } catch (err) {
+      logError(`Could not report the review of chat ${userId} to the owner: ${errorMessage(err)}`);
+    }
+  }
+
+  /** The newest copy of a file in the client's rejected/ folder. */
+  #rejectedPath(userId: number, originalName: string): string | null {
+    const dir = path.join(this.folders.dir(userId), "rejected");
+    try {
+      const suffix = `_${safeFileName(originalName)}`;
+      const match = fs.readdirSync(dir).filter((name) => name.endsWith(suffix)).sort().at(-1);
+      return match ? path.join(dir, match) : null;
+    } catch {
+      return null;
+    }
   }
 
   async #connectionProblem(api: Api, connectionId: string): Promise<string> {
@@ -736,6 +1234,32 @@ export class Assistant {
     } catch (err) {
       logError(`Could not update the transcripts: ${errorMessage(err)}`);
     }
+    try {
+      this.folders.appendChat(chatId, item.role === "other" ? item.name : this.settings.companyName, item.text);
+    } catch (err) {
+      logError(`Could not update chat.txt of chat ${chatId}: ${errorMessage(err)}`);
+    }
+  }
+
+  /**
+   * The owner's 🗑: forgets everything about this client — history, transcripts, the users list entry and the whole
+   * client folder (chat.txt, accepted and rejected files, files waiting for review). Returns their name.
+   */
+  deleteChat(userId: number): string {
+    const name = this.personTitle(userId);
+    const timer = this.#reviewTimers.get(userId);
+    if (timer) clearTimeout(timer);
+    this.#reviewTimers.delete(userId);
+    this.transcripts.removeChat(userId);
+    this.history.removeChat(userId);
+    this.users.remove(userId);
+    this.folders.delete(userId);
+    for (const key of [...this.#takeoverUntil.keys()]) {
+      if (key.endsWith(`:${userId}`)) this.#takeoverUntil.delete(key);
+    }
+    if (this.#replyTo?.userId === userId) this.#replyTo = null;
+    log(`The owner deleted the chat and folder of ${userId}.`);
+    return name;
   }
 
   #rememberUser(message: Message): void {
@@ -765,9 +1289,11 @@ export class Assistant {
     users.forEach((user, i) => {
       const name = `<a href="tg://user?id=${user.id}">${escapeHtml(user.name)}</a>`;
       const username = user.username ? ` @${escapeHtml(user.username)}` : "";
+      const ready = this.#readyPercent(user.id);
       const line =
         `${i + 1}. ${name}${username}\n` +
-        `    ID ${user.id} · ${user.messages} ta xabar · oxirgi: ${tashkentTime(user.lastSeen)}`;
+        `    ID ${user.id} · ${user.messages} ta xabar · oxirgi: ${tashkentTime(user.lastSeen)}` +
+        (ready ? ` · 📊 ${ready}` : "");
       if (current.text.length + line.length + 1 > 3800 || current.buttons.length >= USERS_PER_PAGE) {
         pages.push(current);
         current = { text: "", buttons: [] };
@@ -784,8 +1310,12 @@ export class Assistant {
     const user = this.users.list().find((known) => known.id === userId);
     const title = user ? `${user.name}${user.username ? ` @${user.username}` : ""}, ID ${userId}` : `ID ${userId}`;
     const items = this.transcripts.forChat(userId);
+    const documents = this.#readyPercent(userId) !== null ? `\n${this.clientProgressText(userId, "uz")}\n` : "";
     if (items.length === 0) {
-      return { kind: "messages", messages: [`📁 ${escapeHtml(title)}\n\nBu mijoz bilan yozishma topilmadi.`] };
+      return {
+        kind: "messages",
+        messages: [`📁 ${escapeHtml(title)}\n${escapeHtml(documents)}\nBu mijoz bilan yozishma topilmadi.`],
+      };
     }
 
     const header = `📁 ${title} — ${items.length} ta xabar`;
@@ -795,7 +1325,7 @@ export class Assistant {
     });
 
     const messages: string[] = [];
-    let current = `<b>${escapeHtml(header)}</b>\n`;
+    let current = `<b>${escapeHtml(header)}</b>\n${escapeHtml(documents)}`;
     for (const entry of entries) {
       const block = `\n<b>${escapeHtml(entry.who)}</b>\n${escapeHtml(truncate(entry.text, 3000))}\n`;
       if (current.length + block.length > 3800) {
@@ -807,7 +1337,7 @@ export class Assistant {
     messages.push(current);
     if (messages.length <= FOLDER_MAX_MESSAGES) return { kind: "messages", messages };
 
-    const content = [header, "", ...entries.map((entry) => `${entry.who}\n${entry.text}\n`)].join("\n");
+    const content = [header, documents, ...entries.map((entry) => `${entry.who}\n${entry.text}\n`)].join("\n");
     return {
       kind: "file",
       caption: `${header}. Yozishma uzun, shuning uchun fayl qilib yuborildi.`,
@@ -824,6 +1354,8 @@ export class Assistant {
     this.state.paused = false;
     this.state.limitUntil = 0;
     this.#takeoverUntil.clear();
+    // Files that waited while the bot was paused or limited.
+    if (this.#api) this.resumePendingReviews(this.#api);
   }
 
   modeText(): string {
@@ -867,8 +1399,13 @@ export class Assistant {
       `• Holat: ${state}`,
       "",
       "Siz (admin) uchun:",
-      "• Mijozlarning xabarlari sizga yuborilmaydi. Faqat 🚨 muhim murojaatlar va mijoz yuborgan fayl/rasmlar keladi.",
-      "• «users» tugmasi mijozlar ro'yxatini ko'rsatadi. Mijozni bossangiz, u bilan butun yozishma ochiladi.",
+      "• Mijozlarning xabarlari sizga yuborilmaydi. Faqat 🚨 muhim murojaatlar va hujjat tekshiruvi xulosalari keladi.",
+      "• Mijoz fayl yuborsa (bir yo'la 10–50 ta ham bo'lishi mumkin), bot har birini anketa shabloni " +
+        "(templates/) bo'yicha tekshiradi: moslari mijoz papkasiga saqlanadi, mos kelmaganlarini sababi bilan " +
+        "qayta so'raydi va mijozga necha foiz tayyorligini ko'rsatadi. Tekshirib bo'lmagan fayllar sizga keladi.",
+      "• «users» tugmasi mijozlar ro'yxatini (📊 tayyorlik foizi bilan) ko'rsatadi. Mijozni bossangiz, u bilan " +
+        "butun yozishma va hujjatlar holati ochiladi; ostida «📄 chat.txt», «📎 Qabul qilingan fayllar» va " +
+        "«🗑 Chatni o'chirish» tugmalari bor.",
       "• Mijozga javob berish: yozishma ostidagi «✍️ Javob yozish» ni bosing va javobni yuboring — matn, rasm, " +
         "fayl yoki ovozli xabar bo'lishi mumkin. Tugatgach «✖️ Tugatish» ni bosing.",
       `• Siz javob bergan chatda bot ${s.ownerTakeoverMinutes} daqiqa jim turadi, shu vaqtda mijozning xabarlari ` +
@@ -881,11 +1418,14 @@ export class Assistant {
       "/status — holat",
       "",
       "Bilib qo'ying:",
-      "• Bot narx, muddat, shartnoma, ruxsatnoma, ekspertiza yoki tekshiruv natijasi bo'yicha va'da bermaydi — " +
-        "murojaatni qabul qilib, mas'ul xodimga yo'naltiradi.",
+      "• Bot mijozni anketani to'ldirish, NDA ni imzolash va hujjatlarni topshirishga olib boradi. Aniq narx, " +
+        "muddat, ruxsatnoma yoki ekspertiza natijasi bo'yicha va'da bermaydi — bunday savollarni mas'ul xodimga " +
+        "yo'naltiradi.",
       "• Favqulodda holat, shikoyat yoki rasmiy so'rovlar 🚨 belgisi bilan keladi.",
       `• Bir odamdan soatiga ${DIRECT_HOURLY_LIMIT} tadan ko'p xabarga bot javob bermaydi (obuna limitini tejash uchun).`,
-      `• Suhbat tarixi ${s.historyTtlDays} kun saqlanadi, keyin o'chiriladi.`,
+      `• Suhbat tarixi ${s.historyTtlDays} kun saqlanadi. Mijoz papkalari (chat.txt va hujjatlar) siz «🗑» bilan ` +
+        "o'chirmaguningizcha saqlanadi.",
+      `• Hujjat tekshiruvi uchun sutkasiga ko'pi bilan ${s.reviewDailyLimit} ta Claude chaqiruvi (REVIEW_DAILY_LIMIT).`,
       "• Korxona haqidagi ma'lumotlar company.md faylida turadi.",
       "• Telegram Premium bo'lsa, botni Settings → Telegram Business → Chatbots orqali korxona akkauntiga ham ulash mumkin.",
     ];
@@ -940,6 +1480,142 @@ export function buildAssistant(
 ): Assistant {
   return new Assistant(settings, opts.generator ?? makeClaudeCli(settings), opts);
 }
+
+/**
+ * Language of what the person wrote (text or caption). A file without a caption has none: its "[document] name"
+ * description is not their language, so the chat's last language is used instead.
+ */
+function languageOf(message: Message): Language | null {
+  const words = message.text ?? message.caption;
+  if (!words) return null;
+  // One-word requests ("holat", "статус", "status") are too short for detectLanguage.
+  if (message.text !== undefined && quickRequest(message.text) !== null) {
+    if (/[ўқғҳ]/i.test(words)) return "uz";
+    if (/\p{Script=Cyrillic}/u.test(words)) return "ru";
+    if (/holat|hujjat|anketa|shablon/i.test(words)) return "uz";
+    return null;
+  }
+  return detectLanguage(words);
+}
+
+/** The document or photo in a message, for review. Photos are taken in their largest size. */
+export function fileOf(message: Message): { fileId: string; name: string; size?: number } | null {
+  if (message.document) {
+    const ext = message.document.mime_type === "application/pdf" ? ".pdf" : "";
+    return {
+      fileId: message.document.file_id,
+      name: message.document.file_name || `document-${message.message_id}${ext}`,
+      size: message.document.file_size,
+    };
+  }
+  const photo = message.photo?.at(-1);
+  if (photo) return { fileId: photo.file_id, name: `photo-${message.message_id}.jpg`, size: photo.file_size };
+  return null;
+}
+
+/** Downloads a file through the Bot API. The bot token is part of the URL, so it is kept out of error messages. */
+async function telegramDownload(api: Api, botToken: string, fileId: string, target: string): Promise<void> {
+  try {
+    const file = await api.getFile(fileId);
+    if (!file.file_path) throw new Error("Telegram returned no file path");
+    const response = await fetch(`https://api.telegram.org/file/bot${botToken}/${file.file_path}`);
+    if (!response.ok) throw new Error(`download failed: HTTP ${response.status}`);
+    const data = Buffer.from(await response.arrayBuffer());
+    if (data.length > MAX_FILE_BYTES) throw new Error("the file is larger than 20 MB");
+    await fs.promises.writeFile(target, data, { mode: 0o600, flag: "wx" });
+  } catch (err) {
+    const message = errorMessage(err);
+    throw new Error(botToken ? message.split(botToken).join("[REDACTED]") : message);
+  }
+}
+
+const REVIEW_WORDS: Record<
+  Language,
+  { checked: (n: number) => string; accepted: string; rejected: string; unchecked: string; left: (n: number) => string }
+> = {
+  uz: {
+    checked: (n) => `📥 Yuborgan ${n} ta faylingiz shablon bo'yicha tekshirildi.`,
+    accepted: "✅ Qabul qilindi:",
+    rejected: "❌ Qayta yuboring:",
+    unchecked: "⚠️ Avtomatik tekshirib bo'lmadi, mutaxassisimiz ko'rib chiqadi:",
+    left: (n) => `Qolgan ${n} ta fayl birozdan keyin tekshiriladi.`,
+  },
+  ru: {
+    checked: (n) => `📥 Отправленные Вами файлы (${n}) проверены по шаблону.`,
+    accepted: "✅ Принято:",
+    rejected: "❌ Отправьте заново:",
+    unchecked: "⚠️ Не удалось проверить автоматически, их посмотрит наш специалист:",
+    left: (n) => `Остальные файлы (${n}) будут проверены чуть позже.`,
+  },
+  en: {
+    checked: (n) => `📥 The ${n} file(s) you sent have been checked against the template.`,
+    accepted: "✅ Accepted:",
+    rejected: "❌ Please send again:",
+    unchecked: "⚠️ Could not be checked automatically; our specialist will look at them:",
+    left: (n) => `The remaining ${n} file(s) will be checked a little later.`,
+  },
+};
+
+/** What the client is told after a batch: which files were accepted, which must be sent again and why. */
+export function reviewSummaryText(
+  verdicts: readonly FileVerdict[],
+  language: Language,
+  left: number,
+  stopped: "limit" | "daily" | null,
+): string {
+  const w = REVIEW_WORDS[language];
+  const lines = [w.checked(verdicts.length)];
+  const accepted = verdicts.filter((v) => v.kind === "accepted");
+  const rejected = verdicts.filter((v) => v.kind === "rejected");
+  const unchecked = verdicts.filter((v) => v.kind === "unchecked");
+  if (accepted.length) {
+    lines.push("", w.accepted, ...accepted.map((v) => `• ${v.kind === "accepted" ? v.doc.title[language] : ""} — ${v.file.name}`));
+  }
+  if (rejected.length) {
+    lines.push(
+      "",
+      w.rejected,
+      ...rejected.map((v) => {
+        if (v.kind !== "rejected") return "";
+        const what = v.doc ? `${v.doc.title[language]} (${v.file.name})` : v.file.name;
+        return `• ${what}: ${v.reasons.join("; ")}`;
+      }),
+    );
+  }
+  if (unchecked.length) lines.push("", w.unchecked, ...unchecked.map((v) => `• ${v.file.name}`));
+  if (left > 0 && stopped) lines.push("", w.left(left));
+  return lines.join("\n");
+}
+
+const TEMPLATE_CAPTION: Record<Language, string> = {
+  uz:
+    "Anketani to'ldirib, NDA qismini imzolang va shu chatga qaytaring. Anketa ostida ko'rsatilgan hujjatlarni ham " +
+    "fayl qilib yuboring: bot har birini tekshirib, nechchi foizi tayyorligini ko'rsatadi.",
+  ru:
+    "Заполните анкету, подпишите раздел NDA и отправьте её в этот чат. Документы из перечня в конце анкеты тоже " +
+    "отправьте файлами: бот проверит каждый и покажет, на сколько процентов пакет готов.",
+  en:
+    "Please fill in the questionnaire (Russian version), sign the NDA part and send it back in this chat, together " +
+    "with the documents listed at its end: each file is checked and you will see how complete your package is.",
+};
+
+const STATUS_UNAVAILABLE: Record<Language, string> = {
+  uz: "Hujjatlar holatini hozir ko'rsatib bo'lmadi, birozdan keyin qayta so'rang.",
+  ru: "Статус документов сейчас недоступен, попробуйте чуть позже.",
+  en: "The document status is not available right now, please try again a little later.",
+};
+
+const TOO_LARGE_REASON: Record<Language, string> = {
+  uz: "fayl 20 MB dan katta, uni Telegram orqali qabul qilib bo'lmaydi. Siqib yoki bo'lib yuboring",
+  ru: "файл больше 20 МБ, через Telegram его принять нельзя. Сожмите его или отправьте частями",
+  en: "the file is larger than 20 MB and cannot be received through Telegram. Please compress or split it",
+};
+
+const REVIEW_STARTED: Record<Language, (n: number) => string> = {
+  uz: (n) => `📥 ${n} ta fayl qabul qilindi, shablon bo'yicha tekshirilmoqda. Natijani shu yerda yozaman.`,
+  ru: (n) => `📥 Получено файлов: ${n}. Проверяю их по шаблону, результат напишу здесь.`,
+  en: (n) => `📥 ${n} files received. I am checking them against the template and will post the result here.`,
+};
 
 function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
