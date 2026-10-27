@@ -118,14 +118,20 @@ export class Clock {
   }
 }
 
-/** A review answer as Claude would write it. */
+/** A review answer as Claude would write it. No `parts` means the file holds every part of the document. */
 export function verdict(
   doc: string | null,
   accepted: boolean,
-  reasons: string[] = [],
-  applicant: Record<string, unknown> | null = null,
+  opts: { parts?: string[]; reasons?: string[]; applicant?: Record<string, unknown> } = {},
 ): string {
-  return JSON.stringify({ doc, verdict: accepted ? "accepted" : "rejected", reasons, summary: doc ?? "file", applicant });
+  return JSON.stringify({
+    doc,
+    parts: opts.parts ?? [],
+    verdict: accepted ? "accepted" : "rejected",
+    reasons: opts.reasons ?? [],
+    summary: doc ?? "file",
+    applicant: opts.applicant ?? null,
+  });
 }
 
 let updateId = 1;

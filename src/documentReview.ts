@@ -6,7 +6,7 @@ import type { Applicant, ClientFolders } from "./clientFolder.js";
 import type { Language } from "./language.js";
 import { buildReviewSystemPrompt, buildReviewUserPrompt } from "./prompts.js";
 import { ensurePrivateDir, isRecord, JsonFile } from "./store.js";
-import type { Template, TemplateDoc } from "./templates.js";
+import type { Template, TemplateDoc, TemplatePart } from "./templates.js";
 
 /** Telegram bots can download files of at most 20 MB. */
 export const MAX_FILE_BYTES = 20 * 1024 * 1024;
@@ -180,6 +180,8 @@ export function readLaws(dir: string): string {
 
 export interface ReviewAnswer {
   doc: string | null;
+  /** Part keys of `doc` the file contains; never empty when doc is set. */
+  parts: string[];
   verdict: "accepted" | "rejected";
   reasons: string[];
   summary: string;
@@ -206,8 +208,18 @@ export function parseReview(raw: string, template: Template): ReviewAnswer {
   }
   if (!isRecord(data)) throw new ReviewParseError("the answer is not a JSON object");
   if (data.verdict !== "accepted" && data.verdict !== "rejected") throw new ReviewParseError("verdict is missing");
-  const keys = new Set(template.documents.map((doc) => doc.key));
-  const doc = typeof data.doc === "string" && keys.has(data.doc) ? data.doc : null;
+  // Claude sometimes names a part ("egrpo") where the document ("ustav_egrpo") is asked for.
+  const named = typeof data.doc === "string" ? data.doc : "";
+  const found =
+    template.documents.find((d) => d.key === named) ??
+    template.documents.find((d) => d.parts.some((part) => part.key === named)) ??
+    null;
+  const doc = found?.key ?? null;
+  const partKeys = new Set(found?.parts.map((part) => part.key) ?? []);
+  let parts = Array.isArray(data.parts)
+    ? [...new Set(data.parts.filter((p): p is string => typeof p === "string" && partKeys.has(p)))]
+    : [];
+  if (found && parts.length === 0) parts = partKeys.has(named) ? [named] : [...partKeys];
   const reasons = Array.isArray(data.reasons)
     ? data.reasons.filter((r): r is string => typeof r === "string" && r.trim() !== "").map((r) => r.trim()).slice(0, 5)
     : [];
@@ -224,6 +236,7 @@ export function parseReview(raw: string, template: Template): ReviewAnswer {
   const verdict = doc === null ? "rejected" : data.verdict;
   return {
     doc,
+    parts,
     verdict,
     reasons,
     summary: typeof data.summary === "string" ? data.summary.trim() : "",
@@ -290,8 +303,8 @@ function toInbox(value: unknown): InboxData | null {
 }
 
 export type FileVerdict =
-  | { kind: "accepted"; file: InboxFile; doc: TemplateDoc; summary: string; applicant: Applicant | null }
-  | { kind: "rejected"; file: InboxFile; doc: TemplateDoc | null; reasons: string[]; summary: string }
+  | { kind: "accepted"; file: InboxFile; doc: TemplateDoc; parts: TemplatePart[]; summary: string; applicant: Applicant | null }
+  | { kind: "rejected"; file: InboxFile; doc: TemplateDoc | null; parts: TemplatePart[]; reasons: string[]; summary: string }
   | { kind: "unchecked"; file: InboxFile; reason: string };
 
 /**
@@ -378,7 +391,7 @@ export async function reviewFile(opts: {
   const source = inbox.path(userId, file);
   const kind = fileKind(file.name);
   if (kind === "unsupported") {
-    return { kind: "rejected", file, doc: null, reasons: [UNSUPPORTED_REASON[language]], summary: "" };
+    return { kind: "rejected", file, doc: null, parts: [], reasons: [UNSUPPORTED_REASON[language]], summary: "" };
   }
 
   let text: string | null;
@@ -389,15 +402,18 @@ export async function reviewFile(opts: {
       kind: "rejected",
       file,
       doc: null,
+      parts: [],
       reasons: [UNREADABLE_REASON[language]],
       summary: err instanceof Error ? err.message : "",
     };
   }
 
   const status = folders.status(userId);
-  const accepted = Object.entries(status.docs)
-    .filter(([, record]) => record.state === "accepted")
-    .map(([key]) => key);
+  const accepted = Object.values(status.docs).flatMap((record) =>
+    Object.entries(record.parts)
+      .filter(([, part]) => part.state === "accepted")
+      .map(([key]) => key),
+  );
   const system = buildReviewSystemPrompt(opts.companyName, template, opts.laws, opts.now);
 
   let raw: string;
@@ -432,11 +448,12 @@ export async function reviewFile(opts: {
     return { kind: "unchecked", file, reason: err instanceof Error ? err.message : String(err) };
   }
   const doc = answer.doc === null ? null : (template.documents.find((d) => d.key === answer.doc) ?? null);
+  const parts = doc ? doc.parts.filter((part) => answer.parts.includes(part.key)) : [];
   if (doc && answer.verdict === "accepted") {
-    return { kind: "accepted", file, doc, summary: answer.summary, applicant: answer.applicant };
+    return { kind: "accepted", file, doc, parts, summary: answer.summary, applicant: answer.applicant };
   }
   const reasons = answer.reasons.length > 0 ? answer.reasons : doc === null ? [NOT_LISTED_REASON[language]] : [];
-  return { kind: "rejected", file, doc, reasons, summary: answer.summary };
+  return { kind: "rejected", file, doc, parts, reasons, summary: answer.summary };
 }
 
 const UNSUPPORTED_REASON: Record<Language, string> = {

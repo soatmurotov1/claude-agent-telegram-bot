@@ -5,121 +5,236 @@
     "ru": "Экспресс-анкета готовности объекта к инвестициям",
     "en": "Express questionnaire on the readiness of a site for investment"
   },
-  "blank": { "uz": "uz.docx", "ru": "ru.docx" },
+  "blank": {
+    "uz": "uz.docx",
+    "ru": "ru.docx"
+  },
   "documents": [
     {
-      "key": "anketa",
-      "title": { "uz": "To'ldirilgan anketa (NDA bilan)", "ru": "Заполненная анкета (с NDA)", "en": "Completed questionnaire (with the NDA)" },
-      "description": "The express questionnaire itself (Uzbek or Russian version), filled in by the owner of the site.",
-      "checks": [
-        "It is this questionnaire (title 'ЭКСПРЕСС-АНКЕТА' / 'ЭКСПРЕСС-АНКЕТАСИ'), not another document.",
-        "Company name, full name and position of the person who filled it in, contact phone or Telegram, and the name of the deposit / subsoil plot are all filled in (not blank lines or underscores).",
-        "Direction A (geological exploration) or B (mining / gold) is marked in step 1.",
-        "In each of the 10 items of step 2 exactly one option is marked, or the item is marked as not applicable (NA).",
-        "In item 10 the requested value of the site / share and the required investment (Capex) are filled in and one deal format is marked.",
-        "The owner's consent block (NDA) has the position, a signature and a date. A stamp is welcome but not required."
-      ],
-      "naItems": []
+      "key": "ustav_egrpo",
+      "title": {
+        "uz": "Korxona ustavi va YeGRPO dan ko'chirma",
+        "ru": "Устав предприятия и выписка из ЕГРПО",
+        "en": "Company charter and extract from the state register (EGRPO)"
+      },
+      "description": "Item 1 of step 3 of the questionnaire: the current company charter and an extract from the unified state register of enterprises and organisations (ЕГРПО).",
+      "parts": [
+        {
+          "key": "ustav",
+          "title": {
+            "uz": "Korxona ustavi",
+            "ru": "Устав",
+            "en": "Company charter"
+          },
+          "checks": [
+            "It is a company charter (Устав / Устав), not another document.",
+            "The company name matches the client's company, if it is known.",
+            "It shows that it was approved and registered (date, founders' decision, registration mark or QR code)."
+          ],
+          "naItems": [
+            1
+          ]
+        },
+        {
+          "key": "egrpo",
+          "title": {
+            "uz": "YeGRPO dan ko'chirma",
+            "ru": "Выписка из ЕГРПО",
+            "en": "Register extract (EGRPO)"
+          },
+          "checks": [
+            "It is an extract from the state register of legal entities (ЕГРПО, issued by the state services centre or my.gov.uz).",
+            "The company name and STIR (INN) are shown and match the client's company, if it is known; the head is named.",
+            "It is recent: issued no more than 3 months before today."
+          ],
+          "naItems": [
+            2
+          ]
+        }
+      ]
     },
     {
-      "key": "ustav",
-      "title": { "uz": "Korxona ustavi", "ru": "Устав предприятия", "en": "Company charter" },
-      "description": "The current version of the company charter (Устав), item 1 of the questionnaire.",
-      "checks": [
-        "It is a company charter (Устав / Устав), not another document.",
-        "The company name matches the company in the questionnaire, if the questionnaire is known.",
-        "It shows that it was approved (date, decision of the founders or registration mark)."
-      ],
-      "naItems": [1]
+      "key": "ruxsatnoma_kelishuv",
+      "title": {
+        "uz": "Yer qa'ridan foydalanish ruxsatnomasi (litsenziya) va litsenziya kelishuvi",
+        "ru": "Разрешение / лицензия на недропользование и лицензионное соглашение (шартнома)",
+        "en": "Subsoil use permit (licence) and licence agreement"
+      },
+      "description": "Item 2 of step 3: the electronic subsoil use permit / licence and the licence agreement (шартнома, subsoil use conditions) under Cabinet of Ministers resolution No. 133.",
+      "parts": [
+        {
+          "key": "ruxsatnoma",
+          "title": {
+            "uz": "Ruxsatnoma (litsenziya)",
+            "ru": "Разрешение (лицензия)",
+            "en": "Permit (licence)"
+          },
+          "checks": [
+            "It is a subsoil use permit or licence (рухсатнома / разрешение / лицензия), usually with a QR code.",
+            "It has a number, an issue date and the holder; the holder matches the client's company, if known.",
+            "It is not expired today (if a validity date is shown)."
+          ],
+          "naItems": [
+            3
+          ]
+        },
+        {
+          "key": "kelishuv",
+          "title": {
+            "uz": "Litsenziya kelishuvi (shartnoma)",
+            "ru": "Лицензионное соглашение (шартнома)",
+            "en": "Licence agreement (shartnoma)"
+          },
+          "checks": [
+            "It is a licence agreement or subsoil use conditions document (лицензия келишуви / лицензионное соглашение / ер қаъридан фойдаланиш шартлари / шартнома).",
+            "It names the subsoil user and refers to the permit or plot.",
+            "It is signed (signature, electronic signature or QR code)."
+          ],
+          "naItems": [
+            3
+          ]
+        }
+      ]
     },
     {
-      "key": "egrpo",
-      "title": { "uz": "YeGRPO dan ko'chirma", "ru": "Выписка из ЕГРПО", "en": "Extract from the state register (EGRPO)" },
-      "description": "Extract from the unified state register of enterprises and organisations, item 2 of the questionnaire.",
-      "checks": [
-        "It is an extract from the state register of legal entities (ЕГРПО / ЕГРПО / my.gov.uz / Davlat xizmatlari markazi).",
-        "The company name and STIR (INN) are shown and match the questionnaire, if it is known.",
-        "The head of the company is named.",
-        "It is recent: issued no more than 3 months before today."
-      ],
-      "naItems": [2]
-    },
-    {
-      "key": "ruxsatnoma",
-      "title": { "uz": "Yer qa'ridan foydalanish ruxsatnomasi (litsenziya)", "ru": "Разрешение / лицензия на недропользование", "en": "Subsoil use permit (licence)" },
-      "description": "Electronic subsoil use permit / licence under Cabinet of Ministers resolution No. 133, item 3 of the questionnaire.",
-      "checks": [
-        "It is a subsoil use permit or licence (рухсатнома / разрешение / лицензия), usually with a QR code.",
-        "It has a number, an issue date and the holder's name; the holder matches the questionnaire's company, if known.",
-        "It is not expired today (if a validity date is shown)."
-      ],
-      "naItems": [3]
-    },
-    {
-      "key": "litsenziya_kelishuvi",
-      "title": { "uz": "Litsenziya kelishuvi (shartnoma)", "ru": "Лицензионное соглашение (шартнома)", "en": "Licence agreement (shartnoma)" },
-      "description": "The signed licence agreement / subsoil use conditions that go with the permit, item 3 of the questionnaire.",
-      "checks": [
-        "It is a licence agreement or subsoil use conditions document (лицензия келишуви / лицензионное соглашение / ер қаъридан фойдаланиш шартлари / шартнома).",
-        "It names the subsoil user and refers to a permit or plot.",
-        "It is signed (signature, electronic signature or QR code)."
-      ],
-      "naItems": [3]
-    },
-    {
-      "key": "loyiha_hujjatlari",
-      "title": { "uz": "Loyiha hujjatlari (UTER, TIA, tog' ajratmasi loyihasi)", "ru": "Проектная документация (УТЭР, ТЭО, проект горного отвода)", "en": "Project documents (UTER, feasibility study, mining allotment project)" },
-      "description": "Project documentation of the site: topographic survey, exploration project, UTER, TEO of conditions, mining allotment project or working project, item 5 of the questionnaire. Each such document sent counts here.",
-      "checks": [
-        "It is one of: topographic survey, geological exploration project (ГҚИ / ГРР), UTER (УТЭР), feasibility study (ТИА / ТЭО), mining allotment project (тоғ ажратмаси / горный отвод) or working project.",
-        "It names the site or the company.",
-        "It shows an approval, agreement or expert review mark, or at least a date and the developer."
-      ],
-      "naItems": [5]
-    },
-    {
-      "key": "5gr_tasdiq",
-      "title": { "uz": "5-GR shakli topshirilganligi tasdig'i", "ru": "Подтверждение сдачи формы 5-ГР", "en": "Proof that form 5-GR was submitted" },
-      "description": "The annual geological report form 5-GR or proof that it was submitted, item 6 of the questionnaire.",
-      "checks": [
-        "It is form 5-GR (5-ГР) or a receipt / letter confirming that it was submitted.",
-        "It shows the reporting year and the company or site.",
-        "The reporting year is the last or the year before last."
-      ],
-      "naItems": [6]
+      "key": "loyiha_5gr",
+      "title": {
+        "uz": "Loyiha hujjatlari (UTER, TIA, tog' ajratmasi loyihasi) va 5-GR tasdig'i",
+        "ru": "Проектная документация (УТЭР, ТЭО, проект горного отвода) и подтверждение сдачи 5-ГР",
+        "en": "Project documents (UTER, feasibility study, mining allotment) and proof of form 5-GR"
+      },
+      "description": "Item 3 of step 3: project documentation of the site and a document confirming that the annual geological report form 5-GR was submitted.",
+      "parts": [
+        {
+          "key": "loyiha",
+          "title": {
+            "uz": "Loyiha hujjatlari",
+            "ru": "Проектная документация",
+            "en": "Project documents"
+          },
+          "checks": [
+            "It is one of: geological exploration project (ГҚИ / ГРР), UTER (УТЭР), feasibility study (ТИА / ТЭО), mining allotment project (тоғ ажратмаси / горный отвод), working project or topographic survey.",
+            "It names the site or the company.",
+            "It shows an approval, agreement or expert review mark, or at least a date and the developer."
+          ],
+          "naItems": [
+            5
+          ]
+        },
+        {
+          "key": "5gr",
+          "title": {
+            "uz": "5-GR shakli topshirilganligi tasdig'i",
+            "ru": "Подтверждение сдачи формы 5-ГР",
+            "en": "Proof that form 5-GR was submitted"
+          },
+          "checks": [
+            "It is form 5-GR (5-ГР) with an acceptance mark, or a receipt / letter confirming that it was submitted.",
+            "It shows the reporting year and the company or site.",
+            "The reporting year is the last or the year before last."
+          ],
+          "naItems": [
+            6
+          ]
+        }
+      ]
     },
     {
       "key": "ekologik_paket",
-      "title": { "uz": "Ekologik paket (ZVOS/ZEP, PDV, limitlar)", "ru": "Экологический пакет (ЗВОС/ЗЭП, ПДВ, лимиты)", "en": "Environmental package (EIA/ZVOS, ZEP, PDV, limits)" },
-      "description": "Environmental documents and the state environmental expert review conclusion, item 7 of the questionnaire.",
-      "checks": [
-        "It is one of: ZVOS / ZEP / OVOS (environmental impact statement), PDV, PDS or waste limits project, or the state environmental expert review conclusion.",
-        "It names the site or the company.",
-        "For an expert review conclusion: it is positive and not expired (3 years for EIA materials, 5 years for environmental standards)."
-      ],
-      "naItems": [7]
+      "title": {
+        "uz": "Ekologik paket (ZVOS/ZEP, PDV, limitlar)",
+        "ru": "Экологический пакет (ЗВОС/ЗЭП, ПДВ, лимиты)",
+        "en": "Environmental package (ZVOS/ZEP, PDV, limits)"
+      },
+      "description": "Item 4 of step 3: environmental documents of the site — ZVOS / ZEP (environmental impact statements), PDV (emissions), PDS (discharges), waste limits — and the state environmental expert review conclusion.",
+      "parts": [
+        {
+          "key": "ekologiya",
+          "title": {
+            "uz": "Ekologik paket",
+            "ru": "Экологический пакет",
+            "en": "Environmental package"
+          },
+          "checks": [
+            "It is one or more of: ZVOS / ZEP / OVOS, PDV, PDS or waste limits project, or the state environmental expert review conclusion.",
+            "It names the site or the company.",
+            "For an expert review conclusion: it is positive and not expired (3 years for EIA materials, 5 years for environmental standards)."
+          ],
+          "naItems": [
+            7
+          ]
+        }
+      ]
     },
     {
-      "key": "epb_dalolatnoma",
-      "title": { "uz": "Sanoat xavfsizligi ekspertizasi (EPB) dalolatnomalari", "ru": "Акты экспертизы промышленной безопасности (ЭПБ)", "en": "Industrial safety expert review (EPB) reports" },
-      "description": "Industrial safety expert review conclusions / reports and permits to operate hazardous production facilities, item 8 of the questionnaire.",
-      "checks": [
-        "It is an industrial safety expert review conclusion or report (ЭПБ / саноат хавфсизлиги экспертизаси), a registration of a hazardous production facility (ОПО) or a permit to operate it.",
-        "It names the company or the facility.",
-        "It has a number and date and is issued by an accredited expert organisation or the competent authority."
-      ],
-      "naItems": [8]
+      "key": "epb_yer",
+      "title": {
+        "uz": "Sanoat xavfsizligi ekspertizasi (EPB) dalolatnomalari va yer ajratmasi to'g'risidagi qarorlar",
+        "ru": "Акты экспертизы промышленной безопасности (ЭПБ) по ОПО и решения на земельный отвод",
+        "en": "Industrial safety expert review (EPB) reports and land allotment decisions"
+      },
+      "description": "Item 5 of step 3: industrial safety expert review reports / conclusions for the hazardous production facilities (ОПО) and the decisions on the land allotment.",
+      "parts": [
+        {
+          "key": "epb",
+          "title": {
+            "uz": "EPB dalolatnomalari",
+            "ru": "Акты ЭПБ",
+            "en": "EPB reports"
+          },
+          "checks": [
+            "It is an industrial safety expert review conclusion or report (ЭПБ / саноат хавфсизлиги экспертизаси), a registration of a hazardous production facility (ОПО) or a permit to operate it.",
+            "It names the company or the facility.",
+            "It has a number and a date and comes from an accredited expert organisation or the competent authority."
+          ],
+          "naItems": [
+            8
+          ]
+        },
+        {
+          "key": "yer",
+          "title": {
+            "uz": "Yer ajratmasi to'g'risidagi qaror",
+            "ru": "Решение на земельный отвод",
+            "en": "Land allotment decision"
+          },
+          "checks": [
+            "It is a land allotment decision (hokim's decision / қарор / решение), a land lease agreement or a cadastre document for the site.",
+            "It names the company and the plot (area, location).",
+            "It has a number and a date."
+          ],
+          "naItems": [
+            9
+          ]
+        }
+      ]
     },
     {
-      "key": "yer_ajratmasi",
-      "title": { "uz": "Yer ajratmasi to'g'risidagi qarorlar", "ru": "Решения на земельный отвод", "en": "Land allotment decisions" },
-      "description": "Decisions or documents on the land allotment for the industrial site, quarry or wells, item 9 of the questionnaire.",
-      "checks": [
-        "It is a land allotment decision (hokim's decision / қарор / решение), a land lease agreement or a cadastre document for the site.",
-        "It names the company and the plot (area, location).",
-        "It has a number and a date."
-      ],
-      "naItems": [9]
+      "key": "anketa",
+      "required": false,
+      "title": {
+        "uz": "To'ldirilgan anketa (NDA bilan)",
+        "ru": "Заполненная анкета (с NDA)",
+        "en": "Completed questionnaire (with the NDA)"
+      },
+      "description": "The express questionnaire itself (Uzbek or Russian version), filled in and signed by the owner. Not one of the 5 required documents, but welcome: it gives the company name and the items marked 'not applicable'.",
+      "parts": [
+        {
+          "key": "anketa",
+          "title": {
+            "uz": "Anketa",
+            "ru": "Анкета",
+            "en": "Questionnaire"
+          },
+          "checks": [
+            "It is this questionnaire (title 'ЭКСПРЕСС-АНКЕТА' / 'ЭКСПРЕСС-АНКЕТАСИ'), not another document.",
+            "Company name, full name and position of the person who filled it in, contact phone or Telegram, and the name of the deposit / subsoil plot are filled in (not blank lines or underscores).",
+            "Direction A (geological exploration) or B (mining / gold) is marked in step 1, and in each of the 10 items of step 2 one option is marked or the item is marked as not applicable (NA).",
+            "The owner's consent block (NDA) has the position, a signature and a date. A stamp is welcome but not required."
+          ],
+          "naItems": []
+        }
+      ]
     }
   ]
 }

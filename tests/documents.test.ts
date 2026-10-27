@@ -26,23 +26,29 @@ async function filledQuestionnaire(): Promise<Buffer> {
   return zip.generateAsync({ type: "nodebuffer" });
 }
 
+/** The answer the fake Claude gives for a file, by the file name in the prompt. */
+function answerByName(answers: Record<string, string>) {
+  return (_system: string, user: string): string => {
+    const name = /File name as sent by the client: (.+)/.exec(user)?.[1]?.trim() ?? "";
+    return answers[name] ?? "??";
+  };
+}
+
+const pdf = (name: string) => ({ name, data: Buffer.from(`%PDF fake ${name}`) });
+
 describe("template", () => {
-  it("lists the questionnaire and the documents of its step 3", () => {
-    expect(template.documents.map((d) => d.key)).toEqual([
-      "anketa",
-      "ustav",
-      "egrpo",
-      "ruxsatnoma",
-      "litsenziya_kelishuvi",
-      "loyiha_hujjatlari",
-      "5gr_tasdiq",
+  it("asks for the 5 documents of step 3, with the questionnaire as an optional extra", () => {
+    expect(template.documents.filter((d) => d.required).map((d) => d.key)).toEqual([
+      "ustav_egrpo",
+      "ruxsatnoma_kelishuv",
+      "loyiha_5gr",
       "ekologik_paket",
-      "epb_dalolatnoma",
-      "yer_ajratmasi",
+      "epb_yer",
     ]);
+    expect(template.documents.find((d) => d.key === "anketa")?.required).toBe(false);
+    expect(template.documents.find((d) => d.key === "ustav_egrpo")?.parts.map((p) => p.key)).toEqual(["ustav", "egrpo"]);
     for (const doc of template.documents) {
-      expect(doc.checks.length).toBeGreaterThan(0);
-      expect(doc.title.uz && doc.title.ru && doc.title.en).toBeTruthy();
+      for (const part of doc.parts) expect(part.checks.length).toBeGreaterThan(0);
     }
   });
 
@@ -55,41 +61,50 @@ describe("template", () => {
 });
 
 describe("progress", () => {
+  const part = (state: "accepted" | "rejected", reasons: string[] = []) => ({ state, reasons, ts: 1 });
   const status = (docs: ClientStatus["docs"], naItems: number[] = []): ClientStatus => ({
     template: template.id,
     applicant: { company: "Test MChJ", direction: "A", naItems },
     docs,
+    completedAt: null,
   });
-  const record = (state: "accepted" | "rejected", reasons: string[] = []) => ({ state, files: ["f"], reasons, ts: 1 });
 
-  it("counts ready, wrong and missing documents in percent", () => {
+  it("counts the 5 documents: ready, wrong, partly sent and missing", () => {
     const p = progress(
       status({
-        anketa: record("accepted"),
-        ustav: record("accepted"),
-        egrpo: record("rejected", ["eski"]),
-        ruxsatnoma: record("accepted"),
+        ustav_egrpo: { files: ["a"], parts: { ustav: part("accepted"), egrpo: part("accepted") } },
+        ruxsatnoma_kelishuv: { files: ["b"], parts: { ruxsatnoma: part("accepted"), kelishuv: part("rejected", ["imzo yo'q"]) } },
+        loyiha_5gr: { files: ["c"], parts: { loyiha: part("accepted") } },
+        anketa: { files: ["d"], parts: { anketa: part("accepted") } },
       }),
       template,
     );
-    expect(p).toMatchObject({ total: 10, accepted: 3, rejected: 1, missing: 6, readyPct: 30, errorPct: 10, missingPct: 60 });
+    expect(p).toMatchObject({ total: 5, accepted: 1, rejected: 1, missing: 3, readyPct: 20, errorPct: 20, missingPct: 60 });
     const text = progressText(p, "uz");
-    expect(text).toContain("Tayyor: 30% (3/10)");
-    expect(text).toContain("Xato: 10% (1)");
-    expect(text).toContain("❌ YeGRPO dan ko'chirma: eski");
-    expect(text).toContain("✅ Korxona ustavi");
+    expect(text).toContain("Tayyor: 20% (1/5) · Xato: 20% (1) · Yetishmaydi: 60% (3)");
+    expect(text).toContain("✅ 1. Korxona ustavi va YeGRPO dan ko'chirma");
+    expect(text).toContain("❌ 2. Yer qa'ridan foydalanish ruxsatnomasi (litsenziya) va litsenziya kelishuvi: Litsenziya kelishuvi (shartnoma): imzo yo'q");
+    expect(text).toContain("🟡 3. Loyiha hujjatlari (UTER, TIA, tog' ajratmasi loyihasi) va 5-GR tasdig'i — yetishmaydi: 5-GR shakli topshirilganligi tasdig'i");
+    expect(text).toContain("⬜ 4. Ekologik paket");
+    expect(text).toContain("✅ To'ldirilgan anketa (NDA bilan) (ixtiyoriy)");
   });
 
-  it("does not require documents of items marked NA", () => {
-    const p = progress(status({ anketa: record("accepted") }, [7, 8]), template);
-    expect(p.total).toBe(8);
-    expect(p.items.filter((i) => i.state === "na").map((i) => i.doc.key)).toEqual(["ekologik_paket", "epb_dalolatnoma"]);
-    expect(progressText(p, "ru")).toContain("➖ Экологический пакет (ЗВОС/ЗЭП, ПДВ, лимиты) (не требуется)");
+  it("does not need parts of items marked NA", () => {
+    const p = progress(
+      status({ ustav_egrpo: { files: ["a"], parts: { ustav: part("accepted") } } }, [2, 7, 8, 9]),
+      template,
+    );
+    // Item 2 drops the register extract from document 1; items 7, 8 and 9 drop documents 4 and 5.
+    expect(p.total).toBe(3);
+    expect(p.accepted).toBe(1);
+    expect(p.items.find((i) => i.doc.key === "ustav_egrpo")?.state).toBe("accepted");
+    expect(p.items.find((i) => i.doc.key === "ekologik_paket")?.state).toBe("na");
+    expect(progressText(p, "ru")).toContain("➖ 5. Акты экспертизы промышленной безопасности (ЭПБ) по ОПО и решения на земельный отвод (не требуется)");
   });
 
   it("shows 0% for a new client", () => {
-    const p = progress({ template: "", applicant: null, docs: {} }, template);
-    expect(p).toMatchObject({ total: 10, readyPct: 0, errorPct: 0, missingPct: 100 });
+    const p = progress({ template: "", applicant: null, docs: {}, completedAt: null }, template);
+    expect(p).toMatchObject({ total: 5, readyPct: 0, errorPct: 0, missingPct: 100 });
   });
 });
 
@@ -106,7 +121,7 @@ describe("file text", () => {
 
   it("reads Excel cells, shared strings included", async () => {
     const zip = new JSZip();
-    zip.file("xl/sharedStrings.xml", '<sst><si><t>Компания</t></si><si><t>ООО Тест</t></si></sst>');
+    zip.file("xl/sharedStrings.xml", "<sst><si><t>Компания</t></si><si><t>ООО Тест</t></si></sst>");
     zip.file(
       "xl/worksheets/sheet1.xml",
       '<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1"><v>42</v></c></row></sheetData></worksheet>',
@@ -129,28 +144,34 @@ describe("file text", () => {
 });
 
 describe("review answer", () => {
-  it("reads the JSON even with text around it", () => {
-    const answer = parseReview(`Here: ${verdict("ustav", true)} done`, template);
-    expect(answer).toMatchObject({ doc: "ustav", verdict: "accepted", reasons: [] });
+  it("reads the JSON even with text around it, with the parts the file holds", () => {
+    const answer = parseReview(`Here: ${verdict("ustav_egrpo", true, { parts: ["egrpo"] })} done`, template);
+    expect(answer).toMatchObject({ doc: "ustav_egrpo", parts: ["egrpo"], verdict: "accepted", reasons: [] });
+  });
+
+  it("takes all parts when none are named, and maps a part key to its document", () => {
+    expect(parseReview(verdict("ustav_egrpo", true), template).parts).toEqual(["ustav", "egrpo"]);
+    expect(parseReview(verdict("egrpo", true), template)).toMatchObject({ doc: "ustav_egrpo", parts: ["egrpo"] });
+    expect(parseReview(verdict("ustav_egrpo", true, { parts: ["egrpo", "yer"] }), template).parts).toEqual(["egrpo"]);
   });
 
   it("never accepts a file that is none of the listed documents", () => {
-    expect(parseReview(verdict("passport", true), template)).toMatchObject({ doc: null, verdict: "rejected" });
+    expect(parseReview(verdict("passport", true), template)).toMatchObject({ doc: null, parts: [], verdict: "rejected" });
   });
 
   it("keeps the applicant only for the questionnaire", () => {
     const applicant = { company: "Oltin Kon MChJ", direction: "B", na_items: [7, 99] };
-    expect(parseReview(verdict("anketa", true, [], applicant), template).applicant).toEqual({
+    expect(parseReview(verdict("anketa", true, { applicant }), template).applicant).toEqual({
       company: "Oltin Kon MChJ",
       direction: "B",
       naItems: [7],
     });
-    expect(parseReview(verdict("ustav", true, [], applicant), template).applicant).toBeNull();
+    expect(parseReview(verdict("ustav_egrpo", true, { applicant }), template).applicant).toBeNull();
   });
 
   it("throws on answers without a verdict", () => {
     expect(() => parseReview("I cannot read this file", template)).toThrow();
-    expect(() => parseReview('{"doc": "ustav"}', template)).toThrow();
+    expect(() => parseReview('{"doc": "ustav_egrpo"}', template)).toThrow();
   });
 
   it("strips the [SEND_TEMPLATE] marker", () => {
@@ -169,120 +190,156 @@ describe("review answer", () => {
 });
 
 describe("document batches", () => {
-  it("reviews many files as one batch and saves them by result", async () => {
+  it("checks the 5 files, sends the ready ones to the admin and says when all are ready", async () => {
     const h = makeHarness();
-    const names = [
-      "anketa.docx",
-      "Ustav.pdf",
-      "egrpo.pdf",
-      "ruxsatnoma.jpg",
-      "kelishuv.pdf",
-      "pasport.jpg",
-      "loyiha1.pdf",
-      "loyiha2.pdf",
-      "5gr.pdf",
-      "eko.pdf",
-      "epb.pdf",
-      "yer.pdf",
-    ];
-    const answers: Record<string, string> = {
-      "anketa.docx": verdict("anketa", true, [], { company: "Oltin Kon MChJ", direction: "B", na_items: [] }),
-      "Ustav.pdf": verdict("ustav", true),
-      "egrpo.pdf": verdict("egrpo", false, ["ko'chirma 3 oydan eski"]),
-      "ruxsatnoma.jpg": verdict("ruxsatnoma", true),
-      "kelishuv.pdf": verdict("litsenziya_kelishuvi", false, ["imzo yo'q"]),
-      "pasport.jpg": verdict(null, false),
-      "loyiha1.pdf": verdict("loyiha_hujjatlari", true),
-      "loyiha2.pdf": verdict("loyiha_hujjatlari", true),
-      "5gr.pdf": verdict("5gr_tasdiq", true),
-      "eko.pdf": verdict("ekologik_paket", true),
-      "epb.pdf": verdict("epb_dalolatnoma", true),
-      "yer.pdf": "not json at all",
-    };
-    h.generator.fallback = (_system, user) => {
-      const name = /File name as sent by the client: (.+)/.exec(user)?.[1]?.trim() ?? "";
-      return answers[name] ?? "??";
-    };
-
-    for (const name of names) {
-      const data = name.endsWith(".docx") ? await filledQuestionnaire() : Buffer.from(`%PDF fake ${name}`);
-      await h.send(h.directMessage(null, { file: { name, data } }));
+    h.generator.fallback = answerByName({
+      "1-ustav-egrpo.pdf": verdict("ustav_egrpo", true),
+      "2-litsenziya.pdf": verdict("ruxsatnoma_kelishuv", true),
+      "3-loyiha.pdf": verdict("loyiha_5gr", true),
+      "4-eko.pdf": verdict("ekologik_paket", true),
+      "5-epb-yer.pdf": verdict("epb_yer", true),
+    });
+    for (const name of ["1-ustav-egrpo.pdf", "2-litsenziya.pdf", "3-loyiha.pdf", "4-eko.pdf", "5-epb-yer.pdf"]) {
+      await h.send(h.directMessage(null, { file: pdf(name) }));
     }
-    expect(h.assistant.outcomes.filter((o) => o === "review_queued")).toHaveLength(12);
+    expect(h.assistant.outcomes.filter((o) => o === "review_queued")).toHaveLength(5);
     expect(h.generator.calls).toHaveLength(0);
     await h.flush();
 
-    // The docx text went into the prompt; PDFs and images were opened by Claude in a folder with only that file.
-    expect(h.generator.calls).toHaveLength(12);
+    // Each file was opened by Claude in a folder holding only that file, which is removed afterwards.
+    expect(h.generator.calls).toHaveLength(5);
+    for (const call of h.generator.calls) {
+      expect(call.files).toEqual(["document.pdf"]);
+      expect(fs.existsSync(call.dir ?? "")).toBe(false);
+    }
+    expect(h.generator.calls[0]?.system).toContain('part "egrpo"');
+    expect(h.generator.calls[0]?.system).toContain("ZRU-987");
+
+    const summary = String(h.api.sentTo(CLIENT_ID).at(-1)?.payload.text);
+    expect(summary).toContain("5 ta faylingiz");
+    expect(summary).toContain("Tayyor: 100% (5/5)");
+    expect(summary).toContain("Barcha hujjatlar qabul qilindi va mutaxassisimizga yuborildi.");
+
+    // The admin gets the note, the 5 ready files, then the completion message.
+    const toOwner = h.api.calls.filter((c) => Number(c.payload.chat_id) === OWNER_ID);
+    expect(toOwner.map((c) => c.method)).toEqual([
+      "sendMessage",
+      "sendDocument",
+      "sendDocument",
+      "sendDocument",
+      "sendDocument",
+      "sendDocument",
+      "sendMessage",
+    ]);
+    expect(String(toOwner[0]?.payload.text)).toContain("5 ta fayl tekshirildi — ✅ 5, ❌ 0. Tayyor: 100% (5/5).");
+    expect(String(toOwner[1]?.payload.caption)).toBe("✅ Korxona ustavi va YeGRPO dan ko'chirma (Korxona ustavi, YeGRPO dan ko'chirma)\n👤 Aziz @user2000");
+    expect(String(toOwner[6]?.payload.text)).toContain("🎉 Aziz @user2000: barcha 5 ta hujjat tayyor (100%)");
+
+    // The completion message is sent only once.
+    h.api.clear();
+    h.generator.push(verdict("anketa", true));
+    await h.send(h.directMessage(null, { file: { name: "anketa.docx", data: await filledQuestionnaire() } }));
+    await h.flush();
+    expect(h.api.sentTo(OWNER_ID).some((c) => String(c.payload.text).includes("🎉"))).toBe(false);
+    expect(h.api.sentTo(OWNER_ID, "sendDocument")).toHaveLength(1);
+  });
+
+  it("reviews many files as one batch and saves them by result", async () => {
+    const h = makeHarness();
+    const answers: Record<string, string> = {
+      "anketa.docx": verdict("anketa", true, { applicant: { company: "Oltin Kon MChJ", direction: "B", na_items: [] } }),
+      "Ustav.pdf": verdict("ustav_egrpo", true, { parts: ["ustav"] }),
+      "egrpo.pdf": verdict("ustav_egrpo", false, { parts: ["egrpo"], reasons: ["ko'chirma 3 oydan eski"] }),
+      "ruxsatnoma.jpg": verdict("ruxsatnoma_kelishuv", true, { parts: ["ruxsatnoma"] }),
+      "kelishuv.pdf": verdict("ruxsatnoma_kelishuv", true, { parts: ["kelishuv"] }),
+      "pasport.jpg": verdict(null, false),
+      "loyiha1.pdf": verdict("loyiha_5gr", true, { parts: ["loyiha"] }),
+      "loyiha2.pdf": verdict("loyiha_5gr", true, { parts: ["loyiha"] }),
+      "eko.pdf": verdict("ekologik_paket", true),
+      "epb.pdf": verdict("epb_yer", true, { parts: ["epb"] }),
+      "yer.pdf": "not json at all",
+      "old.doc": "",
+    };
+    h.generator.fallback = answerByName(answers);
+    for (const name of Object.keys(answers)) {
+      const data = name.endsWith(".docx") ? await filledQuestionnaire() : Buffer.from(`%PDF fake ${name}`);
+      await h.send(h.directMessage(null, { file: { name, data } }));
+    }
+    await h.flush();
+
+    // .doc is rejected without Claude; the docx text went into the prompt.
+    expect(h.generator.calls).toHaveLength(11);
     const docxCall = h.generator.calls.find((c) => c.user.includes("anketa.docx"));
     expect(docxCall?.dir).toBeUndefined();
     expect(docxCall?.user).toContain("☒");
-    for (const call of h.generator.calls.filter((c) => c.dir)) {
-      expect(call.files).toHaveLength(1);
-      expect(fs.existsSync(call.dir ?? "")).toBe(false);
-    }
-    expect(h.generator.calls[0]?.system).toContain('key "egrpo"');
-    expect(h.generator.calls[0]?.system).toContain("ZRU-987");
 
-    // One "checking" note and one summary to the client.
     const toClient = h.api.sentTo(CLIENT_ID).map((c) => String(c.payload.text));
-    expect(toClient).toHaveLength(2);
+    expect(toClient).toHaveLength(2); // "checking ..." and the summary
     const summary = toClient[1] ?? "";
     expect(summary).toContain("12 ta faylingiz");
-    expect(summary).toContain("✅ Qabul qilindi:");
-    expect(summary).toContain("Korxona ustavi — Ustav.pdf");
-    expect(summary).toContain("YeGRPO dan ko'chirma (egrpo.pdf): ko'chirma 3 oydan eski");
+    expect(summary).toContain("Korxona ustavi va YeGRPO dan ko'chirma (Korxona ustavi) — Ustav.pdf");
+    expect(summary).toContain("Korxona ustavi va YeGRPO dan ko'chirma (YeGRPO dan ko'chirma) (egrpo.pdf): ko'chirma 3 oydan eski");
     expect(summary).toContain("pasport.jpg: bu hujjat talab qilinadigan hujjatlar ro'yxatida yo'q");
-    expect(summary).toContain("⚠️");
-    expect(summary).toContain("yer.pdf");
-    expect(summary).toContain("Tayyor: 70% (7/10)");
-    expect(summary).toContain("Xato: 20% (2)");
+    expect(summary).toContain("old.doc: bu formatdagi faylni tekshirib bo'lmaydi");
+    expect(summary).toMatch(/⚠️[^\n]*\n• yer\.pdf/);
+    expect(summary).toContain("Tayyor: 40% (2/5) · Xato: 20% (1) · Yetishmaydi: 40% (2)");
+    expect(summary).toContain("🟡 3. Loyiha hujjatlari");
+    expect(summary).toContain("🟡 5. Sanoat xavfsizligi ekspertizasi (EPB) dalolatnomalari va yer ajratmasi to'g'risidagi qarorlar — yetishmaydi: Yer ajratmasi to'g'risidagi qaror");
 
     const dir = h.clientDir();
     expect(fs.readdirSync(path.join(dir, "accepted")).sort()).toEqual(
-      ["5gr_tasdiq", "anketa", "ekologik_paket", "epb_dalolatnoma", "loyiha_hujjatlari", "ruxsatnoma", "ustav"].sort(),
+      ["anketa", "ekologik_paket", "epb_yer", "loyiha_5gr", "ruxsatnoma_kelishuv", "ustav_egrpo"].sort(),
     );
-    expect(fs.readdirSync(path.join(dir, "accepted", "loyiha_hujjatlari"))).toHaveLength(2);
+    expect(fs.readdirSync(path.join(dir, "accepted", "loyiha_5gr"))).toHaveLength(2);
     const rejected = fs.readdirSync(path.join(dir, "rejected"));
     expect(rejected.filter((f) => f !== "reasons.jsonl")).toHaveLength(4);
-    expect(fs.readFileSync(path.join(dir, "rejected", "reasons.jsonl"), "utf8")).toContain("imzo yo'q");
+    expect(fs.readFileSync(path.join(dir, "rejected", "reasons.jsonl"), "utf8")).toContain("3 oydan eski");
     expect(JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")).applicant.company).toBe("Oltin Kon MChJ");
     expect(fs.readdirSync(path.join(dir, "inbox")).filter((f) => f !== "inbox.json")).toHaveLength(0);
 
-    // The owner gets a short note with the folder buttons, and the file that could not be checked.
+    // The admin: the note, the 8 accepted files, then the file that could not be checked.
     const note = h.api.sentTo(OWNER_ID).map((c) => String(c.payload.text)).find((t) => t.includes("ta fayl tekshirildi"));
-    expect(note).toContain("12 ta fayl tekshirildi — ✅ 8, ❌ 3, ⚠️ 1 ta tekshirib bo'lmadi. Tayyor: 70%.");
-    const docs = h.api.sentTo(OWNER_ID, "sendDocument");
-    expect(docs).toHaveLength(1);
-    expect(String(docs[0]?.payload.caption)).toContain("Tekshirib bo'lmadi");
+    expect(note).toContain("12 ta fayl tekshirildi — ✅ 8, ❌ 3, ⚠️ 1 ta tekshirib bo'lmadi. Tayyor: 40% (2/5).");
+    const docs = h.api.sentTo(OWNER_ID, "sendDocument").map((c) => String(c.payload.caption));
+    expect(docs).toHaveLength(9);
+    expect(docs.filter((c) => c.startsWith("✅"))).toHaveLength(8);
+    expect(docs.at(-1)).toContain("Tekshirib bo'lmadi");
+
+    // The register extract sent again on its own completes document 1.
+    h.api.clear();
+    h.generator.fallback = answerByName({ "egrpo-yangi.pdf": verdict("ustav_egrpo", true, { parts: ["egrpo"] }) });
+    await h.send(h.directMessage(null, { file: pdf("egrpo-yangi.pdf") }));
+    await h.flush();
+    expect(String(h.api.sentTo(CLIENT_ID).at(-1)?.payload.text)).toContain("✅ 1. Korxona ustavi va YeGRPO dan ko'chirma");
 
     // The status request shows the same figures without calling Claude.
     h.api.clear();
+    const calls = h.generator.calls.length;
     await h.send(h.directMessage("holat"));
-    expect(h.generator.calls).toHaveLength(12);
-    expect(String(h.api.sentTo(CLIENT_ID)[0]?.payload.text)).toContain("Tayyor: 70% (7/10)");
+    expect(h.generator.calls).toHaveLength(calls);
+    expect(String(h.api.sentTo(CLIENT_ID)[0]?.payload.text)).toContain("Tayyor: 60% (3/5)");
   });
 
-  it("keeps an accepted document when a wrong copy comes later", async () => {
+  it("keeps an accepted part when a wrong copy comes later", async () => {
     const h = makeHarness();
-    h.generator.push(verdict("ustav", true), verdict("ustav", false, ["muhr yo'q"]));
-    await h.send(h.directMessage(null, { file: { name: "ustav.docx", data: await filledQuestionnaire() } }));
+    h.generator.push(verdict("ustav_egrpo", true), verdict("ustav_egrpo", false, { reasons: ["muhr yo'q"] }));
+    await h.send(h.directMessage(null, { file: pdf("ustav.pdf") }));
     await h.flush();
-    await h.send(h.directMessage(null, { file: { name: "ustav2.docx", data: await filledQuestionnaire() } }));
+    await h.send(h.directMessage(null, { file: pdf("ustav2.pdf") }));
     await h.flush();
-    expect(h.assistant.clientProgressText(CLIENT_ID, "uz")).toContain("✅ Korxona ustavi");
+    expect(h.assistant.clientProgressText(CLIENT_ID, "uz")).toContain("✅ 1. Korxona ustavi va YeGRPO dan ko'chirma");
   });
 
-  it("does not send summaries in preview mode but still saves the files", async () => {
+  it("does not send summaries to the client in preview mode but saves the files and sends them to the admin", async () => {
     const h = makeHarness({ AUTO_SEND: "false" });
-    h.generator.push(verdict("egrpo", true));
-    await h.send(h.directMessage(null, { file: { name: "egrpo.pdf", data: Buffer.from("%PDF") } }));
+    h.generator.push(verdict("ekologik_paket", true));
+    await h.send(h.directMessage(null, { file: pdf("eko.pdf") }));
     await h.flush();
     expect(h.api.sentTo(CLIENT_ID)).toHaveLength(0);
-    expect(h.previews.at(-1)?.reply).toContain("YeGRPO dan ko'chirma — egrpo.pdf");
-    expect(fs.readdirSync(path.join(h.clientDir(), "accepted", "egrpo"))).toHaveLength(1);
-    const note = String(h.api.sentTo(OWNER_ID).at(-1)?.payload.text);
-    expect(note).toContain("Mijozga yuborilmadi");
+    expect(h.previews.at(-1)?.reply).toContain("Ekologik paket (ZVOS/ZEP, PDV, limitlar) — eko.pdf");
+    expect(fs.readdirSync(path.join(h.clientDir(), "accepted", "ekologik_paket"))).toHaveLength(1);
+    expect(String(h.api.sentTo(OWNER_ID)[0]?.payload.text)).toContain("Mijozga yuborilmadi");
+    expect(h.api.sentTo(OWNER_ID, "sendDocument")).toHaveLength(1);
   });
 
   it("rejects formats it cannot read and files over 20 MB without calling Claude", async () => {
@@ -298,10 +355,8 @@ describe("document batches", () => {
 
   it("stops at the usage limit and keeps the rest in the inbox across a restart", async () => {
     const h = makeHarness();
-    h.generator.push(verdict("ustav", true), new ClaudeLimitError("usage limit", h.clock.t + 3600, null));
-    for (const name of ["a.pdf", "b.pdf", "c.pdf"]) {
-      await h.send(h.directMessage(null, { file: { name, data: Buffer.from("%PDF") } }));
-    }
+    h.generator.push(verdict("ustav_egrpo", true), new ClaudeLimitError("usage limit", h.clock.t + 3600, null));
+    for (const name of ["a.pdf", "b.pdf", "c.pdf"]) await h.send(h.directMessage(null, { file: pdf(name) }));
     await h.flush();
     expect(h.generator.calls).toHaveLength(2);
     expect(h.assistant.inbox.read(CLIENT_ID).files.map((f) => f.name)).toEqual(["b.pdf", "c.pdf"]);
@@ -309,31 +364,31 @@ describe("document batches", () => {
 
     h.restart();
     h.clock.advance(3601);
-    h.generator.push(verdict("egrpo", true), verdict("ruxsatnoma", true));
+    h.generator.push(verdict("loyiha_5gr", true), verdict("ruxsatnoma_kelishuv", true));
     await h.flush();
     expect(h.generator.calls).toHaveLength(4);
     expect(h.assistant.inbox.read(CLIENT_ID).files).toHaveLength(0);
-    expect(h.assistant.clientProgressText(CLIENT_ID, "uz")).toContain("Tayyor: 30% (3/10)");
+    expect(h.assistant.clientProgressText(CLIENT_ID, "uz")).toContain("Tayyor: 60% (3/5)");
   });
 
   it("reviews files sent to the business account and answers through it", async () => {
     const h = makeHarness();
     h.setConnection();
-    h.generator.push(verdict("ustav", true));
-    await h.send(h.businessMessage(null, { name: "ustav.pdf", data: Buffer.from("%PDF") }));
+    h.generator.push(verdict("ustav_egrpo", true));
+    await h.send(h.businessMessage(null, pdf("ustav.pdf")));
     await h.flush();
     const summary = h.api.sentTo(CLIENT_ID).at(-1);
     expect(summary?.payload.business_connection_id).toBe(CONNECTION_ID);
-    expect(String(summary?.payload.text)).toContain("Korxona ustavi — ustav.pdf");
+    expect(String(summary?.payload.text)).toContain("Korxona ustavi va YeGRPO dan ko'chirma — ustav.pdf");
   });
 
   it("reviews photos too", async () => {
     const h = makeHarness();
-    h.generator.push(verdict("ruxsatnoma", true));
+    h.generator.push(verdict("ruxsatnoma_kelishuv", true, { parts: ["ruxsatnoma"] }));
     await h.send(h.directMessage(null, { photo: Buffer.from("jpeg") }));
     await h.flush();
     expect(h.generator.calls[0]?.files).toEqual(["document.jpg"]);
-    expect(h.assistant.clientProgressText(CLIENT_ID, "uz")).toContain("✅ Yer qa'ridan foydalanish ruxsatnomasi");
+    expect(h.assistant.clientProgressText(CLIENT_ID, "uz")).toContain("🟡 2. Yer qa'ridan foydalanish ruxsatnomasi");
   });
 });
 
@@ -349,20 +404,22 @@ describe("client folder and questionnaire", () => {
 
   it("sends the blank questionnaire when Claude asks for it, without the marker", async () => {
     const h = makeHarness();
-    h.generator.push("Anketani yuboraman, to'ldirib qaytaring. [SEND_TEMPLATE]");
+    h.generator.push("Anketani yuboraman, 5 ta hujjatni yuboring. [SEND_TEMPLATE]");
     await h.send(h.directMessage("Konimizga investor kerak"));
     const text = h.api.sentTo(CLIENT_ID).map((c) => String(c.payload.text));
-    expect(text).toEqual(["Anketani yuboraman, to'ldirib qaytaring."]);
+    expect(text).toEqual(["Anketani yuboraman, 5 ta hujjatni yuboring."]);
     expect(h.api.sentTo(CLIENT_ID, "sendDocument")).toHaveLength(1);
     expect(h.generator.calls[0]?.system).toContain("[SEND_TEMPLATE]");
+    expect(h.generator.calls[0]?.system).toContain("the 5 documents listed at its end");
   });
 
-  it("sends the Russian form on request without Claude", async () => {
+  it("sends the Russian form with the list of 5 documents on request, without Claude", async () => {
     const h = makeHarness();
     await h.send(h.directMessage("Анкета"));
     expect(h.generator.calls).toHaveLength(0);
-    const doc = h.api.sentTo(CLIENT_ID, "sendDocument")[0];
-    expect(String(doc?.payload.caption)).toContain("Заполните анкету");
+    const caption = String(h.api.sentTo(CLIENT_ID, "sendDocument")[0]?.payload.caption);
+    expect(caption).toContain("5 документов");
+    expect(caption).toContain("5) акты ЭПБ и решения на земельный отвод");
   });
 
   it("shows clients the status and questionnaire buttons on /start", async () => {
@@ -376,9 +433,9 @@ describe("client folder and questionnaire", () => {
 describe("deleting a chat", () => {
   async function clientWithHistory() {
     const h = makeHarness();
-    h.generator.push("Javob", verdict("ustav", true));
+    h.generator.push("Javob", verdict("ustav_egrpo", true));
     await h.send(h.directMessage("Salom"));
-    await h.send(h.directMessage(null, { file: { name: "ustav.pdf", data: Buffer.from("%PDF") } }));
+    await h.send(h.directMessage(null, { file: pdf("ustav.pdf") }));
     await h.flush();
     h.api.clear();
     return h;
@@ -391,8 +448,7 @@ describe("deleting a chat", () => {
     expect(fs.existsSync(h.clientDir())).toBe(true);
 
     await h.send(h.callback(`delete:${CLIENT_ID}`));
-    const ask = h.api.sentTo(OWNER_ID).at(-1);
-    expect(String(ask?.payload.text)).toContain("O'chirilsinmi?");
+    expect(String(h.api.sentTo(OWNER_ID).at(-1)?.payload.text)).toContain("O'chirilsinmi?");
     expect(fs.existsSync(h.clientDir())).toBe(true);
 
     await h.send(h.callback("delete-no"));
@@ -418,7 +474,7 @@ describe("deleting a chat", () => {
     const h = await clientWithHistory();
     await h.send(h.callback(`folder:${CLIENT_ID}`));
     const last = h.api.sentTo(OWNER_ID).at(-1);
-    expect(String(last?.payload.text)).toContain("Tayyor: 10% (1/10)");
+    expect(String(last?.payload.text)).toContain("Tayyor: 20% (1/5)");
     const buttons = (last?.payload.reply_markup as { inline_keyboard: { callback_data: string }[][] }).inline_keyboard
       .flat()
       .map((b) => b.callback_data);
@@ -427,9 +483,8 @@ describe("deleting a chat", () => {
     await h.send(h.callback(`chattxt:${CLIENT_ID}`));
     expect(h.api.sentTo(OWNER_ID, "sendDocument").at(-1)?.payload.caption).toContain("yozishma");
     await h.send(h.callback(`files:${CLIENT_ID}`));
-    expect(String(h.api.sentTo(OWNER_ID, "sendDocument").at(-1)?.payload.caption)).toBe("✅ ustav");
+    expect(String(h.api.sentTo(OWNER_ID, "sendDocument").at(-1)?.payload.caption)).toBe("✅ Korxona ustavi va YeGRPO dan ko'chirma");
 
-    const list = h.assistant.usersListMessages()[0]?.text ?? "";
-    expect(list).toContain("📊 10%");
+    expect(h.assistant.usersListMessages()[0]?.text ?? "").toContain("📊 20%");
   });
 });

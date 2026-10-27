@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 import { GrammyError, HttpError, InputFile, type Api } from "grammy";
 import type { BusinessConnection, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup } from "grammy/types";
 import { ClaudeCLI, ClaudeError, ClaudeLimitError } from "./claudeCli.js";
-import { ClientFolders, progress, progressText, safeFileName } from "./clientFolder.js";
+import { ClientFolders, type Progress, progress, progressText, safeFileName } from "./clientFolder.js";
 import type { Settings } from "./config.js";
 import {
   type FileVerdict,
@@ -17,7 +17,7 @@ import {
 } from "./documentReview.js";
 import { detectLanguage, type Language } from "./language.js";
 import { buildSystemPrompt, buildUserPrompt, SKIP_TOKEN, splitEscalation, splitTemplate } from "./prompts.js";
-import { blankFor, loadTemplate, type Template } from "./templates.js";
+import { blankFor, loadTemplate, type Template, type TemplateDoc, type TemplatePart } from "./templates.js";
 import {
   appendJsonl,
   type Clock,
@@ -890,7 +890,7 @@ export class Assistant {
     const lang = chat.language ?? "uz";
     if (file.size !== undefined && file.size > MAX_FILE_BYTES) {
       log(`Chat ${chat.chatName} (${chat.chatId}): ${file.name} is larger than 20 MB, not downloaded.`);
-      this.folders.reject(chat.chatId, "", null, null, file.name, [TOO_LARGE_REASON[lang]]);
+      this.folders.reject(chat.chatId, "", null, [], null, file.name, [TOO_LARGE_REASON[lang]]);
       await this.#deliver(api, chat, `❌ ${file.name}: ${TOO_LARGE_REASON[lang]}.`);
       return;
     }
@@ -1002,6 +1002,7 @@ export class Assistant {
     if (data.files.length >= 3) await this.#deliver(api, chat, REVIEW_STARTED[lang](data.files.length));
 
     const verdicts: FileVerdict[] = [];
+    const accepted: { verdict: Extract<FileVerdict, { kind: "accepted" }>; file: string }[] = [];
     let stopped: "limit" | "daily" | null = null;
     for (const file of data.files) {
       if (!this.#allowReview()) {
@@ -1034,7 +1035,8 @@ export class Assistant {
         }
         verdict = { kind: "unchecked", file, reason: err instanceof ClaudeError ? err.message : errorMessage(err) };
       }
-      this.#saveVerdict(userId, template, verdict);
+      const saved = this.#saveVerdict(userId, template, verdict);
+      if (saved && verdict.kind === "accepted") accepted.push({ verdict, file: saved });
       verdicts.push(verdict);
       // The owner deleted this chat while it was being reviewed.
       if (!this.folders.exists(userId)) return;
@@ -1053,43 +1055,69 @@ export class Assistant {
       `Chat ${chat.chatName} (${userId}): ${verdicts.length} file(s) reviewed, ready ${p.readyPct}%` +
         `${sent ? "" : " (summary not sent)"}.`,
     );
-    await this.#reportReviewToOwner(api, userId, verdicts, p.readyPct, sent ? "" : summary);
+    await this.#reportReviewToOwner(api, userId, verdicts, accepted, p, sent ? "" : summary);
   }
 
-  #saveVerdict(userId: number, template: Template, verdict: FileVerdict): void {
+  /** Files the verdict away. Returns where an accepted file was saved, so it can be sent to the owner. */
+  #saveVerdict(userId: number, template: Template, verdict: FileVerdict): string | null {
     const source = this.inbox.path(userId, verdict.file);
+    let saved: string | null = null;
     try {
       if (verdict.kind === "accepted") {
-        this.folders.accept(userId, template.id, verdict.doc.key, source, verdict.file.name);
+        const parts = verdict.parts.map((part) => part.key);
+        saved = this.folders.accept(userId, template.id, verdict.doc.key, parts, source, verdict.file.name);
         if (verdict.applicant) this.folders.setApplicant(userId, template.id, verdict.applicant);
       } else if (verdict.kind === "rejected") {
-        this.folders.reject(userId, template.id, verdict.doc?.key ?? null, source, verdict.file.name, verdict.reasons);
+        const parts = verdict.parts.map((part) => part.key);
+        this.folders.reject(userId, template.id, verdict.doc?.key ?? null, parts, source, verdict.file.name, verdict.reasons);
       } else {
-        this.folders.reject(userId, template.id, null, source, verdict.file.name, [`not checked: ${verdict.reason}`]);
+        this.folders.reject(userId, template.id, null, [], source, verdict.file.name, [`not checked: ${verdict.reason}`]);
       }
     } catch (err) {
       logError(`Could not save the review of ${verdict.file.name} for chat ${userId}: ${errorMessage(err)}`);
     }
     this.inbox.remove(userId, verdict.file);
+    return saved;
   }
 
   /** A short note to the owner; files that could not be checked are sent along so someone looks at them. */
+  /**
+   * Tells the owner how the batch went and sends them the files that were accepted in it (the ready documents),
+   * then the ones that could not be checked. When the package becomes complete, the owner is told once.
+   */
   async #reportReviewToOwner(
     api: Api,
     userId: number,
     verdicts: FileVerdict[],
-    readyPct: number,
+    accepted: { verdict: Extract<FileVerdict, { kind: "accepted" }>; file: string }[],
+    p: Progress,
     unsentSummary: string,
   ): Promise<void> {
     const count = (kind: FileVerdict["kind"]): number => verdicts.filter((v) => v.kind === kind).length;
     const unchecked = verdicts.filter((v): v is Extract<FileVerdict, { kind: "unchecked" }> => v.kind === "unchecked");
+    const who = this.personTitle(userId);
     let text =
-      `📎 ${this.personTitle(userId)}: ${verdicts.length} ta fayl tekshirildi — ✅ ${count("accepted")}, ` +
+      `📎 ${who}: ${verdicts.length} ta fayl tekshirildi — ✅ ${count("accepted")}, ` +
       `❌ ${count("rejected")}${unchecked.length ? `, ⚠️ ${unchecked.length} ta tekshirib bo'lmadi` : ""}. ` +
-      `Tayyor: ${readyPct}%.`;
+      `Tayyor: ${p.readyPct}% (${p.accepted}/${p.total}).` +
+      (accepted.length ? "\nQabul qilingan hujjatlar quyida." : "");
     if (unsentSummary) text += `\n\nMijozga yuborilmadi (PREVIEW yoki siz javob beryapsiz). Xulosa:\n${truncate(unsentSummary, 3000)}`;
     try {
       await api.sendMessage(this.settings.ownerId, text, { reply_markup: folderKeyboard(userId) });
+      for (const { verdict, file } of accepted) {
+        const parts = verdict.doc.parts.length > 1 ? ` (${verdict.parts.map((part) => part.title.uz).join(", ")})` : "";
+        await api.sendDocument(this.settings.ownerId, new InputFile(file, verdict.file.name), {
+          caption: truncate(`✅ ${verdict.doc.title.uz}${parts}\n👤 ${who}`, 1000),
+        });
+      }
+      if (p.total > 0 && p.accepted === p.total && this.folders.markComplete(userId)) {
+        await api.sendMessage(
+          this.settings.ownerId,
+          `🎉 ${who}: barcha ${p.total} ta hujjat tayyor (100%). Hammasi mijoz papkasida — «📎 Qabul qilingan ` +
+            "fayllar» tugmasi bilan qayta olish mumkin.",
+          { reply_markup: folderKeyboard(userId) },
+        );
+      }
       for (const verdict of unchecked) {
         const saved = this.#rejectedPath(userId, verdict.file.name);
         if (!saved) continue;
@@ -1402,7 +1430,9 @@ export class Assistant {
       "• Mijozlarning xabarlari sizga yuborilmaydi. Faqat 🚨 muhim murojaatlar va hujjat tekshiruvi xulosalari keladi.",
       "• Mijoz fayl yuborsa (bir yo'la 10–50 ta ham bo'lishi mumkin), bot har birini anketa shabloni " +
         "(templates/) bo'yicha tekshiradi: moslari mijoz papkasiga saqlanadi, mos kelmaganlarini sababi bilan " +
-        "qayta so'raydi va mijozga necha foiz tayyorligini ko'rsatadi. Tekshirib bo'lmagan fayllar sizga keladi.",
+        "qayta so'raydi va mijozga necha foiz tayyorligini ko'rsatadi. Mijozdan 5 ta hujjat so'raladi (anketa " +
+        "oxiridagi ro'yxat). Qabul qilingan har bir hujjat va tekshirib bo'lmagan fayllar sizga yuboriladi; 5 tasi " +
+        "to'liq bo'lsa, alohida 🎉 xabar keladi.",
       "• «users» tugmasi mijozlar ro'yxatini (📊 tayyorlik foizi bilan) ko'rsatadi. Mijozni bossangiz, u bilan " +
         "butun yozishma va hujjatlar holati ochiladi; ostida «📄 chat.txt», «📎 Qabul qilingan fayllar» va " +
         "«🗑 Chatni o'chirish» tugmalari bor.",
@@ -1565,21 +1595,23 @@ export function reviewSummaryText(
 ): string {
   const w = REVIEW_WORDS[language];
   const lines = [w.checked(verdicts.length)];
-  const accepted = verdicts.filter((v) => v.kind === "accepted");
-  const rejected = verdicts.filter((v) => v.kind === "rejected");
+  const accepted = verdicts.filter((v): v is Extract<FileVerdict, { kind: "accepted" }> => v.kind === "accepted");
+  const rejected = verdicts.filter((v): v is Extract<FileVerdict, { kind: "rejected" }> => v.kind === "rejected");
   const unchecked = verdicts.filter((v) => v.kind === "unchecked");
+  // "Charter and register extract (Register extract)" when the file holds only some parts of a document.
+  const title = (v: { doc: TemplateDoc | null; parts: TemplatePart[] }): string => {
+    if (!v.doc) return "";
+    const some = v.doc.parts.length > 1 && v.parts.length > 0 && v.parts.length < v.doc.parts.length;
+    return some ? `${v.doc.title[language]} (${v.parts.map((part) => part.title[language]).join(", ")})` : v.doc.title[language];
+  };
   if (accepted.length) {
-    lines.push("", w.accepted, ...accepted.map((v) => `• ${v.kind === "accepted" ? v.doc.title[language] : ""} — ${v.file.name}`));
+    lines.push("", w.accepted, ...accepted.map((v) => `• ${title(v)} — ${v.file.name}`));
   }
   if (rejected.length) {
     lines.push(
       "",
       w.rejected,
-      ...rejected.map((v) => {
-        if (v.kind !== "rejected") return "";
-        const what = v.doc ? `${v.doc.title[language]} (${v.file.name})` : v.file.name;
-        return `• ${what}: ${v.reasons.join("; ")}`;
-      }),
+      ...rejected.map((v) => `• ${v.doc ? `${title(v)} (${v.file.name})` : v.file.name}: ${v.reasons.join("; ")}`),
     );
   }
   if (unchecked.length) lines.push("", w.unchecked, ...unchecked.map((v) => `• ${v.file.name}`));
@@ -1589,14 +1621,20 @@ export function reviewSummaryText(
 
 const TEMPLATE_CAPTION: Record<Language, string> = {
   uz:
-    "Anketani to'ldirib, NDA qismini imzolang va shu chatga qaytaring. Anketa ostida ko'rsatilgan hujjatlarni ham " +
-    "fayl qilib yuboring: bot har birini tekshirib, nechchi foizi tayyorligini ko'rsatadi.",
+    "Anketa oxiridagi 5 ta hujjatni shu chatga fayl qilib yuboring: 1) ustav va YeGRPO dan ko'chirma; " +
+    "2) ruxsatnoma (litsenziya) va litsenziya kelishuvi; 3) loyiha hujjatlari va 5-GR tasdig'i; 4) ekologik paket; " +
+    "5) EPB dalolatnomalari va yer ajratmasi qarorlari. Bot har birini tekshirib, nechchi foizi tayyorligini " +
+    "ko'rsatadi. Anketani to'ldirib, imzolab yuborsangiz ham bo'ladi.",
   ru:
-    "Заполните анкету, подпишите раздел NDA и отправьте её в этот чат. Документы из перечня в конце анкеты тоже " +
-    "отправьте файлами: бот проверит каждый и покажет, на сколько процентов пакет готов.",
+    "Отправьте файлами в этот чат 5 документов из перечня в конце анкеты: 1) устав и выписка из ЕГРПО; " +
+    "2) разрешение (лицензия) и лицензионное соглашение; 3) проектная документация и подтверждение сдачи 5-ГР; " +
+    "4) экологический пакет; 5) акты ЭПБ и решения на земельный отвод. Бот проверит каждый и покажет, на сколько " +
+    "процентов пакет готов. Заполненную и подписанную анкету тоже можно прислать.",
   en:
-    "Please fill in the questionnaire (Russian version), sign the NDA part and send it back in this chat, together " +
-    "with the documents listed at its end: each file is checked and you will see how complete your package is.",
+    "Please send the 5 documents listed at the end of the questionnaire (Russian version) as files in this chat: " +
+    "1) charter and register extract; 2) subsoil use permit and licence agreement; 3) project documents and proof " +
+    "of form 5-GR; 4) environmental package; 5) industrial safety reports and land allotment decisions. Each file " +
+    "is checked and you will see how complete your package is. You may also send the filled-in, signed questionnaire.",
 };
 
 const STATUS_UNAVAILABLE: Record<Language, string> = {

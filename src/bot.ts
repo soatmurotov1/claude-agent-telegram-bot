@@ -129,6 +129,7 @@ async function tryReview(settings: Settings, file: string, lang: string | undefi
           file: entry.name,
           verdict: verdict.kind,
           doc: verdict.kind === "unchecked" ? null : (verdict.doc?.key ?? null),
+          parts: verdict.kind === "unchecked" ? [] : verdict.parts.map((part) => part.key),
           reasons: verdict.kind === "rejected" ? verdict.reasons : [],
           summary: verdict.kind === "unchecked" ? verdict.reason : verdict.summary,
           applicant: verdict.kind === "accepted" ? verdict.applicant : null,

@@ -8,15 +8,27 @@ export const DEFAULT_TEMPLATE_ID = "investment-checklist";
 
 export type Titles = Record<Language, string>;
 
+/**
+ * One paper inside a required document, e.g. the charter inside "charter and register extract". A client may send
+ * all parts in one file or each part as its own file.
+ */
+export interface TemplatePart {
+  key: string;
+  title: Titles;
+  /** Acceptance criteria, for Claude. */
+  checks: string[];
+  /** Questionnaire items that, when all marked "not applicable", make this part optional. Empty = always needed. */
+  naItems: number[];
+}
+
 export interface TemplateDoc {
   key: string;
   title: Titles;
   /** What the document is, for Claude. */
   description: string;
-  /** Acceptance criteria, for Claude. */
-  checks: string[];
-  /** Questionnaire items that, when marked "not applicable", make this document optional. Empty = always needed. */
-  naItems: number[];
+  parts: TemplatePart[];
+  /** False for documents that are welcome but not counted in the percentages (the questionnaire itself). */
+  required: boolean;
 }
 
 export interface Template {
@@ -66,25 +78,44 @@ export function loadTemplate(templatesDir: string, id = DEFAULT_TEMPLATE_ID): Te
     }
   }
 
+  // Document and part keys share one namespace, so a part key alone names its document.
   const keys = new Set<string>();
-  const documents = raw.documents.map((value, i): TemplateDoc => {
-    const where = `${file}: documents[${i}]`;
-    if (!isRecord(value)) throw new TemplateError(`${where} must be an object`);
-    const { key, description, checks, naItems } = value;
+  const checkKey = (key: unknown, where: string): string => {
     if (typeof key !== "string" || !/^[a-z0-9_]+$/.test(key)) {
       throw new TemplateError(`${where}: key must use only a-z, 0-9 and _`);
     }
+    return key;
+  };
+  const documents = raw.documents.map((value, i): TemplateDoc => {
+    const where = `${file}: documents[${i}]`;
+    if (!isRecord(value)) throw new TemplateError(`${where} must be an object`);
+    const key = checkKey(value.key, where);
     if (keys.has(key)) throw new TemplateError(`${where}: duplicate key ${key}`);
     keys.add(key);
+    if (!Array.isArray(value.parts) || value.parts.length === 0) throw new TemplateError(`${where}: "parts" is missing`);
+    const parts = value.parts.map((part, j): TemplatePart => {
+      const partWhere = `${where}.parts[${j}]`;
+      if (!isRecord(part)) throw new TemplateError(`${partWhere} must be an object`);
+      const partKey = checkKey(part.key, partWhere);
+      if (keys.has(partKey) && partKey !== key) throw new TemplateError(`${partWhere}: duplicate key ${partKey}`);
+      keys.add(partKey);
+      const { checks, naItems } = part;
+      return {
+        key: partKey,
+        title: titles(part.title, partWhere),
+        checks: Array.isArray(checks) ? checks.filter((c): c is string => typeof c === "string") : [],
+        naItems: Array.isArray(naItems) ? naItems.filter((n): n is number => Number.isInteger(n)) : [],
+      };
+    });
     return {
       key,
       title: titles(value.title, where),
-      description: typeof description === "string" ? description : "",
-      checks: Array.isArray(checks) ? checks.filter((c): c is string => typeof c === "string") : [],
-      naItems: Array.isArray(naItems) ? naItems.filter((n): n is number => Number.isInteger(n)) : [],
+      description: typeof value.description === "string" ? value.description : "",
+      parts,
+      required: value.required !== false,
     };
   });
-  if (documents.length === 0) throw new TemplateError(`${file}: no documents`);
+  if (!documents.some((doc) => doc.required)) throw new TemplateError(`${file}: no required documents`);
 
   return {
     id: typeof raw.id === "string" ? raw.id : id,

@@ -1,6 +1,7 @@
 import { Composer, type Context, InputFile } from "grammy";
 import type { ReplyKeyboardMarkup } from "grammy/types";
 import type { Settings } from "./config.js";
+import { loadTemplate } from "./templates.js";
 import {
   type Assistant,
   CHAT_TXT_CALLBACK_PREFIX,
@@ -149,8 +150,14 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
       return;
     }
     await ctx.api.sendMessage(settings.ownerId, assistant.clientProgressText(userId, "uz"));
+    const titles = new Map<string, string>();
+    try {
+      for (const doc of loadTemplate(settings.templatesDir).documents) titles.set(doc.key, doc.title.uz);
+    } catch {
+      // Keys are shown instead of titles.
+    }
     for (const { docKey, file } of files) {
-      await ctx.api.sendDocument(settings.ownerId, new InputFile(file), { caption: `✅ ${docKey}` });
+      await ctx.api.sendDocument(settings.ownerId, new InputFile(file), { caption: `✅ ${titles.get(docKey) ?? docKey}` });
     }
   });
 
