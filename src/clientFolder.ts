@@ -17,7 +17,18 @@ export interface PartRecord {
 export interface DocRecord {
   /** Accepted file names under accepted/<doc key>/, oldest first. */
   files: string[];
+  /** Telegram file_id per accepted file name, to pass files on without uploading them (no 50 MB upload limit). */
+  fileIds: Record<string, string>;
   parts: Record<string, PartRecord>;
+}
+
+export interface AcceptedFile {
+  docKey: string;
+  /** Absolute path of the saved copy. */
+  file: string;
+  /** The name the client gave it. */
+  name: string;
+  fileId?: string;
 }
 
 /** What the accepted questionnaire said about the client, used to check the other documents. */
@@ -74,7 +85,11 @@ function toStatus(value: unknown): ClientStatus | null {
         if (!isRecord(part) || (part.state !== "accepted" && part.state !== "rejected")) continue;
         parts[partKey] = { state: part.state, reasons: stringList(part.reasons), ts: typeof part.ts === "number" ? part.ts : 0 };
       }
-      docs[key] = { files: stringList(raw.files), parts };
+      const fileIds: Record<string, string> = {};
+      if (isRecord(raw.fileIds)) {
+        for (const [name, id] of Object.entries(raw.fileIds)) if (typeof id === "string") fileIds[name] = id;
+      }
+      docs[key] = { files: stringList(raw.files), fileIds, parts };
     }
   }
   let applicant: Applicant | null = null;
@@ -221,6 +236,7 @@ export class ClientFolders {
     partKeys: readonly string[],
     source: string,
     originalName: string,
+    fileId?: string,
   ): string {
     const dir = this.#ensure(userId, "accepted", docKey);
     const name = `${stamp(this.clock())}_${safeFileName(originalName)}`;
@@ -229,8 +245,9 @@ export class ClientFolders {
     fs.chmodSync(target, 0o600);
     this.#update(userId, (status) => {
       status.template = templateId;
-      const record = status.docs[docKey] ?? { files: [], parts: {} };
+      const record = status.docs[docKey] ?? { files: [], fileIds: {}, parts: {} };
       record.files.push(name);
+      if (fileId) record.fileIds[name] = fileId;
       for (const part of partKeys) record.parts[part] = { state: "accepted", reasons: [], ts: this.clock() };
       status.docs[docKey] = record;
     });
@@ -280,7 +297,7 @@ export class ClientFolders {
     if (docKey === null || partKeys.length === 0) return;
     this.#update(userId, (status) => {
       status.template = templateId;
-      const record = status.docs[docKey] ?? { files: [], parts: {} };
+      const record = status.docs[docKey] ?? { files: [], fileIds: {}, parts: {} };
       for (const part of partKeys) {
         if (record.parts[part]?.state === "accepted") continue;
         record.parts[part] = { state: "rejected", reasons, ts: this.clock() };
@@ -289,14 +306,19 @@ export class ClientFolders {
     });
   }
 
-  /** Accepted files as absolute paths, grouped by document key. */
-  acceptedFiles(userId: number): { docKey: string; file: string }[] {
+  /** Accepted files, grouped by document in `order` (template order), then any others. */
+  acceptedFiles(userId: number, order: readonly string[] = []): AcceptedFile[] {
     const status = this.status(userId);
-    const out: { docKey: string; file: string }[] = [];
-    for (const [docKey, record] of Object.entries(status.docs)) {
-      for (const name of record.files) {
-        const file = path.join(this.dir(userId), "accepted", docKey, name);
-        if (fs.existsSync(file)) out.push({ docKey, file });
+    const keys = [...order.filter((key) => key in status.docs), ...Object.keys(status.docs).filter((k) => !order.includes(k))];
+    const out: AcceptedFile[] = [];
+    for (const docKey of keys) {
+      const record = status.docs[docKey];
+      if (!record) continue;
+      for (const saved of record.files) {
+        const file = path.join(this.dir(userId), "accepted", docKey, saved);
+        if (!fs.existsSync(file)) continue;
+        const fileId = record.fileIds[saved];
+        out.push({ docKey, file, name: saved.replace(/^\d{8}-\d{6}_/, ""), ...(fileId ? { fileId } : {}) });
       }
     }
     return out;

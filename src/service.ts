@@ -4,18 +4,19 @@ import crypto from "node:crypto";
 import { GrammyError, HttpError, InputFile, type Api } from "grammy";
 import type { BusinessConnection, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup } from "grammy/types";
 import { ClaudeCLI, ClaudeError, ClaudeLimitError } from "./claudeCli.js";
-import { ClientFolders, type Progress, progress, progressText, safeFileName } from "./clientFolder.js";
+import { type AcceptedFile, ClientFolders, type Progress, progress, progressText } from "./clientFolder.js";
 import type { Settings } from "./config.js";
 import {
   type FileVerdict,
   Inbox,
-  MAX_FILE_BYTES,
+  type InboxFile,
   readLaws,
   type ReviewChat,
   type ReviewGenerator,
   reviewFile,
 } from "./documentReview.js";
 import { detectLanguage, type Language } from "./language.js";
+import { BOT_API_DOWNLOAD_LIMIT, MtprotoDownloader } from "./largeFiles.js";
 import { buildSystemPrompt, buildUserPrompt, SKIP_TOKEN, splitEscalation, splitTemplate } from "./prompts.js";
 import { blankFor, loadTemplate, type Template, type TemplateDoc, type TemplatePart } from "./templates.js";
 import {
@@ -152,6 +153,8 @@ export function deleteConfirmKeyboard(userId: number): InlineKeyboardMarkup {
 
 /** Downloads a Telegram file to `target`. Replaced in tests. */
 export type FileDownloader = (api: Api, fileId: string, target: string) => Promise<void>;
+/** Downloads a file over 20 MB to `target`. */
+export type LargeFileDownloader = (fileId: string, target: string, size?: number) => Promise<void>;
 
 /** The ✍️ button that starts writing to a person. */
 export function replyKeyboard(userId: number): InlineKeyboardMarkup {
@@ -301,6 +304,8 @@ export interface AssistantOptions {
   clock?: Clock;
   previewSink?: (preview: Preview) => void;
   downloadFile?: FileDownloader;
+  /** Downloads files over 20 MB (MTProto); null turns large files off. Built from TELEGRAM_API_ID/HASH by default. */
+  downloadLargeFile?: LargeFileDownloader | null;
   /** Wait after the last file before a batch is reviewed (default REVIEW_BATCH_SECONDS). */
   reviewDelayMs?: number;
 }
@@ -357,6 +362,9 @@ export class Assistant {
   readonly #clock: Clock;
   readonly #previewSink: (preview: Preview) => void;
   readonly #downloadFile: FileDownloader;
+  readonly #downloadLargeFile: LargeFileDownloader | null;
+  /** Set when TELEGRAM_API_ID/HASH are configured, for the startup check. */
+  readonly mtproto: MtprotoDownloader | null = null;
   readonly #reviewDelayMs: number;
   readonly #reviewTimers = new Map<number, NodeJS.Timeout>();
   /** Batches running now, so tests and /resume can wait for them. */
@@ -369,11 +377,25 @@ export class Assistant {
   constructor(
     readonly settings: Settings,
     private readonly generator: ReplyGenerator,
-    { clock = () => Date.now() / 1000, previewSink = printPreview, downloadFile, reviewDelayMs }: AssistantOptions = {},
+    { clock = () => Date.now() / 1000, previewSink = printPreview, downloadFile, downloadLargeFile, reviewDelayMs }: AssistantOptions = {},
   ) {
     this.#clock = clock;
     this.#previewSink = previewSink;
     this.#downloadFile = downloadFile ?? ((api, fileId, target) => telegramDownload(api, settings.botToken, fileId, target));
+    if (downloadLargeFile !== undefined) {
+      this.#downloadLargeFile = downloadLargeFile;
+    } else if (settings.telegramApiId && settings.telegramApiHash && settings.botToken) {
+      const mtproto = new MtprotoDownloader({
+        apiId: settings.telegramApiId,
+        apiHash: settings.telegramApiHash,
+        botToken: settings.botToken,
+        sessionFile: path.join(settings.dataDir, "mtproto.session"),
+      });
+      this.mtproto = mtproto;
+      this.#downloadLargeFile = (fileId, target, size) => mtproto.download(fileId, target, size);
+    } else {
+      this.#downloadLargeFile = null;
+    }
     this.#reviewDelayMs = reviewDelayMs ?? REVIEW_BATCH_SECONDS * 1000;
     const dir = settings.dataDir;
     ensurePrivateDir(dir);
@@ -760,8 +782,8 @@ export class Assistant {
    * Sends a text the bot wrote without Claude's reply flow (status, review summary) to the client. In PREVIEW mode,
    * or when the owner is answering this chat, it goes to the logs instead. Returns true when it was sent.
    */
-  async #deliver(api: Api, chat: ChatContext, text: string, keyboard?: InlineKeyboardMarkup | ReplyKeyboardMarkup): Promise<boolean> {
-    const preview: Preview = {
+  #previewOf(chat: ChatContext, text: string): Preview {
+    return {
       connectionId: chat.target.kind === "business" ? chat.target.connectionId : DIRECT_HISTORY_ID,
       chatId: chat.chatId,
       chatName: chat.chatName,
@@ -771,6 +793,10 @@ export class Assistant {
       escalated: false,
       note: "",
     };
+  }
+
+  async #deliver(api: Api, chat: ChatContext, text: string, keyboard?: InlineKeyboardMarkup | ReplyKeyboardMarkup): Promise<boolean> {
+    const preview = this.#previewOf(chat, text);
     if (!this.settings.autoSend) {
       this.#showPreview(preview);
       return false;
@@ -888,17 +914,43 @@ export class Assistant {
     const file = fileOf(message);
     if (!file) return;
     const lang = chat.language ?? "uz";
-    if (file.size !== undefined && file.size > MAX_FILE_BYTES) {
-      log(`Chat ${chat.chatName} (${chat.chatId}): ${file.name} is larger than 20 MB, not downloaded.`);
-      this.folders.reject(chat.chatId, "", null, [], null, file.name, [TOO_LARGE_REASON[lang]]);
-      await this.#deliver(api, chat, `❌ ${file.name}: ${TOO_LARGE_REASON[lang]}.`);
+    const refuse = async (reason: string): Promise<void> => {
+      this.folders.reject(chat.chatId, "", null, [], null, file.name, [reason]);
+      await this.#deliver(api, chat, `❌ ${file.name}: ${reason}.`);
+    };
+    const maxBytes = this.settings.maxFileMb * 1024 * 1024;
+    if (file.size !== undefined && file.size > maxBytes) {
+      log(`Chat ${chat.chatName} (${chat.chatId}): ${file.name} is larger than MAX_FILE_MB (${this.settings.maxFileMb}).`);
+      await refuse(TOO_LARGE_REASON[lang](this.settings.maxFileMb));
       return;
     }
+    const large = file.size !== undefined && file.size > BOT_API_DOWNLOAD_LIMIT;
+    if (large && !this.#downloadLargeFile) {
+      logError(
+        `Chat ${chat.chatId}: ${file.name} is larger than 20 MB, which the Bot API cannot download. Set ` +
+          "TELEGRAM_API_ID and TELEGRAM_API_HASH (from my.telegram.org) to accept such files.",
+      );
+      await refuse(LARGE_DISABLED_REASON[lang]);
+      return;
+    }
+
     const workdir = path.join(this.settings.dataDir, "claude-run");
     ensurePrivateDir(workdir);
     const tmp = path.join(workdir, `download-${crypto.randomBytes(8).toString("hex")}`);
     try {
-      await this.#downloadFile(api, file.fileId, tmp);
+      if (large && this.#downloadLargeFile) {
+        log(`Chat ${chat.chatId}: downloading ${file.name} (${Math.round((file.size ?? 0) / 1048576)} MB) over MTProto.`);
+        await this.#downloadLargeFile(file.fileId, tmp, file.size);
+      } else {
+        try {
+          await this.#downloadFile(api, file.fileId, tmp);
+        } catch (err) {
+          // Telegram did not say the size, and the file turned out too big for the Bot API.
+          if (!this.#downloadLargeFile || !/too big|too large/i.test(errorMessage(err))) throw err;
+          fs.rmSync(tmp, { force: true });
+          await this.#downloadLargeFile(file.fileId, tmp, file.size);
+        }
+      }
       const reviewChat: ReviewChat = {
         target: chat.target,
         chatId: chat.chatId,
@@ -906,11 +958,11 @@ export class Assistant {
         language: chat.language,
         ...(chat.threadId !== undefined ? { threadId: chat.threadId } : {}),
       };
-      this.inbox.add(reviewChat, tmp, file.name, message.message_id, this.#clock());
+      this.inbox.add(reviewChat, tmp, file.name, message.message_id, this.#clock(), file.fileId);
     } catch (err) {
       fs.rmSync(tmp, { force: true });
       logError(`Could not download ${file.name} from chat ${chat.chatId}: ${errorMessage(err)}`);
-      if (chat.target.kind === "direct") await this.#passToOwner(api, message, chat, false);
+      await refuse(DOWNLOAD_FAILED_REASON[lang]);
       return;
     }
     log(`Chat ${chat.chatName} (${chat.chatId}): ${file.name} queued for review.`);
@@ -1003,6 +1055,7 @@ export class Assistant {
 
     const verdicts: FileVerdict[] = [];
     const accepted: { verdict: Extract<FileVerdict, { kind: "accepted" }>; file: string }[] = [];
+    const retrying: InboxFile[] = [];
     let stopped: "limit" | "daily" | null = null;
     for (const file of data.files) {
       if (!this.#allowReview()) {
@@ -1035,27 +1088,40 @@ export class Assistant {
         }
         verdict = { kind: "unchecked", file, reason: err instanceof ClaudeError ? err.message : errorMessage(err) };
       }
+      // A failed check (CLI error, unreadable answer) is not the client's fault: try again later, and only after
+      // the last attempt ask the client to send the file in another form. Nobody else looks at it in between.
+      if (verdict.kind === "unchecked") {
+        const attempts = this.inbox.retryLater(userId, file);
+        logError(`Chat ${userId}: could not check ${file.name} (attempt ${attempts}): ${verdict.reason}`);
+        if (attempts < MAX_REVIEW_ATTEMPTS) {
+          retrying.push(file);
+          continue;
+        }
+        verdict = { kind: "rejected", file, doc: null, parts: [], reasons: [UNCHECKED_REASON[lang]], summary: verdict.reason };
+      }
       const saved = this.#saveVerdict(userId, template, verdict);
       if (saved && verdict.kind === "accepted") accepted.push({ verdict, file: saved });
       verdicts.push(verdict);
       // The owner deleted this chat while it was being reviewed.
       if (!this.folders.exists(userId)) return;
     }
-    if (verdicts.length === 0) return;
+    if (retrying.length > 0 && stopped === null) this.#scheduleReview(userId, REVIEW_RETRY_SECONDS * 1000);
+    if (verdicts.length === 0 && retrying.length === 0) return;
 
-    const left = this.inbox.read(userId).files.length;
+    const left = this.inbox.read(userId).files.length - retrying.length;
     const p = progress(this.folders.status(userId), template);
-    const summary = reviewSummaryText(verdicts, lang, left, stopped) + "\n\n" + progressText(p, lang);
-    // While the owner is answering this client, the summary goes to the owner only.
+    const summary = reviewSummaryText(verdicts, lang, left, stopped, retrying) + "\n\n" + progressText(p, lang);
+    // While the owner is answering this client, the summary waits in the logs (previews) instead.
     const ownerActive = this.#blocked(chat.chatKey) === Outcome.owner_active;
     const sent =
       !ownerActive &&
       (await this.#deliver(api, chat, summary, chat.target.kind === "direct" ? CLIENT_KEYBOARD : undefined));
+    if (!sent && ownerActive) this.#showPreview({ ...this.#previewOf(chat, summary), note: "not sent: the owner is answering" });
     log(
-      `Chat ${chat.chatName} (${userId}): ${verdicts.length} file(s) reviewed, ready ${p.readyPct}%` +
-        `${sent ? "" : " (summary not sent)"}.`,
+      `Chat ${chat.chatName} (${userId}): ${verdicts.length} file(s) reviewed, ${retrying.length} to retry, ` +
+        `ready ${p.readyPct}%${sent ? "" : " (summary not sent)"}.`,
     );
-    await this.#reportReviewToOwner(api, userId, verdicts, accepted, p, sent ? "" : summary);
+    await this.#sendPackageIfComplete(api, userId, template, p, accepted);
   }
 
   /** Files the verdict away. Returns where an accepted file was saved, so it can be sent to the owner. */
@@ -1065,7 +1131,7 @@ export class Assistant {
     try {
       if (verdict.kind === "accepted") {
         const parts = verdict.parts.map((part) => part.key);
-        saved = this.folders.accept(userId, template.id, verdict.doc.key, parts, source, verdict.file.name);
+        saved = this.folders.accept(userId, template.id, verdict.doc.key, parts, source, verdict.file.name, verdict.file.fileId);
         if (verdict.applicant) this.folders.setApplicant(userId, template.id, verdict.applicant);
       } else if (verdict.kind === "rejected") {
         const parts = verdict.parts.map((part) => part.key);
@@ -1085,62 +1151,84 @@ export class Assistant {
    * Tells the owner how the batch went and sends them the files that were accepted in it (the ready documents),
    * then the ones that could not be checked. When the package becomes complete, the owner is told once.
    */
-  async #reportReviewToOwner(
+  /**
+   * The owner hears about a client's documents only once the package is complete: every required document sent
+   * and accepted. Then the whole package goes to them at once. Documents accepted after that (a newer copy) are
+   * passed on as updates. Nothing is sent while the package is still incomplete.
+   */
+  async #sendPackageIfComplete(
     api: Api,
     userId: number,
-    verdicts: FileVerdict[],
-    accepted: { verdict: Extract<FileVerdict, { kind: "accepted" }>; file: string }[],
+    template: Template,
     p: Progress,
-    unsentSummary: string,
+    accepted: { verdict: Extract<FileVerdict, { kind: "accepted" }>; file: string }[],
   ): Promise<void> {
-    const count = (kind: FileVerdict["kind"]): number => verdicts.filter((v) => v.kind === kind).length;
-    const unchecked = verdicts.filter((v): v is Extract<FileVerdict, { kind: "unchecked" }> => v.kind === "unchecked");
+    if (p.total === 0 || p.accepted < p.total) return;
     const who = this.personTitle(userId);
-    let text =
-      `📎 ${who}: ${verdicts.length} ta fayl tekshirildi — ✅ ${count("accepted")}, ` +
-      `❌ ${count("rejected")}${unchecked.length ? `, ⚠️ ${unchecked.length} ta tekshirib bo'lmadi` : ""}. ` +
-      `Tayyor: ${p.readyPct}% (${p.accepted}/${p.total}).` +
-      (accepted.length ? "\nQabul qilingan hujjatlar quyida." : "");
-    if (unsentSummary) text += `\n\nMijozga yuborilmadi (PREVIEW yoki siz javob beryapsiz). Xulosa:\n${truncate(unsentSummary, 3000)}`;
+    const titles = new Map(template.documents.map((doc) => [doc.key, doc.title.uz]));
     try {
-      await api.sendMessage(this.settings.ownerId, text, { reply_markup: folderKeyboard(userId) });
-      for (const { verdict, file } of accepted) {
-        const parts = verdict.doc.parts.length > 1 ? ` (${verdict.parts.map((part) => part.title.uz).join(", ")})` : "";
-        await api.sendDocument(this.settings.ownerId, new InputFile(file, verdict.file.name), {
-          caption: truncate(`✅ ${verdict.doc.title.uz}${parts}\n👤 ${who}`, 1000),
-        });
-      }
-      if (p.total > 0 && p.accepted === p.total && this.folders.markComplete(userId)) {
+      if (this.folders.markComplete(userId)) {
         await api.sendMessage(
           this.settings.ownerId,
-          `🎉 ${who}: barcha ${p.total} ta hujjat tayyor (100%). Hammasi mijoz papkasida — «📎 Qabul qilingan ` +
-            "fayllar» tugmasi bilan qayta olish mumkin.",
+          `🎉 Yangi to'liq paket: ${who}\nBarcha ${p.total} ta hujjat topshirildi va talab darajasida (100%). ` +
+            `Fayllar quyida.\n\n${this.clientProgressText(userId, "uz")}`,
           { reply_markup: folderKeyboard(userId) },
         );
+        const files = this.folders.acceptedFiles(userId, template.documents.map((doc) => doc.key));
+        for (const file of files) {
+          await this.#sendFileToOwner(api, file, `✅ ${titles.get(file.docKey) ?? file.docKey}\n👤 ${who}`);
+        }
+        log(`Chat ${userId}: the package is complete; ${files.length} file(s) sent to the owner.`);
+        return;
       }
-      for (const verdict of unchecked) {
-        const saved = this.#rejectedPath(userId, verdict.file.name);
-        if (!saved) continue;
-        await api.sendDocument(this.settings.ownerId, new InputFile(saved, verdict.file.name), {
-          caption: truncate(`⚠️ Tekshirib bo'lmadi: ${verdict.reason}`, 1000),
-        });
+      for (const { verdict, file } of accepted) {
+        const fileId = verdict.file.fileId;
+        await this.#sendFileToOwner(
+          api,
+          { docKey: verdict.doc.key, file, name: verdict.file.name, ...(fileId ? { fileId } : {}) },
+          `🔄 Yangilangan hujjat: ${verdict.doc.title.uz}\n👤 ${who}`,
+        );
       }
     } catch (err) {
-      logError(`Could not report the review of chat ${userId} to the owner: ${errorMessage(err)}`);
+      logError(`Could not send the package of chat ${userId} to the owner: ${errorMessage(err)}`);
     }
   }
 
-  /** The newest copy of a file in the client's rejected/ folder. */
-  #rejectedPath(userId: number, originalName: string): string | null {
-    const dir = path.join(this.folders.dir(userId), "rejected");
+  /** The owner's 📎 button: the client's status and every accepted file. Returns how many files were sent. */
+  async sendAcceptedFilesToOwner(api: Api, userId: number): Promise<number> {
+    let order: string[] = [];
+    const titles = new Map<string, string>();
     try {
-      const suffix = `_${safeFileName(originalName)}`;
-      const match = fs.readdirSync(dir).filter((name) => name.endsWith(suffix)).sort().at(-1);
-      return match ? path.join(dir, match) : null;
+      const template = loadTemplate(this.settings.templatesDir);
+      order = template.documents.map((doc) => doc.key);
+      for (const doc of template.documents) titles.set(doc.key, doc.title.uz);
     } catch {
-      return null;
+      // Keys are shown instead of titles.
     }
+    const files = this.folders.acceptedFiles(userId, order);
+    if (files.length === 0) return 0;
+    await api.sendMessage(this.settings.ownerId, this.clientProgressText(userId, "uz"));
+    for (const file of files) await this.#sendFileToOwner(api, file, `✅ ${titles.get(file.docKey) ?? file.docKey}`);
+    return files.length;
   }
+
+  /**
+   * Sends a saved file to the owner by its Telegram file_id when known (no re-upload, works for any size),
+   * otherwise uploads the saved copy (Bot API uploads are limited to 50 MB).
+   */
+  async #sendFileToOwner(api: Api, file: AcceptedFile, caption: string): Promise<void> {
+    const options = { caption: truncate(caption, 1000) };
+    if (file.fileId) {
+      try {
+        await api.sendDocument(this.settings.ownerId, file.fileId, options);
+        return;
+      } catch (err) {
+        logError(`Sending ${file.name} by file_id failed (${errorMessage(err)}); uploading the saved copy.`);
+      }
+    }
+    await api.sendDocument(this.settings.ownerId, new InputFile(file.file, file.name), options);
+  }
+
 
   async #connectionProblem(api: Api, connectionId: string): Promise<string> {
     try {
@@ -1427,12 +1515,13 @@ export class Assistant {
       `• Holat: ${state}`,
       "",
       "Siz (admin) uchun:",
-      "• Mijozlarning xabarlari sizga yuborilmaydi. Faqat 🚨 muhim murojaatlar va hujjat tekshiruvi xulosalari keladi.",
-      "• Mijoz fayl yuborsa (bir yo'la 10–50 ta ham bo'lishi mumkin), bot har birini anketa shabloni " +
-        "(templates/) bo'yicha tekshiradi: moslari mijoz papkasiga saqlanadi, mos kelmaganlarini sababi bilan " +
-        "qayta so'raydi va mijozga necha foiz tayyorligini ko'rsatadi. Mijozdan 5 ta hujjat so'raladi (anketa " +
-        "oxiridagi ro'yxat). Qabul qilingan har bir hujjat va tekshirib bo'lmagan fayllar sizga yuboriladi; 5 tasi " +
-        "to'liq bo'lsa, alohida 🎉 xabar keladi.",
+      "• Mijozlarning xabarlari sizga yuborilmaydi. Faqat 🚨 muhim murojaatlar va to'liq hujjat paketlari keladi.",
+      "• Mijozdan anketa oxiridagi 5 ta hujjat so'raladi. Mijoz fayl yuborsa (bir yo'la 10–50 ta ham, 20 MB dan " +
+        "kattasi ham), bot har birini shablon (templates/) bo'yicha tekshiradi: moslari mijoz papkasiga saqlanadi, " +
+        "mos kelmaganlarini sababi bilan qayta so'raydi va mijozga necha foiz tayyorligini ko'rsatadi.",
+      "• Sizga faqat 5 ta hujjatning hammasi topshirilib, hammasi talab darajasida bo'lganda 🎉 xabar va butun " +
+        "paket (barcha fayllar) bir yo'la keladi. Undan oldin hech narsa yuborilmaydi; holatni «users» orqali " +
+        "istalgan vaqtda ko'rishingiz mumkin.",
       "• «users» tugmasi mijozlar ro'yxatini (📊 tayyorlik foizi bilan) ko'rsatadi. Mijozni bossangiz, u bilan " +
         "butun yozishma va hujjatlar holati ochiladi; ostida «📄 chat.txt», «📎 Qabul qilingan fayllar» va " +
         "«🗑 Chatni o'chirish» tugmalari bor.",
@@ -1551,7 +1640,7 @@ async function telegramDownload(api: Api, botToken: string, fileId: string, targ
     const response = await fetch(`https://api.telegram.org/file/bot${botToken}/${file.file_path}`);
     if (!response.ok) throw new Error(`download failed: HTTP ${response.status}`);
     const data = Buffer.from(await response.arrayBuffer());
-    if (data.length > MAX_FILE_BYTES) throw new Error("the file is larger than 20 MB");
+    if (data.length > BOT_API_DOWNLOAD_LIMIT) throw new Error("the file is too big for the Bot API (over 20 MB)");
     await fs.promises.writeFile(target, data, { mode: 0o600, flag: "wx" });
   } catch (err) {
     const message = errorMessage(err);
@@ -1559,29 +1648,41 @@ async function telegramDownload(api: Api, botToken: string, fileId: string, targ
   }
 }
 
+/** How often a file is tried when its check fails for a reason unrelated to the file. */
+export const MAX_REVIEW_ATTEMPTS = 3;
+/** Wait before such a file is tried again. */
+export const REVIEW_RETRY_SECONDS = 300;
+
+/** Told to the client after the last failed attempt; nobody else looks at the file. */
+const UNCHECKED_REASON: Record<Language, string> = {
+  uz: "faylni avtomatik tekshirib bo'lmadi: uni PDF qilib yoki aniqroq skan qilib qayta yuboring",
+  ru: "файл не удалось проверить автоматически: пришлите его в PDF или более чёткий скан",
+  en: "the file could not be checked automatically: please send it as a PDF or a clearer scan",
+};
+
 const REVIEW_WORDS: Record<
   Language,
-  { checked: (n: number) => string; accepted: string; rejected: string; unchecked: string; left: (n: number) => string }
+  { checked: (n: number) => string; accepted: string; rejected: string; retrying: string; left: (n: number) => string }
 > = {
   uz: {
     checked: (n) => `📥 Yuborgan ${n} ta faylingiz shablon bo'yicha tekshirildi.`,
     accepted: "✅ Qabul qilindi:",
     rejected: "❌ Qayta yuboring:",
-    unchecked: "⚠️ Avtomatik tekshirib bo'lmadi, mutaxassisimiz ko'rib chiqadi:",
+    retrying: "⏳ Hozir tekshirib bo'lmadi, bir necha daqiqadan keyin qayta tekshiriladi:",
     left: (n) => `Qolgan ${n} ta fayl birozdan keyin tekshiriladi.`,
   },
   ru: {
     checked: (n) => `📥 Отправленные Вами файлы (${n}) проверены по шаблону.`,
     accepted: "✅ Принято:",
     rejected: "❌ Отправьте заново:",
-    unchecked: "⚠️ Не удалось проверить автоматически, их посмотрит наш специалист:",
+    retrying: "⏳ Сейчас проверить не удалось, повторная проверка через несколько минут:",
     left: (n) => `Остальные файлы (${n}) будут проверены чуть позже.`,
   },
   en: {
     checked: (n) => `📥 The ${n} file(s) you sent have been checked against the template.`,
     accepted: "✅ Accepted:",
     rejected: "❌ Please send again:",
-    unchecked: "⚠️ Could not be checked automatically; our specialist will look at them:",
+    retrying: "⏳ Could not be checked right now; they will be checked again in a few minutes:",
     left: (n) => `The remaining ${n} file(s) will be checked a little later.`,
   },
 };
@@ -1592,12 +1693,12 @@ export function reviewSummaryText(
   language: Language,
   left: number,
   stopped: "limit" | "daily" | null,
+  retrying: readonly InboxFile[] = [],
 ): string {
   const w = REVIEW_WORDS[language];
-  const lines = [w.checked(verdicts.length)];
+  const lines = [w.checked(verdicts.length + retrying.length)];
   const accepted = verdicts.filter((v): v is Extract<FileVerdict, { kind: "accepted" }> => v.kind === "accepted");
   const rejected = verdicts.filter((v): v is Extract<FileVerdict, { kind: "rejected" }> => v.kind === "rejected");
-  const unchecked = verdicts.filter((v) => v.kind === "unchecked");
   // "Charter and register extract (Register extract)" when the file holds only some parts of a document.
   const title = (v: { doc: TemplateDoc | null; parts: TemplatePart[] }): string => {
     if (!v.doc) return "";
@@ -1614,7 +1715,7 @@ export function reviewSummaryText(
       ...rejected.map((v) => `• ${v.doc ? `${title(v)} (${v.file.name})` : v.file.name}: ${v.reasons.join("; ")}`),
     );
   }
-  if (unchecked.length) lines.push("", w.unchecked, ...unchecked.map((v) => `• ${v.file.name}`));
+  if (retrying.length) lines.push("", w.retrying, ...retrying.map((file) => `• ${file.name}`));
   if (left > 0 && stopped) lines.push("", w.left(left));
   return lines.join("\n");
 }
@@ -1643,10 +1744,23 @@ const STATUS_UNAVAILABLE: Record<Language, string> = {
   en: "The document status is not available right now, please try again a little later.",
 };
 
-const TOO_LARGE_REASON: Record<Language, string> = {
-  uz: "fayl 20 MB dan katta, uni Telegram orqali qabul qilib bo'lmaydi. Siqib yoki bo'lib yuboring",
-  ru: "файл больше 20 МБ, через Telegram его принять нельзя. Сожмите его или отправьте частями",
-  en: "the file is larger than 20 MB and cannot be received through Telegram. Please compress or split it",
+const TOO_LARGE_REASON: Record<Language, (mb: number) => string> = {
+  uz: (mb) => `fayl ${mb} MB dan katta. Uni siqib yoki qismlarga bo'lib yuboring`,
+  ru: (mb) => `файл больше ${mb} МБ. Сожмите его или отправьте частями`,
+  en: (mb) => `the file is larger than ${mb} MB. Please compress or split it`,
+};
+
+/** For files over 20 MB while TELEGRAM_API_ID / TELEGRAM_API_HASH are not set. */
+const LARGE_DISABLED_REASON: Record<Language, string> = {
+  uz: "20 MB dan katta fayllarni qabul qilish hali sozlanmagan. Hozircha faylni siqib yoki qismlarga bo'lib yuboring",
+  ru: "приём файлов больше 20 МБ пока не настроен. Пока сожмите файл или отправьте его частями",
+  en: "receiving files over 20 MB is not set up yet. For now, please compress or split the file",
+};
+
+const DOWNLOAD_FAILED_REASON: Record<Language, string> = {
+  uz: "faylni yuklab olib bo'lmadi, uni qayta yuboring",
+  ru: "файл не удалось загрузить, отправьте его ещё раз",
+  en: "the file could not be downloaded, please send it again",
 };
 
 const REVIEW_STARTED: Record<Language, (n: number) => string> = {

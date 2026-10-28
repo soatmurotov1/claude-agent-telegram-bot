@@ -25,6 +25,8 @@ export const ISOLATION_SETTINGS = {
 /** Variables removed from the child environment besides everything starting with ANTHROPIC_. */
 const STRIPPED_ENV = [
   "TELEGRAM_BOT_TOKEN",
+  "TELEGRAM_API_HASH",
+  "TELEGRAM_API_ID",
   "CLAUDE_CODE_OAUTH_TOKEN",
   "CLAUDE_CODE_USE_BEDROCK",
   "CLAUDE_CODE_USE_VERTEX",

@@ -146,11 +146,15 @@ export class Harness {
   readonly previews: Preview[] = [];
   /** Content Telegram "serves" for each file_id. */
   readonly files = new Map<string, Buffer>();
+  /** file_ids downloaded through the large-file (MTProto) path. */
+  readonly largeDownloads: string[] = [];
   readonly settings: Settings;
+  readonly #largeFiles: boolean;
   assistant!: Assistant;
   bot!: Bot;
 
-  constructor(overrides: Record<string, string> = {}) {
+  constructor(overrides: Record<string, string> = {}, { largeFiles = true }: { largeFiles?: boolean } = {}) {
+    this.#largeFiles = largeFiles;
     this.root = fs.mkdtempSync(path.join(os.tmpdir(), "sgk-docs-test-"));
     this.dataDir = path.join(this.root, "data");
     const envFile = path.join(this.root, ".env");
@@ -180,6 +184,14 @@ export class Harness {
         if (!data) throw new Error(`no such file ${fileId}`);
         await fs.promises.writeFile(target, data, { mode: 0o600 });
       },
+      downloadLargeFile: this.#largeFiles
+        ? async (fileId, target) => {
+            const data = this.files.get(fileId);
+            if (!data) throw new Error(`no such file ${fileId}`);
+            this.largeDownloads.push(fileId);
+            await fs.promises.writeFile(target, data, { mode: 0o600 });
+          }
+        : null,
     });
     this.bot = new Bot(this.settings.botToken, {
       botInfo: BOT_INFO,
@@ -299,8 +311,8 @@ export class Harness {
 
 const harnesses: Harness[] = [];
 
-export function makeHarness(overrides: Record<string, string> = {}): Harness {
-  const harness = new Harness(overrides);
+export function makeHarness(overrides: Record<string, string> = {}, opts: { largeFiles?: boolean } = {}): Harness {
+  const harness = new Harness(overrides, opts);
   harnesses.push(harness);
   return harness;
 }

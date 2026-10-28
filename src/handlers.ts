@@ -1,7 +1,6 @@
 import { Composer, type Context, InputFile } from "grammy";
 import type { ReplyKeyboardMarkup } from "grammy/types";
 import type { Settings } from "./config.js";
-import { loadTemplate } from "./templates.js";
 import {
   type Assistant,
   CHAT_TXT_CALLBACK_PREFIX,
@@ -142,22 +141,11 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
     await ctx.answerCallbackQuery();
     if (ctx.from.id !== settings.ownerId) return;
     const userId = Number(ctx.match[1]);
-    const files = assistant.folders.acceptedFiles(userId);
-    if (files.length === 0) {
+    const sent = await assistant.sendAcceptedFilesToOwner(ctx.api, userId);
+    if (sent === 0) {
       await ctx.api.sendMessage(settings.ownerId, "Bu mijozdan hali birorta hujjat qabul qilinmagan.", {
         reply_markup: OWNER_KEYBOARD,
       });
-      return;
-    }
-    await ctx.api.sendMessage(settings.ownerId, assistant.clientProgressText(userId, "uz"));
-    const titles = new Map<string, string>();
-    try {
-      for (const doc of loadTemplate(settings.templatesDir).documents) titles.set(doc.key, doc.title.uz);
-    } catch {
-      // Keys are shown instead of titles.
-    }
-    for (const { docKey, file } of files) {
-      await ctx.api.sendDocument(settings.ownerId, new InputFile(file), { caption: `✅ ${titles.get(docKey) ?? docKey}` });
     }
   });
 

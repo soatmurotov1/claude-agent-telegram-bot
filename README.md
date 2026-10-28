@@ -55,9 +55,10 @@ Common to both:
 | Before an auto-send | Pause/limit/takeover are checked again, and the connection is re-read from Telegram (owner, enabled, reply right) |
 | History retention | Messages and previews older than `HISTORY_TTL_DAYS` (default 30) are deleted |
 | Someone writes to the bot directly | Claude answers from `company.md` (sent only with `AUTO_SEND=true`); the admin gets no copy |
-| A client sends files or photos (also 10-50 at once) | Collected for `REVIEW_BATCH_SECONDS` (15 s) after the last one, then each is checked against the template; one summary goes to the client; the admin gets a short note and every accepted file |
-| A file cannot be checked (bad JSON from Claude, CLI error) | Saved in `rejected/` and sent to the admin with ⚠️ |
-| A file is larger than 20 MB | Not downloaded (Bot API limit); the client is asked to compress or split it |
+| A client sends files or photos (also 10-50 at once) | Collected for `REVIEW_BATCH_SECONDS` (15 s) after the last one, then each is checked against the template; one summary goes to the client. The admin gets nothing until the package is complete |
+| A file cannot be checked (bad JSON from Claude, CLI error) | Kept in the inbox and checked again after `REVIEW_RETRY_SECONDS` (5 min), at most `MAX_REVIEW_ATTEMPTS` (3) times; then the client is asked to send a PDF or a clearer scan |
+| All 5 documents sent and accepted | The admin gets one 🎉 message with the status and the whole package (every accepted file, by `file_id`, so any size); a newer accepted copy later is sent as 🔄 update |
+| A file is larger than 20 MB | Downloaded over MTProto when `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` are set (up to `MAX_FILE_MB`, default and maximum 2000); otherwise the client is asked to compress or split it |
 | Client writes "holat" / "статус" / presses 📊 | Their document status, without Claude |
 | Client writes "anketa" / "анкета" / presses 📄, or Claude adds `[SEND_TEMPLATE]` | The blank questionnaire is sent (Russian for Russian and English speakers) |
 | More than `REVIEW_DAILY_LIMIT` document checks in 24 h | Remaining files wait in the inbox and are retried an hour later |
@@ -108,8 +109,9 @@ taken from the company's express questionnaire «Инвестициялар уч
 | – | `anketa` (optional) | The filled-in questionnaire with the signed NDA; not counted, gives the company name and NA items | – |
 
 A document is ✅ when all its needed parts are accepted, 🟡 when only some are, ❌ when a part was rejected.
-Every file accepted in a batch is sent to the owner right away (with the document and the client in the caption);
-when all 5 are ready the owner gets a 🎉 message once.
+The owner is sent nothing while the package is incomplete. When every required document has been sent and
+accepted, the owner gets a 🎉 message once with the status and all accepted files (sent by Telegram `file_id`, so
+files over 50 MB need no re-upload). The 📎 button in the client's folder sends the accepted files at any time.
 
 How a file is checked (`src/documentReview.ts`):
 
@@ -121,7 +123,7 @@ How a file is checked (`src/documentReview.ts`):
 3. Claude gets the template (each part's acceptance checks), the summaries in [`laws/`](laws/), the company
    from the accepted questionnaire and the file, and answers with JSON: which document and which of its parts the
    file holds, accepted or rejected, reasons in the client's language.
-4. Accepted → `accepted/<key>/` and sent to the owner; rejected → `rejected/` with `reasons.jsonl`. A later wrong
+4. Accepted → `accepted/<key>/`; rejected → `rejected/` with `reasons.jsonl`. A later wrong
    copy never undoes an accepted part. The accepted questionnaire also records the company and the items marked "NA".
 5. Progress = accepted / 5 required documents (minus those whose parts are all NA):
    `Tayyor 60% (3/5) · Xato 20% (1) · Yetishmaydi 20% (1)` and one numbered line per document with ✅ 🟡 ❌ ⬜ ➖,
@@ -170,6 +172,7 @@ Everything is stored in `data/` (on Railway: the volume at `/app/data`), directo
 | `seen.json` | IDs of handled messages (for duplicates) |
 | `state.json` | Pause flag and usage-limit deadline |
 | `users.json` | People who wrote to the bot (name, @username, ID, counts) for the `users` list |
+| `mtproto.session` | The MTProto session (an auth key) for downloading files over 20 MB; keep it private |
 | `clients/<id>/chat.txt` | The whole conversation with this person as plain text |
 | `clients/<id>/accepted/<doc>/` | Files that passed the template check |
 | `clients/<id>/rejected/` | Files that did not, with `reasons.jsonl` |
@@ -198,8 +201,14 @@ personal-data requirements, before you connect the bot.
    AUTO_SEND=false
    ```
    Optional: `COMPANY_NAME`, `CLAUDE_MODEL`, `CLAUDE_EFFORT`, `CLAUDE_TIMEOUT_SECONDS`, `LIMIT_COOLDOWN_MINUTES`,
-   `OWNER_TAKEOVER_MINUTES`, `HISTORY_LIMIT`, `HISTORY_TTL_DAYS`, `REVIEW_DAILY_LIMIT`. `CLAUDE_BIN`, `DATA_DIR`, `PROFILE_PATH`, `TEMPLATES_DIR` and `LAWS_DIR` are
+   `OWNER_TAKEOVER_MINUTES`, `HISTORY_LIMIT`, `HISTORY_TTL_DAYS`, `REVIEW_DAILY_LIMIT`, `MAX_FILE_MB`. `CLAUDE_BIN`, `DATA_DIR`, `PROFILE_PATH`, `TEMPLATES_DIR` and `LAWS_DIR` are
    not needed.
+
+   **Files over 20 MB.** The Bot API gives bots files of at most 20 MB. To accept larger ones, open
+   https://my.telegram.org → *API development tools*, create an app (any name) and add its numbers as
+   `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`. The bot then downloads large files over MTProto with its own
+   token, connecting only for the download. The log says `Files over 20 MB: enabled (MTProto login as @…)`.
+   Keep the api_hash secret like a token. Mind the volume size: accepted files are kept in `data/clients/`.
 6. **Volume (the bot's memory).** Right-click the canvas (or Cmd+K / Ctrl+K) → *Volume* → choose the service →
    mount path exactly `/app/data` → *Deploy*. Everything in the table above is written there and survives
    redeploys. Without a volume, the memory, users, pause and limit state are lost on every deploy; the log then
@@ -268,6 +277,7 @@ src/store.ts       history, duplicates, state, previews (atomic JSON files)
 src/templates.ts   loads templates/<id>/template.json
 src/clientFolder.ts  data/clients/<id>/: chat.txt, accepted/rejected files, status, percentages
 src/documentReview.ts  DOCX/XLSX text, inbox, one-file check with Claude, JSON verdict
+src/largeFiles.ts  files over 20 MB: Bot API file_id decoding and MTProto download (GramJS)
 src/service.ts     Assistant: message flow, review batches, owner commands
 src/handlers.ts    grammY router
 company.md         company profile (fill in)

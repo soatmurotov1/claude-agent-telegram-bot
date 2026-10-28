@@ -20,6 +20,9 @@ export const SETTING_KEYS = [
   "HISTORY_LIMIT",
   "HISTORY_TTL_DAYS",
   "REVIEW_DAILY_LIMIT",
+  "MAX_FILE_MB",
+  "TELEGRAM_API_ID",
+  "TELEGRAM_API_HASH",
   "DATA_DIR",
   "PROFILE_PATH",
   "TEMPLATES_DIR",
@@ -61,6 +64,11 @@ export interface Settings {
   readonly historyTtlDays: number;
   /** Claude calls for document checks allowed per 24 hours across all clients. */
   readonly reviewDailyLimit: number;
+  /** Largest file a client may send, in MB. Above 20 MB needs telegramApiId and telegramApiHash. */
+  readonly maxFileMb: number;
+  /** my.telegram.org app credentials for downloading files over 20 MB (0 and "" when not set). */
+  readonly telegramApiId: number;
+  readonly telegramApiHash: string;
   readonly dataDir: string;
   readonly profilePath: string;
   readonly templatesDir: string;
@@ -178,6 +186,18 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
     return n;
   };
 
+  const apiIdValue = get("TELEGRAM_API_ID");
+  const telegramApiHash = get("TELEGRAM_API_HASH");
+  if (apiIdValue && !/^\d+$/.test(apiIdValue)) {
+    throw new ConfigError(`TELEGRAM_API_ID must be the numeric api_id from my.telegram.org (check ${where}).`);
+  }
+  if (telegramApiHash && !/^[0-9a-f]{32}$/i.test(telegramApiHash)) {
+    throw new ConfigError(`TELEGRAM_API_HASH must be the 32-character api_hash from my.telegram.org (check ${where}).`);
+  }
+  if (Boolean(apiIdValue) !== Boolean(telegramApiHash)) {
+    throw new ConfigError(`Set both TELEGRAM_API_ID and TELEGRAM_API_HASH, or neither (check ${where}).`);
+  }
+
   const claudeBinValue = get("CLAUDE_BIN");
   const claudeBin = claudeBinValue
     ? claudeBinValue.includes("/") || claudeBinValue.includes("\\")
@@ -198,6 +218,8 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
     historyLimit: int("HISTORY_LIMIT", 50, 1),
     historyTtlDays: int("HISTORY_TTL_DAYS", 30, 1),
     reviewDailyLimit: int("REVIEW_DAILY_LIMIT", 100, 1),
+    maxFileMb: Math.min(int("MAX_FILE_MB", 2000, 1), 2000),
+    telegramApiId: apiIdValue ? Number(apiIdValue) : 0,
     dataDir: path.resolve(baseDir, get("DATA_DIR") || "data"),
     profilePath: path.resolve(baseDir, get("PROFILE_PATH") || "company.md"),
     templatesDir: path.resolve(baseDir, get("TEMPLATES_DIR") || "templates"),
@@ -216,6 +238,7 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
     ...values,
     botToken: botToken ? "[hidden]" : "",
     claudeOauthToken: claudeOauthToken ? "[hidden]" : "",
+    telegramApiHash: telegramApiHash ? "[hidden]" : "",
     claudeAuthMode: authMode(),
   });
 
@@ -223,6 +246,7 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
   // Secrets are non-enumerable so they never end up in logs, JSON or inspect output.
   Object.defineProperty(settings, "botToken", { value: botToken, enumerable: false });
   Object.defineProperty(settings, "claudeOauthToken", { value: claudeOauthToken, enumerable: false });
+  Object.defineProperty(settings, "telegramApiHash", { value: telegramApiHash, enumerable: false });
   Object.defineProperty(settings, "claudeAuthMode", { get: authMode, enumerable: true });
   Object.defineProperty(settings, "toJSON", { value: publicView, enumerable: false });
   Object.defineProperty(settings, util.inspect.custom, { value: publicView, enumerable: false });

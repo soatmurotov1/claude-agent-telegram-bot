@@ -101,9 +101,9 @@ Obyektni investitsiyaga tayyorlash "Investitsiyalar uchun obyekt tayyorgarligini
 Murojaat va hujjat topshirish tartibi
 Mijoz shu chatda, telefon, email yoki Telegram (@sanoatgeokontex_xizmat) orqali bog'lanadi va qaysi xizmat kerakligini, obyekt qayerdaligini va kompaniya nomini yozadi.
 Bot mijozga ekspress-anketani (o'zbek yoki rus tilida, NDA bilan) yuboradi.
-Mijoz anketa oxirida ko'rsatilgan 5 ta hujjatni shu chatga fayl qilib yuboradi (bir yo'la yuborish mumkin; bir hujjatning ikki qismi — masalan ustav va YeGRPO — bitta faylda ham, alohida fayllarda ham bo'lishi mumkin). To'ldirilgan va imzolangan anketani ham yuborsa yaxshi, lekin u 5 ta hujjatga kirmaydi.
+Mijoz anketa oxirida ko'rsatilgan 5 ta hujjatni shu chatga fayl qilib yuboradi (bir yo'la yuborish mumkin, 20 MB dan katta fayllar ham qabul qilinadi; bir hujjatning ikki qismi — masalan ustav va YeGRPO — bitta faylda ham, alohida fayllarda ham bo'lishi mumkin). To'ldirilgan va imzolangan anketani ham yuborsa yaxshi, lekin u 5 ta hujjatga kirmaydi.
 Bot har bir faylni shablon bo'yicha tekshiradi: mos kelganini qabul qiladi, mos kelmaganini sababi bilan qayta so'raydi va paket necha foiz tayyorligini ko'rsatadi. Mijoz istalgan vaqtda "holat" deb yozib, hujjatlar holatini ko'rishi mumkin.
-Qabul qilingan har bir hujjat darhol kompaniya mutaxassisiga yuboriladi. 5 ta hujjat to'plangach, mutaxassislar obyektni tahlil qiladi; ish hajmi, narx va muddat kelishilgach shartnoma tuziladi.
+5 ta hujjatning hammasi topshirilib, hammasi talab darajasida bo'lgach, butun paket kompaniya mutaxassisiga yuboriladi va mutaxassislar obyektni tahlil qiladi; ish hajmi, narx va muddat kelishilgach shartnoma tuziladi.
 Fayl, rasm va hujjat yuborilganda
 Bot mijoz yuborgan fayl va rasmlarni (PDF, DOCX, XLSX, JPG/PNG) o'zi shablon bo'yicha tekshiradi va natijani shu chatda yozadi: qaysi hujjat qabul qilindi, qaysi biri nima sababdan qayta kerak, paket necha foiz tayyor.
 Bot hujjat mazmuni bo'yicha huquqiy xulosa bermaydi: faqat hujjat ro'yxatdagi hujjatmi, to'ldirilganmi, imzolanganmi, muddati o'tmaganmi — shuni tekshiradi.

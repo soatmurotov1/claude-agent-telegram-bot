@@ -2,9 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 import JSZip from "jszip";
 import { afterEach, describe, expect, it } from "vitest";
-import { ClaudeLimitError } from "../src/claudeCli.js";
+import { ClaudeError, ClaudeLimitError } from "../src/claudeCli.js";
 import { type ClientStatus, progress, progressText, safeFileName } from "../src/clientFolder.js";
 import { docxText, fileKind, parseReview, xlsxText } from "../src/documentReview.js";
+import { decodeFileId, encodeFileId, FileIdError } from "../src/largeFiles.js";
 import { splitTemplate } from "../src/prompts.js";
 import { quickRequest } from "../src/service.js";
 import { blankFor, loadTemplate } from "../src/templates.js";
@@ -72,10 +73,10 @@ describe("progress", () => {
   it("counts the 5 documents: ready, wrong, partly sent and missing", () => {
     const p = progress(
       status({
-        ustav_egrpo: { files: ["a"], parts: { ustav: part("accepted"), egrpo: part("accepted") } },
-        ruxsatnoma_kelishuv: { files: ["b"], parts: { ruxsatnoma: part("accepted"), kelishuv: part("rejected", ["imzo yo'q"]) } },
-        loyiha_5gr: { files: ["c"], parts: { loyiha: part("accepted") } },
-        anketa: { files: ["d"], parts: { anketa: part("accepted") } },
+        ustav_egrpo: { files: ["a"], fileIds: {}, parts: { ustav: part("accepted"), egrpo: part("accepted") } },
+        ruxsatnoma_kelishuv: { files: ["b"], fileIds: {}, parts: { ruxsatnoma: part("accepted"), kelishuv: part("rejected", ["imzo yo'q"]) } },
+        loyiha_5gr: { files: ["c"], fileIds: {}, parts: { loyiha: part("accepted") } },
+        anketa: { files: ["d"], fileIds: {}, parts: { anketa: part("accepted") } },
       }),
       template,
     );
@@ -91,7 +92,7 @@ describe("progress", () => {
 
   it("does not need parts of items marked NA", () => {
     const p = progress(
-      status({ ustav_egrpo: { files: ["a"], parts: { ustav: part("accepted") } } }, [2, 7, 8, 9]),
+      status({ ustav_egrpo: { files: ["a"], fileIds: {}, parts: { ustav: part("accepted") } } }, [2, 7, 8, 9]),
       template,
     );
     // Item 2 drops the register extract from document 1; items 7, 8 and 9 drop documents 4 and 5.
@@ -189,8 +190,34 @@ describe("review answer", () => {
   });
 });
 
+describe("Bot API file_id", () => {
+  const location = {
+    fileType: 5,
+    dcId: 2,
+    id: 5432109876543210123n,
+    accessHash: -1234567890123456789n,
+    fileReference: Buffer.from("01000000ff00000000aabbccddeeff00112233445566778899", "hex"),
+  };
+
+  it("decodes what it encodes, file reference included", () => {
+    const id = encodeFileId(location);
+    expect(decodeFileId(id)).toEqual(location);
+    expect(decodeFileId(encodeFileId({ ...location, fileReference: Buffer.alloc(0) })).id).toBe(location.id);
+  });
+
+  it("has the layout of real document ids (type 5 with a file reference, then the DC)", () => {
+    // Real Bot API document ids start with "BQAC": type 0x02000005, then dc_id.
+    expect(encodeFileId(location).startsWith("BQAC")).toBe(true);
+  });
+
+  it("refuses photo ids, which never need the large-file path", () => {
+    expect(() => decodeFileId(encodeFileId({ ...location, fileType: 2 }))).toThrow(FileIdError);
+    expect(() => decodeFileId("AAAA")).toThrow(FileIdError);
+  });
+});
+
 describe("document batches", () => {
-  it("checks the 5 files, sends the ready ones to the admin and says when all are ready", async () => {
+  it("sends the admin the whole package only once all 5 documents are accepted", async () => {
     const h = makeHarness();
     h.generator.fallback = answerByName({
       "1-ustav-egrpo.pdf": verdict("ustav_egrpo", true),
@@ -199,49 +226,49 @@ describe("document batches", () => {
       "4-eko.pdf": verdict("ekologik_paket", true),
       "5-epb-yer.pdf": verdict("epb_yer", true),
     });
-    for (const name of ["1-ustav-egrpo.pdf", "2-litsenziya.pdf", "3-loyiha.pdf", "4-eko.pdf", "5-epb-yer.pdf"]) {
+    // Four documents first: the admin hears nothing yet.
+    for (const name of ["1-ustav-egrpo.pdf", "2-litsenziya.pdf", "3-loyiha.pdf", "4-eko.pdf"]) {
       await h.send(h.directMessage(null, { file: pdf(name) }));
     }
+    await h.flush();
+    expect(String(h.api.sentTo(CLIENT_ID).at(-1)?.payload.text)).toContain("Tayyor: 80% (4/5)");
+    expect(h.api.calls.filter((c) => Number(c.payload.chat_id) === OWNER_ID)).toHaveLength(0);
+    h.api.clear();
+    h.generator.calls.length = 0;
+
+    await h.send(h.directMessage(null, { file: pdf("5-epb-yer.pdf") }));
     expect(h.assistant.outcomes.filter((o) => o === "review_queued")).toHaveLength(5);
     expect(h.generator.calls).toHaveLength(0);
     await h.flush();
 
-    // Each file was opened by Claude in a folder holding only that file, which is removed afterwards.
-    expect(h.generator.calls).toHaveLength(5);
-    for (const call of h.generator.calls) {
-      expect(call.files).toEqual(["document.pdf"]);
-      expect(fs.existsSync(call.dir ?? "")).toBe(false);
-    }
-    expect(h.generator.calls[0]?.system).toContain('part "egrpo"');
-    expect(h.generator.calls[0]?.system).toContain("ZRU-987");
+    // The file was opened by Claude in a folder holding only that file, which is removed afterwards.
+    expect(h.generator.calls).toHaveLength(1);
+    const call = h.generator.calls[0];
+    expect(call?.files).toEqual(["document.pdf"]);
+    expect(fs.existsSync(call?.dir ?? "")).toBe(false);
+    expect(call?.system).toContain('part "egrpo"');
+    expect(call?.system).toContain("ZRU-987");
 
     const summary = String(h.api.sentTo(CLIENT_ID).at(-1)?.payload.text);
-    expect(summary).toContain("5 ta faylingiz");
     expect(summary).toContain("Tayyor: 100% (5/5)");
     expect(summary).toContain("Barcha hujjatlar qabul qilindi va mutaxassisimizga yuborildi.");
 
-    // The admin gets the note, the 5 ready files, then the completion message.
+    // Now the admin gets one message and the 5 files, sent by their Telegram file_id (no re-upload, any size).
     const toOwner = h.api.calls.filter((c) => Number(c.payload.chat_id) === OWNER_ID);
-    expect(toOwner.map((c) => c.method)).toEqual([
-      "sendMessage",
-      "sendDocument",
-      "sendDocument",
-      "sendDocument",
-      "sendDocument",
-      "sendDocument",
-      "sendMessage",
-    ]);
-    expect(String(toOwner[0]?.payload.text)).toContain("5 ta fayl tekshirildi — ✅ 5, ❌ 0. Tayyor: 100% (5/5).");
-    expect(String(toOwner[1]?.payload.caption)).toBe("✅ Korxona ustavi va YeGRPO dan ko'chirma (Korxona ustavi, YeGRPO dan ko'chirma)\n👤 Aziz @user2000");
-    expect(String(toOwner[6]?.payload.text)).toContain("🎉 Aziz @user2000: barcha 5 ta hujjat tayyor (100%)");
+    expect(toOwner.map((c) => c.method)).toEqual(["sendMessage", ...new Array(5).fill("sendDocument")]);
+    expect(String(toOwner[0]?.payload.text)).toContain("🎉 Yangi to'liq paket: Aziz @user2000");
+    expect(String(toOwner[0]?.payload.text)).toContain("Barcha 5 ta hujjat topshirildi va talab darajasida (100%)");
+    expect(String(toOwner[1]?.payload.caption)).toBe("✅ Korxona ustavi va YeGRPO dan ko'chirma\n👤 Aziz @user2000");
+    for (const doc of toOwner.slice(1)) expect(doc.payload.document).toMatch(/^file-\d+$/);
 
-    // The completion message is sent only once.
+    // The package is announced once; a newer accepted copy later is passed on as an update.
     h.api.clear();
-    h.generator.push(verdict("anketa", true));
-    await h.send(h.directMessage(null, { file: { name: "anketa.docx", data: await filledQuestionnaire() } }));
+    h.generator.push(verdict("ekologik_paket", true));
+    await h.send(h.directMessage(null, { file: pdf("eko-yangi.pdf") }));
     await h.flush();
-    expect(h.api.sentTo(OWNER_ID).some((c) => String(c.payload.text).includes("🎉"))).toBe(false);
-    expect(h.api.sentTo(OWNER_ID, "sendDocument")).toHaveLength(1);
+    const later = h.api.calls.filter((c) => Number(c.payload.chat_id) === OWNER_ID);
+    expect(later.map((c) => c.method)).toEqual(["sendDocument"]);
+    expect(String(later[0]?.payload.caption)).toContain("🔄 Yangilangan hujjat: Ekologik paket");
   });
 
   it("reviews many files as one batch and saves them by result", async () => {
@@ -281,7 +308,7 @@ describe("document batches", () => {
     expect(summary).toContain("Korxona ustavi va YeGRPO dan ko'chirma (YeGRPO dan ko'chirma) (egrpo.pdf): ko'chirma 3 oydan eski");
     expect(summary).toContain("pasport.jpg: bu hujjat talab qilinadigan hujjatlar ro'yxatida yo'q");
     expect(summary).toContain("old.doc: bu formatdagi faylni tekshirib bo'lmaydi");
-    expect(summary).toMatch(/⚠️[^\n]*\n• yer\.pdf/);
+    expect(summary).toMatch(/⏳[^\n]*qayta tekshiriladi:\n• yer\.pdf/);
     expect(summary).toContain("Tayyor: 40% (2/5) · Xato: 20% (1) · Yetishmaydi: 40% (2)");
     expect(summary).toContain("🟡 3. Loyiha hujjatlari");
     expect(summary).toContain("🟡 5. Sanoat xavfsizligi ekspertizasi (EPB) dalolatnomalari va yer ajratmasi to'g'risidagi qarorlar — yetishmaydi: Yer ajratmasi to'g'risidagi qaror");
@@ -292,32 +319,54 @@ describe("document batches", () => {
     );
     expect(fs.readdirSync(path.join(dir, "accepted", "loyiha_5gr"))).toHaveLength(2);
     const rejected = fs.readdirSync(path.join(dir, "rejected"));
-    expect(rejected.filter((f) => f !== "reasons.jsonl")).toHaveLength(4);
+    expect(rejected.filter((f) => f !== "reasons.jsonl")).toHaveLength(3);
     expect(fs.readFileSync(path.join(dir, "rejected", "reasons.jsonl"), "utf8")).toContain("3 oydan eski");
     expect(JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8")).applicant.company).toBe("Oltin Kon MChJ");
-    expect(fs.readdirSync(path.join(dir, "inbox")).filter((f) => f !== "inbox.json")).toHaveLength(0);
+    // yer.pdf waits in the inbox for another attempt.
+    expect(h.assistant.inbox.read(CLIENT_ID).files.map((f) => [f.name, f.attempts])).toEqual([["yer.pdf", 1]]);
 
-    // The admin: the note, the 8 accepted files, then the file that could not be checked.
-    const note = h.api.sentTo(OWNER_ID).map((c) => String(c.payload.text)).find((t) => t.includes("ta fayl tekshirildi"));
-    expect(note).toContain("12 ta fayl tekshirildi — ✅ 8, ❌ 3, ⚠️ 1 ta tekshirib bo'lmadi. Tayyor: 40% (2/5).");
-    const docs = h.api.sentTo(OWNER_ID, "sendDocument").map((c) => String(c.payload.caption));
-    expect(docs).toHaveLength(9);
-    expect(docs.filter((c) => c.startsWith("✅"))).toHaveLength(8);
-    expect(docs.at(-1)).toContain("Tekshirib bo'lmadi");
+    // The package is not complete, so the admin is sent nothing at all.
+    expect(h.api.calls.filter((c) => Number(c.payload.chat_id) === OWNER_ID)).toHaveLength(0);
 
-    // The register extract sent again on its own completes document 1.
+    // Next round: yer.pdf is checked again, and the register extract sent again on its own completes document 1.
     h.api.clear();
-    h.generator.fallback = answerByName({ "egrpo-yangi.pdf": verdict("ustav_egrpo", true, { parts: ["egrpo"] }) });
+    h.generator.fallback = answerByName({
+      "yer.pdf": verdict("epb_yer", true, { parts: ["yer"] }),
+      "egrpo-yangi.pdf": verdict("ustav_egrpo", true, { parts: ["egrpo"] }),
+    });
     await h.send(h.directMessage(null, { file: pdf("egrpo-yangi.pdf") }));
     await h.flush();
-    expect(String(h.api.sentTo(CLIENT_ID).at(-1)?.payload.text)).toContain("✅ 1. Korxona ustavi va YeGRPO dan ko'chirma");
+    const second = String(h.api.sentTo(CLIENT_ID).at(-1)?.payload.text);
+    expect(second).toContain("✅ 1. Korxona ustavi va YeGRPO dan ko'chirma");
+    expect(second).toContain("✅ 5. Sanoat xavfsizligi");
+    expect(second).toContain("Tayyor: 80% (4/5)");
+    expect(h.api.calls.filter((c) => Number(c.payload.chat_id) === OWNER_ID)).toHaveLength(0);
 
     // The status request shows the same figures without calling Claude.
     h.api.clear();
     const calls = h.generator.calls.length;
     await h.send(h.directMessage("holat"));
     expect(h.generator.calls).toHaveLength(calls);
-    expect(String(h.api.sentTo(CLIENT_ID)[0]?.payload.text)).toContain("Tayyor: 60% (3/5)");
+    expect(String(h.api.sentTo(CLIENT_ID)[0]?.payload.text)).toContain("Tayyor: 80% (4/5)");
+  });
+
+  it("tries a file again when its check fails, and asks the client for another copy after the last attempt", async () => {
+    const h = makeHarness();
+    h.generator.fallback = () => {
+      throw new ClaudeError("Claude did not answer within 120 s");
+    };
+    await h.send(h.directMessage(null, { file: pdf("skan.pdf") }));
+    await h.flush();
+    expect(String(h.api.sentTo(CLIENT_ID).at(-1)?.payload.text)).toContain("⏳");
+    expect(h.assistant.inbox.read(CLIENT_ID).files[0]?.attempts).toBe(1);
+    await h.flush();
+    expect(h.assistant.inbox.read(CLIENT_ID).files[0]?.attempts).toBe(2);
+    await h.flush();
+    expect(h.generator.calls).toHaveLength(3);
+    expect(h.assistant.inbox.read(CLIENT_ID).files).toHaveLength(0);
+    const last = String(h.api.sentTo(CLIENT_ID).at(-1)?.payload.text);
+    expect(last).toContain("skan.pdf: faylni avtomatik tekshirib bo'lmadi: uni PDF qilib yoki aniqroq skan qilib qayta yuboring");
+    expect(h.api.calls.filter((c) => Number(c.payload.chat_id) === OWNER_ID)).toHaveLength(0);
   });
 
   it("keeps an accepted part when a wrong copy comes later", async () => {
@@ -330,7 +379,7 @@ describe("document batches", () => {
     expect(h.assistant.clientProgressText(CLIENT_ID, "uz")).toContain("✅ 1. Korxona ustavi va YeGRPO dan ko'chirma");
   });
 
-  it("does not send summaries to the client in preview mode but saves the files and sends them to the admin", async () => {
+  it("does not send summaries to the client in preview mode but still saves the files", async () => {
     const h = makeHarness({ AUTO_SEND: "false" });
     h.generator.push(verdict("ekologik_paket", true));
     await h.send(h.directMessage(null, { file: pdf("eko.pdf") }));
@@ -338,18 +387,38 @@ describe("document batches", () => {
     expect(h.api.sentTo(CLIENT_ID)).toHaveLength(0);
     expect(h.previews.at(-1)?.reply).toContain("Ekologik paket (ZVOS/ZEP, PDV, limitlar) — eko.pdf");
     expect(fs.readdirSync(path.join(h.clientDir(), "accepted", "ekologik_paket"))).toHaveLength(1);
-    expect(String(h.api.sentTo(OWNER_ID)[0]?.payload.text)).toContain("Mijozga yuborilmadi");
-    expect(h.api.sentTo(OWNER_ID, "sendDocument")).toHaveLength(1);
+    expect(h.api.calls.filter((c) => Number(c.payload.chat_id) === OWNER_ID)).toHaveLength(0);
   });
 
-  it("rejects formats it cannot read and files over 20 MB without calling Claude", async () => {
+  it("accepts files over 20 MB through the large-file download", async () => {
     const h = makeHarness();
-    await h.send(h.directMessage(null, { file: { name: "eski.doc", data: Buffer.from("x") } }));
-    await h.send(h.directMessage(null, { file: { name: "katta.pdf", data: Buffer.from("x"), size: 25 * 1024 * 1024 } }));
+    h.generator.push(verdict("loyiha_5gr", true));
+    await h.send(h.directMessage(null, { file: { name: "TIA-katta.pdf", data: Buffer.from("%PDF big"), size: 85 * 1024 * 1024 } }));
+    await h.send(h.directMessage(null, { file: { name: "kichik.pdf", data: Buffer.from("%PDF small") } }));
     await h.flush();
-    expect(h.generator.calls).toHaveLength(0);
-    const texts = h.api.sentTo(CLIENT_ID).map((c) => String(c.payload.text));
-    expect(texts.some((t) => t.includes("katta.pdf") && t.includes("20 MB"))).toBe(true);
+    expect(h.largeDownloads).toHaveLength(1);
+    expect(h.generator.calls).toHaveLength(2);
+    expect(String(h.api.sentTo(CLIENT_ID).at(-1)?.payload.text)).toContain("TIA-katta.pdf");
+    expect(fs.readdirSync(path.join(h.clientDir(), "accepted", "loyiha_5gr"))).toHaveLength(1);
+  });
+
+  it("refuses large files when the large-file download is not set up, and files over MAX_FILE_MB", async () => {
+    const off = makeHarness({}, { largeFiles: false });
+    await off.send(off.directMessage(null, { file: { name: "katta.pdf", data: Buffer.from("x"), size: 25 * 1024 * 1024 } }));
+    await off.flush();
+    expect(off.generator.calls).toHaveLength(0);
+    expect(String(off.api.sentTo(CLIENT_ID).at(-1)?.payload.text)).toContain(
+      "katta.pdf: 20 MB dan katta fayllarni qabul qilish hali sozlanmagan",
+    );
+
+    const capped = makeHarness({ MAX_FILE_MB: "30" });
+    await capped.send(capped.directMessage(null, { file: { name: "juda-katta.pdf", data: Buffer.from("x"), size: 40 * 1024 * 1024 } }));
+    await capped.send(capped.directMessage(null, { file: { name: "eski.doc", data: Buffer.from("x") } }));
+    await capped.flush();
+    expect(capped.generator.calls).toHaveLength(0);
+    expect(capped.largeDownloads).toHaveLength(0);
+    const texts = capped.api.sentTo(CLIENT_ID).map((c) => String(c.payload.text));
+    expect(texts.some((t) => t.includes("juda-katta.pdf: fayl 30 MB dan katta"))).toBe(true);
     expect(texts.some((t) => t.includes("eski.doc") && t.includes("PDF, DOCX, XLSX"))).toBe(true);
   });
 

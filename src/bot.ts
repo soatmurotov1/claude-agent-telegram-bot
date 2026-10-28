@@ -272,6 +272,19 @@ async function runBot(settings: Settings): Promise<number> {
   } catch (err) {
     logError(`WARNING: ${errorMessage(err)}. Files that clients send cannot be checked.`);
   }
+  if (assistant.mtproto) {
+    // Checked in the background so a slow or failing MTProto login never delays the bot itself.
+    void assistant.mtproto.check().then(
+      (who) => log(`Files over 20 MB: enabled (MTProto login as ${who}), up to ${settings.maxFileMb} MB.`),
+      (err: unknown) =>
+        logError(
+          `WARNING: files over 20 MB cannot be downloaded: MTProto login failed (${errorMessage(err)}). ` +
+            "Check TELEGRAM_API_ID and TELEGRAM_API_HASH.",
+        ),
+    );
+  } else {
+    log("Files over 20 MB: off (set TELEGRAM_API_ID and TELEGRAM_API_HASH from my.telegram.org to accept them).");
+  }
   const waiting = assistant.inbox.pending();
   if (waiting.length > 0) log(`Resuming the review of files from ${waiting.length} client(s).`);
   assistant.resumePendingReviews(bot.api);

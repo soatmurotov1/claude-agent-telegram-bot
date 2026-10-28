@@ -8,8 +8,6 @@ import { buildReviewSystemPrompt, buildReviewUserPrompt } from "./prompts.js";
 import { ensurePrivateDir, isRecord, JsonFile } from "./store.js";
 import type { Template, TemplateDoc, TemplatePart } from "./templates.js";
 
-/** Telegram bots can download files of at most 20 MB. */
-export const MAX_FILE_BYTES = 20 * 1024 * 1024;
 /** Extracted text sent to Claude is cut at this many characters. */
 const MAX_TEXT_CHARS = 60_000;
 /** Laws summaries added to the review prompt are cut at this many characters. */
@@ -266,6 +264,10 @@ export interface InboxFile {
   name: string;
   messageId: number;
   ts: number;
+  /** Telegram file_id, so the file can be passed on without uploading it again (any size). */
+  fileId?: string;
+  /** Checks that failed for reasons unrelated to the file (CLI error, unreadable answer). */
+  attempts: number;
 }
 
 interface InboxData {
@@ -293,11 +295,18 @@ function toChat(value: unknown): ReviewChat | null {
 function toInbox(value: unknown): InboxData | null {
   if (!isRecord(value)) return null;
   const files = Array.isArray(value.files)
-    ? value.files.flatMap((f): InboxFile[] =>
-        isRecord(f) && typeof f.stored === "string" && typeof f.name === "string"
-          ? [{ stored: f.stored, name: f.name, messageId: typeof f.messageId === "number" ? f.messageId : 0, ts: typeof f.ts === "number" ? f.ts : 0 }]
-          : [],
-      )
+    ? value.files.flatMap((f): InboxFile[] => {
+        if (!isRecord(f) || typeof f.stored !== "string" || typeof f.name !== "string") return [];
+        const entry: InboxFile = {
+          stored: f.stored,
+          name: f.name,
+          messageId: typeof f.messageId === "number" ? f.messageId : 0,
+          ts: typeof f.ts === "number" ? f.ts : 0,
+          attempts: typeof f.attempts === "number" ? f.attempts : 0,
+        };
+        if (typeof f.fileId === "string") entry.fileId = f.fileId;
+        return [entry];
+      })
     : [];
   return { chat: toChat(value.chat), files };
 }
@@ -327,7 +336,7 @@ export class Inbox {
   }
 
   /** Moves a downloaded file into the inbox and remembers where to answer. */
-  add(chat: ReviewChat, source: string, name: string, messageId: number, ts: number): InboxFile {
+  add(chat: ReviewChat, source: string, name: string, messageId: number, ts: number, fileId?: string): InboxFile {
     ensurePrivateDir(this.folders.root);
     ensurePrivateDir(this.folders.dir(chat.chatId));
     const dir = this.dir(chat.chatId);
@@ -335,7 +344,7 @@ export class Inbox {
     const ext = path.extname(name).toLowerCase().replace(/[^.a-z0-9]/g, "").slice(0, 10);
     const stored = `${crypto.randomBytes(8).toString("hex")}${ext}`;
     fs.renameSync(source, path.join(dir, stored));
-    const entry: InboxFile = { stored, name, messageId, ts };
+    const entry: InboxFile = { stored, name, messageId, ts, attempts: 0, ...(fileId ? { fileId } : {}) };
     const data = this.read(chat.chatId);
     data.chat = chat;
     data.files.push(entry);
@@ -353,6 +362,16 @@ export class Inbox {
     const data = this.read(userId);
     data.files = data.files.filter((f) => f.stored !== file.stored);
     this.#file(userId).write(data);
+  }
+
+  /** Keeps a file whose check failed for another reason for a later attempt. Returns the attempts so far. */
+  retryLater(userId: number, file: InboxFile): number {
+    const data = this.read(userId);
+    const entry = data.files.find((f) => f.stored === file.stored);
+    if (!entry) return file.attempts + 1;
+    entry.attempts += 1;
+    this.#file(userId).write(data);
+    return entry.attempts;
   }
 
   /** Clients (user IDs) with files still waiting. */
