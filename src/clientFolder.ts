@@ -28,7 +28,23 @@ export interface AcceptedFile {
   file: string;
   /** The name the client gave it. */
   name: string;
+  /** The saved name (time stamp + name); the same for every document one file was accepted for. */
+  saved: string;
   fileId?: string;
+}
+
+/** One file of the package for the owner, with every document it was accepted for (one file may hold several). */
+export interface PackageFile {
+  docKeys: string[];
+  file: string;
+  name: string;
+  fileId?: string;
+}
+
+/** The documents (and their parts) one file was found to contain. */
+export interface DocParts {
+  docKey: string;
+  partKeys: readonly string[];
 }
 
 /** What the accepted questionnaire said about the client, used to check the other documents. */
@@ -45,6 +61,11 @@ export interface ClientStatus {
   docs: Record<string, DocRecord>;
   /** When every required document was first accepted (the owner is told once), or null. */
   completedAt: number | null;
+  /**
+   * The required document keys the package was complete for. When the template's list changes (for example from
+   * 5 to 16 documents), an earlier completion no longer counts and the owner is told again once the new list is done.
+   */
+  completedFor: string;
 }
 
 export interface ProgressItem {
@@ -106,7 +127,18 @@ function toStatus(value: unknown): ClientStatus | null {
     applicant,
     docs,
     completedAt: typeof value.completedAt === "number" ? value.completedAt : null,
+    completedFor: typeof value.completedFor === "string" ? value.completedFor : "",
   };
+}
+
+/** Hard-links a saved file (no extra disk space for a file that holds several documents), or copies it. */
+function linkOrCopy(source: string, target: string): void {
+  try {
+    fs.linkSync(source, target);
+  } catch {
+    fs.copyFileSync(source, target);
+    fs.chmodSync(target, 0o600);
+  }
 }
 
 /** A file name that is safe on every file system, keeping letters of any script. */
@@ -201,7 +233,7 @@ export class ClientFolders {
   #statusFile(userId: number): JsonFile<ClientStatus> {
     return new JsonFile<ClientStatus>(
       path.join(this.dir(userId), "status.json"),
-      () => ({ template: "", applicant: null, docs: {}, completedAt: null }),
+      () => ({ template: "", applicant: null, docs: {}, completedAt: null, completedFor: "" }),
       toStatus,
     );
   }
@@ -227,54 +259,68 @@ export class ClientFolders {
   }
 
   /**
-   * Copies an accepted file to accepted/<docKey>/ and marks the parts it contains accepted. Returns the saved path.
+   * Saves an accepted file under accepted/<docKey>/ for every document it holds (one copy, hard-linked into the
+   * other folders) and marks those parts accepted. Returns the saved path (in the first document's folder).
    */
   accept(
     userId: number,
     templateId: string,
-    docKey: string,
-    partKeys: readonly string[],
+    docs: readonly DocParts[],
     source: string,
     originalName: string,
     fileId?: string,
   ): string {
-    const dir = this.#ensure(userId, "accepted", docKey);
+    if (docs.length === 0) throw new Error("accept() needs at least one document");
     const name = `${stamp(this.clock())}_${safeFileName(originalName)}`;
-    const target = path.join(dir, name);
-    fs.copyFileSync(source, target);
-    fs.chmodSync(target, 0o600);
+    let first: string | null = null;
+    for (const { docKey } of docs) {
+      const target = path.join(this.#ensure(userId, "accepted", docKey), name);
+      if (first === null) {
+        fs.copyFileSync(source, target);
+        fs.chmodSync(target, 0o600);
+        first = target;
+      } else if (!fs.existsSync(target)) {
+        linkOrCopy(first, target);
+      }
+    }
     this.#update(userId, (status) => {
       status.template = templateId;
-      const record = status.docs[docKey] ?? { files: [], fileIds: {}, parts: {} };
-      record.files.push(name);
-      if (fileId) record.fileIds[name] = fileId;
-      for (const part of partKeys) record.parts[part] = { state: "accepted", reasons: [], ts: this.clock() };
-      status.docs[docKey] = record;
+      for (const { docKey, partKeys } of docs) {
+        const record = status.docs[docKey] ?? { files: [], fileIds: {}, parts: {} };
+        if (!record.files.includes(name)) record.files.push(name);
+        if (fileId) record.fileIds[name] = fileId;
+        for (const part of partKeys) record.parts[part] = { state: "accepted", reasons: [], ts: this.clock() };
+        status.docs[docKey] = record;
+      }
     });
-    return target;
+    return first ?? "";
   }
 
-  /** Remembers that every required document has been accepted, once. Returns true the first time. */
-  markComplete(userId: number): boolean {
+  /**
+   * Remembers that every required document (`requiredKeys`) has been accepted. Returns true the first time for
+   * this list of documents, so the owner is told once, and again only if the template's list changes.
+   */
+  markComplete(userId: number, requiredKeys: readonly string[]): boolean {
+    const signature = [...requiredKeys].sort().join(",");
     let first = false;
     this.#update(userId, (status) => {
-      if (status.completedAt !== null) return;
+      if (status.completedAt !== null && status.completedFor === signature) return;
       status.completedAt = this.clock();
+      status.completedFor = signature;
       first = true;
     });
     return first;
   }
 
   /**
-   * Copies a rejected file to rejected/ with its reasons and marks its parts rejected. A part that was already
-   * accepted stays accepted: a later wrong copy does not undo a good one. docKey is null for files that match no
-   * listed document.
+   * Copies a rejected file to rejected/ with its reasons and marks the parts of `docs` rejected, each with its own
+   * reasons. A part that was already accepted stays accepted: a later wrong copy does not undo a good one. `docs`
+   * is empty for files that match no listed document; `reasons` then says why.
    */
   reject(
     userId: number,
     templateId: string,
-    docKey: string | null,
-    partKeys: readonly string[],
+    docs: readonly (DocParts & { reasons: string[] })[],
     source: string | null,
     originalName: string,
     reasons: string[],
@@ -283,27 +329,54 @@ export class ClientFolders {
     const name = `${stamp(this.clock())}_${safeFileName(originalName)}`;
     if (source) {
       const target = path.join(dir, name);
-      fs.copyFileSync(source, target);
-      fs.chmodSync(target, 0o600);
+      if (!fs.existsSync(target)) linkOrCopy(source, target);
     }
     appendJsonl(path.join(dir, "reasons.jsonl"), {
       ts: this.clock(),
       file: source ? name : null,
       original: originalName,
-      doc: docKey,
-      parts: partKeys,
+      docs: docs.map(({ docKey, partKeys, reasons: own }) => ({ doc: docKey, parts: partKeys, reasons: own })),
       reasons,
     });
-    if (docKey === null || partKeys.length === 0) return;
+    const marked = docs.filter((doc) => doc.partKeys.length > 0);
+    if (marked.length === 0) return;
     this.#update(userId, (status) => {
       status.template = templateId;
-      const record = status.docs[docKey] ?? { files: [], fileIds: {}, parts: {} };
-      for (const part of partKeys) {
-        if (record.parts[part]?.state === "accepted") continue;
-        record.parts[part] = { state: "rejected", reasons, ts: this.clock() };
+      for (const { docKey, partKeys, reasons: own } of marked) {
+        const record = status.docs[docKey] ?? { files: [], fileIds: {}, parts: {} };
+        for (const part of partKeys) {
+          if (record.parts[part]?.state === "accepted") continue;
+          record.parts[part] = { state: "rejected", reasons: own.length ? own : reasons, ts: this.clock() };
+        }
+        status.docs[docKey] = record;
       }
-      status.docs[docKey] = record;
     });
+  }
+
+  /**
+   * The package for the owner: the latest accepted file of every document in `order` (template order), a file that
+   * holds several documents only once, with all of them.
+   */
+  packageFiles(userId: number, order: readonly string[]): PackageFile[] {
+    const latest = new Map<string, AcceptedFile>();
+    for (const file of this.acceptedFiles(userId, order)) {
+      if (order.includes(file.docKey)) latest.set(file.docKey, file);
+    }
+    const out: PackageFile[] = [];
+    const bySaved = new Map<string, PackageFile>();
+    for (const key of order) {
+      const file = latest.get(key);
+      if (!file) continue;
+      const known = bySaved.get(file.saved);
+      if (known) {
+        known.docKeys.push(key);
+        continue;
+      }
+      const entry: PackageFile = { docKeys: [key], file: file.file, name: file.name, ...(file.fileId ? { fileId: file.fileId } : {}) };
+      bySaved.set(file.saved, entry);
+      out.push(entry);
+    }
+    return out;
   }
 
   /** Accepted files, grouped by document in `order` (template order), then any others. */
@@ -318,7 +391,7 @@ export class ClientFolders {
         const file = path.join(this.dir(userId), "accepted", docKey, saved);
         if (!fs.existsSync(file)) continue;
         const fileId = record.fileIds[saved];
-        out.push({ docKey, file, name: saved.replace(/^\d{8}-\d{6}_/, ""), ...(fileId ? { fileId } : {}) });
+        out.push({ docKey, file, name: saved.replace(/^\d{8}-\d{6}_/, ""), saved, ...(fileId ? { fileId } : {}) });
       }
     }
     return out;

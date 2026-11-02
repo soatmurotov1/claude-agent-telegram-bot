@@ -1,16 +1,25 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { GrammyError, HttpError, InputFile, type Api } from "grammy";
+import { GrammyError, HttpError, InputFile, InputMediaBuilder, type Api } from "grammy";
 import type { BusinessConnection, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup } from "grammy/types";
 import { ClaudeCLI, ClaudeError, ClaudeLimitError } from "./claudeCli.js";
-import { type AcceptedFile, ClientFolders, type Progress, progress, progressText } from "./clientFolder.js";
+import {
+  type AcceptedFile,
+  ClientFolders,
+  type PackageFile,
+  type Progress,
+  progress,
+  progressText,
+} from "./clientFolder.js";
 import type { Settings } from "./config.js";
 import {
+  type DocMatch,
   type FileVerdict,
   Inbox,
   type InboxFile,
   readLaws,
+  rejectedFile,
   type ReviewChat,
   type ReviewGenerator,
   reviewFile,
@@ -18,7 +27,7 @@ import {
 import { detectLanguage, type Language } from "./language.js";
 import { BOT_API_DOWNLOAD_LIMIT, MtprotoDownloader } from "./largeFiles.js";
 import { buildSystemPrompt, buildUserPrompt, SKIP_TOKEN, splitEscalation, splitTemplate } from "./prompts.js";
-import { blankFor, loadTemplate, type Template, type TemplateDoc, type TemplatePart } from "./templates.js";
+import { blankFor, loadTemplate, type Template } from "./templates.js";
 import {
   appendJsonl,
   type Clock,
@@ -267,6 +276,19 @@ export function splitMessage(text: string, size = MAX_MESSAGE_LENGTH): string[] 
   const chunks: string[] = [];
   for (let i = 0; i < chars.length; i += size) chunks.push(chars.slice(i, i + size).join(""));
   return chunks;
+}
+
+/** Telegram puts at most 10 files into one album. */
+export const ALBUM_SIZE = 10;
+
+/** "✅ 3. Yer qa'ridan foydalanish uchun elektron ruxsatnoma" per document key, numbered like the client's status. */
+function packageCaptions(template: Template): Map<string, string> {
+  const out = new Map<string, string>();
+  let n = 0;
+  for (const doc of template.documents) {
+    out.set(doc.key, doc.required ? `✅ ${++n}. ${doc.title.uz}` : `✅ ${doc.title.uz}`);
+  }
+  return out;
 }
 
 function truncate(text: string, max: number): string {
@@ -915,7 +937,7 @@ export class Assistant {
     if (!file) return;
     const lang = chat.language ?? "uz";
     const refuse = async (reason: string): Promise<void> => {
-      this.folders.reject(chat.chatId, "", null, [], null, file.name, [reason]);
+      this.folders.reject(chat.chatId, "", [], null, file.name, [reason]);
       await this.#deliver(api, chat, `❌ ${file.name}: ${reason}.`);
     };
     const maxBytes = this.settings.maxFileMb * 1024 * 1024;
@@ -1054,7 +1076,7 @@ export class Assistant {
     if (data.files.length >= 3) await this.#deliver(api, chat, REVIEW_STARTED[lang](data.files.length));
 
     const verdicts: FileVerdict[] = [];
-    const accepted: { verdict: Extract<FileVerdict, { kind: "accepted" }>; file: string }[] = [];
+    const accepted: { verdict: Extract<FileVerdict, { kind: "reviewed" }>; file: string }[] = [];
     const retrying: InboxFile[] = [];
     let stopped: "limit" | "daily" | null = null;
     for (const file of data.files) {
@@ -1097,10 +1119,10 @@ export class Assistant {
           retrying.push(file);
           continue;
         }
-        verdict = { kind: "rejected", file, doc: null, parts: [], reasons: [UNCHECKED_REASON[lang]], summary: verdict.reason };
+        verdict = rejectedFile(file, [UNCHECKED_REASON[lang]], verdict.reason);
       }
       const saved = this.#saveVerdict(userId, template, verdict);
-      if (saved && verdict.kind === "accepted") accepted.push({ verdict, file: saved });
+      if (saved && verdict.kind === "reviewed") accepted.push({ verdict, file: saved });
       verdicts.push(verdict);
       // The owner deleted this chat while it was being reviewed.
       if (!this.folders.exists(userId)) return;
@@ -1129,15 +1151,23 @@ export class Assistant {
     const source = this.inbox.path(userId, verdict.file);
     let saved: string | null = null;
     try {
-      if (verdict.kind === "accepted") {
-        const parts = verdict.parts.map((part) => part.key);
-        saved = this.folders.accept(userId, template.id, verdict.doc.key, parts, source, verdict.file.name, verdict.file.fileId);
-        if (verdict.applicant) this.folders.setApplicant(userId, template.id, verdict.applicant);
-      } else if (verdict.kind === "rejected") {
-        const parts = verdict.parts.map((part) => part.key);
-        this.folders.reject(userId, template.id, verdict.doc?.key ?? null, parts, source, verdict.file.name, verdict.reasons);
+      if (verdict.kind === "reviewed") {
+        // One file may hold several documents: the good ones are accepted, the others rejected, each on its own.
+        if (verdict.accepted.length > 0) {
+          const docs = verdict.accepted.map((m) => ({ docKey: m.doc.key, partKeys: m.parts.map((part) => part.key) }));
+          saved = this.folders.accept(userId, template.id, docs, source, verdict.file.name, verdict.file.fileId);
+          if (verdict.applicant) this.folders.setApplicant(userId, template.id, verdict.applicant);
+        }
+        if (verdict.rejected.length > 0 || verdict.accepted.length === 0) {
+          const docs = verdict.rejected.map((m) => ({
+            docKey: m.doc.key,
+            partKeys: m.parts.map((part) => part.key),
+            reasons: m.reasons,
+          }));
+          this.folders.reject(userId, template.id, docs, source, verdict.file.name, verdict.reasons);
+        }
       } else {
-        this.folders.reject(userId, template.id, null, [], source, verdict.file.name, [`not checked: ${verdict.reason}`]);
+        this.folders.reject(userId, template.id, [], source, verdict.file.name, [`not checked: ${verdict.reason}`]);
       }
     } catch (err) {
       logError(`Could not save the review of ${verdict.file.name} for chat ${userId}: ${errorMessage(err)}`);
@@ -1146,47 +1176,43 @@ export class Assistant {
     return saved;
   }
 
-  /** A short note to the owner; files that could not be checked are sent along so someone looks at them. */
   /**
-   * Tells the owner how the batch went and sends them the files that were accepted in it (the ready documents),
-   * then the ones that could not be checked. When the package becomes complete, the owner is told once.
-   */
-  /**
-   * The owner hears about a client's documents only once the package is complete: every required document sent
-   * and accepted. Then the whole package goes to them at once. Documents accepted after that (a newer copy) are
-   * passed on as updates. Nothing is sent while the package is still incomplete.
+   * The owner hears about a client's documents only once the package is complete: every required document (all
+   * 16) sent and accepted. Then the whole package goes to them at once: one 🎉 message with the status, then the
+   * files in albums of up to 10. Documents accepted after that (a newer copy) are passed on as updates. Nothing is
+   * sent while the package is still incomplete, however long the client takes.
    */
   async #sendPackageIfComplete(
     api: Api,
     userId: number,
     template: Template,
     p: Progress,
-    accepted: { verdict: Extract<FileVerdict, { kind: "accepted" }>; file: string }[],
+    accepted: { verdict: Extract<FileVerdict, { kind: "reviewed" }>; file: string }[],
   ): Promise<void> {
     if (p.total === 0 || p.accepted < p.total) return;
     const who = this.personTitle(userId);
-    const titles = new Map(template.documents.map((doc) => [doc.key, doc.title.uz]));
+    const required = template.documents.filter((doc) => doc.required).map((doc) => doc.key);
     try {
-      if (this.folders.markComplete(userId)) {
+      if (this.folders.markComplete(userId, required)) {
         await api.sendMessage(
           this.settings.ownerId,
           `🎉 Yangi to'liq paket: ${who}\nBarcha ${p.total} ta hujjat topshirildi va talab darajasida (100%). ` +
             `Fayllar quyida.\n\n${this.clientProgressText(userId, "uz")}`,
           { reply_markup: folderKeyboard(userId) },
         );
-        const files = this.folders.acceptedFiles(userId, template.documents.map((doc) => doc.key));
-        for (const file of files) {
-          await this.#sendFileToOwner(api, file, `✅ ${titles.get(file.docKey) ?? file.docKey}\n👤 ${who}`);
-        }
+        const files = this.folders.packageFiles(userId, template.documents.map((doc) => doc.key));
+        await this.#sendAlbumsToOwner(api, files, packageCaptions(template), `👤 ${who}`);
         log(`Chat ${userId}: the package is complete; ${files.length} file(s) sent to the owner.`);
         return;
       }
+      const numbers = packageCaptions(template);
       for (const { verdict, file } of accepted) {
         const fileId = verdict.file.fileId;
+        const docs = verdict.accepted.map((m) => numbers.get(m.doc.key) ?? m.doc.title.uz).join("\n");
         await this.#sendFileToOwner(
           api,
-          { docKey: verdict.doc.key, file, name: verdict.file.name, ...(fileId ? { fileId } : {}) },
-          `🔄 Yangilangan hujjat: ${verdict.doc.title.uz}\n👤 ${who}`,
+          { file, name: verdict.file.name, ...(fileId ? { fileId } : {}) },
+          `🔄 Yangilangan hujjat:\n${docs}\n👤 ${who}`,
         );
       }
     } catch (err) {
@@ -1194,29 +1220,60 @@ export class Assistant {
     }
   }
 
-  /** The owner's 📎 button: the client's status and every accepted file. Returns how many files were sent. */
+  /** The owner's 📎 button: the client's status and the package (latest accepted file per document). */
   async sendAcceptedFilesToOwner(api: Api, userId: number): Promise<number> {
     let order: string[] = [];
-    const titles = new Map<string, string>();
+    let captions = new Map<string, string>();
     try {
       const template = loadTemplate(this.settings.templatesDir);
       order = template.documents.map((doc) => doc.key);
-      for (const doc of template.documents) titles.set(doc.key, doc.title.uz);
+      captions = packageCaptions(template);
     } catch {
       // Keys are shown instead of titles.
+      order = Object.keys(this.folders.status(userId).docs);
     }
-    const files = this.folders.acceptedFiles(userId, order);
+    const files = this.folders.packageFiles(userId, order);
     if (files.length === 0) return 0;
     await api.sendMessage(this.settings.ownerId, this.clientProgressText(userId, "uz"));
-    for (const file of files) await this.#sendFileToOwner(api, file, `✅ ${titles.get(file.docKey) ?? file.docKey}`);
+    await this.#sendAlbumsToOwner(api, files, captions, "");
     return files.length;
+  }
+
+  /**
+   * Sends package files to the owner as albums of up to 10 documents (a Telegram limit), each file captioned with
+   * the documents it holds. Files go by their Telegram file_id when known (no re-upload, any size). If an album
+   * cannot be sent, its files are sent one by one instead.
+   */
+  async #sendAlbumsToOwner(api: Api, files: PackageFile[], captions: Map<string, string>, footer: string): Promise<void> {
+    const captionOf = (file: PackageFile): string => {
+      const lines = file.docKeys.map((key) => captions.get(key) ?? `✅ ${key}`);
+      if (footer) lines.push(footer);
+      return truncate(lines.join("\n"), 1000);
+    };
+    for (let i = 0; i < files.length; i += ALBUM_SIZE) {
+      const chunk = files.slice(i, i + ALBUM_SIZE);
+      if (chunk.length >= 2) {
+        try {
+          await api.sendMediaGroup(
+            this.settings.ownerId,
+            chunk.map((file) =>
+              InputMediaBuilder.document(file.fileId ?? new InputFile(file.file, file.name), { caption: captionOf(file) }),
+            ),
+          );
+          continue;
+        } catch (err) {
+          logError(`Sending an album of ${chunk.length} file(s) failed (${errorMessage(err)}); sending them one by one.`);
+        }
+      }
+      for (const file of chunk) await this.#sendFileToOwner(api, file, captionOf(file));
+    }
   }
 
   /**
    * Sends a saved file to the owner by its Telegram file_id when known (no re-upload, works for any size),
    * otherwise uploads the saved copy (Bot API uploads are limited to 50 MB).
    */
-  async #sendFileToOwner(api: Api, file: AcceptedFile, caption: string): Promise<void> {
+  async #sendFileToOwner(api: Api, file: Pick<AcceptedFile, "file" | "name" | "fileId">, caption: string): Promise<void> {
     const options = { caption: truncate(caption, 1000) };
     if (file.fileId) {
       try {
@@ -1516,12 +1573,14 @@ export class Assistant {
       "",
       "Siz (admin) uchun:",
       "• Mijozlarning xabarlari sizga yuborilmaydi. Faqat 🚨 muhim murojaatlar va to'liq hujjat paketlari keladi.",
-      "• Mijozdan anketa oxiridagi 5 ta hujjat so'raladi. Mijoz fayl yuborsa (bir yo'la 10–50 ta ham, 20 MB dan " +
-        "kattasi ham), bot har birini shablon (templates/) bo'yicha tekshiradi: moslari mijoz papkasiga saqlanadi, " +
-        "mos kelmaganlarini sababi bilan qayta so'raydi va mijozga necha foiz tayyorligini ko'rsatadi.",
-      "• Sizga faqat 5 ta hujjatning hammasi topshirilib, hammasi talab darajasida bo'lganda 🎉 xabar va butun " +
-        "paket (barcha fayllar) bir yo'la keladi. Undan oldin hech narsa yuborilmaydi; holatni «users» orqali " +
-        "istalgan vaqtda ko'rishingiz mumkin.",
+      "• Mijozdan 16 ta hujjat so'raladi (ustav, YeGRPO, ruxsatnoma, litsenziya, 133-son kelishuv, UTER, TIA, " +
+        "tog' ajratmasi, 5-GR, ZVOS, ZEP, PDV, limitlar, EPB, yer ajratmasi, imzolangan anketa+NDA). Mijoz fayl " +
+        "yuborsa (bir yo'la 10–50 ta ham, 20 MB dan kattasi ham, bir faylda bir nechta hujjat ham), bot har birini " +
+        "shablon (templates/) bo'yicha tekshiradi: moslari mijoz papkasiga saqlanadi, mos kelmaganlarini sababi " +
+        "bilan qayta so'raydi va mijozga necha foiz tayyorligini ko'rsatadi.",
+      "• Sizga faqat 16 ta hujjatning hammasi topshirilib, hammasi talab darajasida bo'lganda bitta 🎉 xabar va " +
+        "butun paket (albumlarda, 10 tadan) bir yo'la keladi. Mijoz fayllarni qancha vaqt davomida yuborsa ham, " +
+        "undan oldin hech narsa yuborilmaydi; holatni «users» orqali istalgan vaqtda ko'rishingiz mumkin.",
       "• «users» tugmasi mijozlar ro'yxatini (📊 tayyorlik foizi bilan) ko'rsatadi. Mijozni bossangiz, u bilan " +
         "butun yozishma va hujjatlar holati ochiladi; ostida «📄 chat.txt», «📎 Qabul qilingan fayllar» va " +
         "«🗑 Chatni o'chirish» tugmalari bor.",
@@ -1697,24 +1756,22 @@ export function reviewSummaryText(
 ): string {
   const w = REVIEW_WORDS[language];
   const lines = [w.checked(verdicts.length + retrying.length)];
-  const accepted = verdicts.filter((v): v is Extract<FileVerdict, { kind: "accepted" }> => v.kind === "accepted");
-  const rejected = verdicts.filter((v): v is Extract<FileVerdict, { kind: "rejected" }> => v.kind === "rejected");
+  const reviewed = verdicts.filter((v): v is Extract<FileVerdict, { kind: "reviewed" }> => v.kind === "reviewed");
   // "Charter and register extract (Register extract)" when the file holds only some parts of a document.
-  const title = (v: { doc: TemplateDoc | null; parts: TemplatePart[] }): string => {
-    if (!v.doc) return "";
-    const some = v.doc.parts.length > 1 && v.parts.length > 0 && v.parts.length < v.doc.parts.length;
-    return some ? `${v.doc.title[language]} (${v.parts.map((part) => part.title[language]).join(", ")})` : v.doc.title[language];
+  const title = (m: DocMatch): string => {
+    const some = m.doc.parts.length > 1 && m.parts.length > 0 && m.parts.length < m.doc.parts.length;
+    return some ? `${m.doc.title[language]} (${m.parts.map((part) => part.title[language]).join(", ")})` : m.doc.title[language];
   };
-  if (accepted.length) {
-    lines.push("", w.accepted, ...accepted.map((v) => `• ${title(v)} — ${v.file.name}`));
-  }
-  if (rejected.length) {
-    lines.push(
-      "",
-      w.rejected,
-      ...rejected.map((v) => `• ${v.doc ? `${title(v)} (${v.file.name})` : v.file.name}: ${v.reasons.join("; ")}`),
-    );
-  }
+  // A file holding several documents is one line, with all the documents accepted from it.
+  const acceptedLines = reviewed
+    .filter((v) => v.accepted.length > 0)
+    .map((v) => `• ${v.accepted.map(title).join(", ")} — ${v.file.name}`);
+  const rejectedLines = reviewed.flatMap((v) => {
+    if (v.accepted.length === 0 && v.rejected.length === 0) return [`• ${v.file.name}: ${v.reasons.join("; ")}`];
+    return v.rejected.map((m) => `• ${title(m)} (${v.file.name}): ${(m.reasons.length ? m.reasons : v.reasons).join("; ")}`);
+  });
+  if (acceptedLines.length) lines.push("", w.accepted, ...acceptedLines);
+  if (rejectedLines.length) lines.push("", w.rejected, ...rejectedLines);
   if (retrying.length) lines.push("", w.retrying, ...retrying.map((file) => `• ${file.name}`));
   if (left > 0 && stopped) lines.push("", w.left(left));
   return lines.join("\n");
@@ -1722,20 +1779,27 @@ export function reviewSummaryText(
 
 const TEMPLATE_CAPTION: Record<Language, string> = {
   uz:
-    "Anketa oxiridagi 5 ta hujjatni shu chatga fayl qilib yuboring: 1) ustav va YeGRPO dan ko'chirma; " +
-    "2) ruxsatnoma (litsenziya) va litsenziya kelishuvi; 3) loyiha hujjatlari va 5-GR tasdig'i; 4) ekologik paket; " +
-    "5) EPB dalolatnomalari va yer ajratmasi qarorlari. Bot har birini tekshirib, nechchi foizi tayyorligini " +
-    "ko'rsatadi. Anketani to'ldirib, imzolab yuborsangiz ham bo'ladi.",
+    "Quyidagi 16 ta hujjatni shu chatga fayl qilib yuboring: 1) korxona ustavi; 2) YeGRPO dan ko'chirma; " +
+    "3) yer qa'ridan foydalanish uchun elektron ruxsatnoma; 4) elektron litsenziya; 5) VMQ 133-son bo'yicha " +
+    "litsenziya kelishuvi (shartnoma); 6) UTER; 7) TIA; 8) tog' ajratmasi loyihasi; 9) 5-GR topshirilganini " +
+    "tasdiqlovchi hujjat; 10) ZVOS; 11) ZEP; 12) PDV; 13) limitlar; 14) OPO bo'yicha EPB dalolatnomalari; " +
+    "15) yer ajratmasi to'g'risidagi qarorlar; 16) ushbu anketa — to'ldirilgan va Maxfiylik kelishuvi (NDA) " +
+    "imzolangan holda. Bir nechta hujjat bitta faylda bo'lishi mumkin. Bot har birini tekshirib, nechchi foizi " +
+    "tayyorligini ko'rsatadi.",
   ru:
-    "Отправьте файлами в этот чат 5 документов из перечня в конце анкеты: 1) устав и выписка из ЕГРПО; " +
-    "2) разрешение (лицензия) и лицензионное соглашение; 3) проектная документация и подтверждение сдачи 5-ГР; " +
-    "4) экологический пакет; 5) акты ЭПБ и решения на земельный отвод. Бот проверит каждый и покажет, на сколько " +
-    "процентов пакет готов. Заполненную и подписанную анкету тоже можно прислать.",
+    "Отправьте файлами в этот чат 16 документов: 1) устав предприятия; 2) выписка из ЕГРПО; 3) электронное " +
+    "разрешение на пользование недрами; 4) электронная лицензия; 5) лицензионное соглашение (шартнома) по ПКМ " +
+    "№ 133; 6) УТЭР; 7) ТЭО; 8) проект горного отвода; 9) подтверждение сдачи формы 5-ГР; 10) ЗВОС; 11) ЗЭП; " +
+    "12) ПДВ; 13) лимиты; 14) акты ЭПБ по ОПО; 15) решения на земельный отвод; 16) эта анкета — заполненная, с " +
+    "подписанным соглашением о конфиденциальности (NDA). Несколько документов можно прислать одним файлом. Бот " +
+    "проверит каждый и покажет, на сколько процентов пакет готов.",
   en:
-    "Please send the 5 documents listed at the end of the questionnaire (Russian version) as files in this chat: " +
-    "1) charter and register extract; 2) subsoil use permit and licence agreement; 3) project documents and proof " +
-    "of form 5-GR; 4) environmental package; 5) industrial safety reports and land allotment decisions. Each file " +
-    "is checked and you will see how complete your package is. You may also send the filled-in, signed questionnaire.",
+    "Please send these 16 documents as files in this chat: 1) company charter; 2) EGRPO register extract; " +
+    "3) electronic subsoil use permit; 4) electronic licence; 5) licence agreement under resolution No. 133; " +
+    "6) UTER; 7) feasibility study (TEO); 8) mining allotment project; 9) proof of form 5-GR; 10) ZVOS; 11) ZEP; " +
+    "12) PDV; 13) limits; 14) industrial safety (EPB) reports; 15) land allotment decisions; 16) this " +
+    "questionnaire (Russian version), filled in, with the signed non-disclosure agreement (NDA). Several documents " +
+    "may be in one file. Each is checked and you will see how complete your package is.",
 };
 
 const STATUS_UNAVAILABLE: Record<Language, string> = {
