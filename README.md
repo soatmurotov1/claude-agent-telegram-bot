@@ -31,8 +31,8 @@ Common to both:
   documents listed in it. "A responsible employee will answer" is kept for serious cases only (exact prices, the
   company's own deadlines, guarantees, complaints, emergencies, official requests). It still makes no promises
   about prices, deadlines, permits, expert reviews or inspection results.
-- **It checks documents.** Files clients send are checked against the template, saved per client and summed up
-  as percentages (see [Documents](#documents)).
+- **It collects documents.** Files clients send are saved per client and counted, **not checked**; once a client
+  has sent 16 files, the whole package goes to the admin (see [Documents](#documents)). Files never go to Claude.
 - **Escalation**: for emergencies (accident, gas leak, fire, injury, collapse), complaints, official requests,
   or mentions of courts, prosecutors or media, Claude starts its answer with `[ESCALATE]`. The bot then sends the
   owner a private alert (in Uzbek) in the bot chat — also in preview mode — at most once per 10 minutes per chat.
@@ -55,13 +55,12 @@ Common to both:
 | Before an auto-send | Pause/limit/takeover are checked again, and the connection is re-read from Telegram (owner, enabled, reply right) |
 | History retention | Messages and previews older than `HISTORY_TTL_DAYS` (default 30) are deleted |
 | Someone writes to the bot directly | Claude answers from `company.md` (sent only with `AUTO_SEND=true`); the admin gets no copy |
-| A client sends files or photos (also 10-50 at once) | Collected for `REVIEW_BATCH_SECONDS` (15 s) after the last one, then each is checked against the template; one summary goes to the client. The admin gets nothing until the package is complete |
-| A file cannot be checked (bad JSON from Claude, CLI error) | Kept in the inbox and checked again after `REVIEW_RETRY_SECONDS` (5 min), at most `MAX_REVIEW_ATTEMPTS` (3) times; then the client is asked to send a PDF or a clearer scan |
-| All 16 documents sent and accepted (however long it takes) | The admin gets one 🎉 message with the status, then the whole package in albums of up to 10 files (by `file_id`, so any size); a newer accepted copy later is sent as 🔄 update |
+| A client sends files or photos (also 10-50 at once, any format) | Collected for `REVIEW_BATCH_SECONDS` (15 s) after the last one, then saved and counted (not checked); one summary goes to the client: `📥 N ta fayl qabul qilindi` and `Qabul qilingan fayllar: X/16`. The admin gets nothing until 16 files have arrived |
+| The 16th file arrives (however long it takes) | The admin gets one 🎉 message, then every file in albums of up to 10 (by `file_id`, so any size), each captioned `📄 3/16 — name` |
+| A file comes after the package was sent | Passed to the admin at once as `🔄 Qo'shimcha fayl` |
 | A file is larger than 20 MB | Downloaded over MTProto when `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` are set (up to `MAX_FILE_MB`, default and maximum 2000); otherwise the client is asked to compress or split it |
 | Client writes "holat" / "статус" / presses 📊 | Their document status, without Claude |
 | Client writes "anketa" / "анкета" / presses 📄, or Claude adds `[SEND_TEMPLATE]` | The blank questionnaire is sent (Russian for Russian and English speakers) |
-| More than `REVIEW_DAILY_LIMIT` document checks in 24 h | Remaining files wait in the inbox and are retried an hour later |
 | Admin writes after pressing ✍️ | Text, photo, file or voice goes to that person; the bot is silent there for `OWNER_TAKEOVER_MINUTES` |
 | The person writes while the bot is silent | The message is passed to the admin with a ✍️ button, so nothing is missed |
 | Admin presses ✖️ Tugatish | The silence ends at once: the bot answers that person again |
@@ -75,7 +74,7 @@ Common to both:
 - `/pause`, `/resume` (also clears the limit and takeover timers), `/status`.
 - **`users` button** (persistent keyboard, owner only; also `/users`): lists everyone who wrote to the bot in the
   last `HISTORY_TTL_DAYS` days, newest first, with @username, ID, message count and last message time. Under the
-  list is a 📁 button per person (with `📊 N%` when they have sent documents): pressing it shows their document
+  list is a 📁 button per person (with `📊 N/16` when they have sent files): pressing it shows their document
   status and the whole conversation with them (oldest first; a very long one arrives as a `.txt` file), with
   **✍️ Javob yozish**, **📄 chat.txt**, **📎 Qabul qilingan fayllar** and **🗑 Chatni o'chirish** under it.
 - **🗑 Chatni o'chirish** asks for confirmation, then deletes the person's history, transcript, users-list entry
@@ -94,68 +93,48 @@ Anyone else who sends `/start` gets a short Uzbek welcome and a keyboard with **
 
 ## Documents
 
-The documents asked for are defined in [`templates/investment-checklist/template.json`](templates/investment-checklist/template.json),
+The 16 documents asked for are listed in [`templates/investment-checklist/template.json`](templates/investment-checklist/template.json),
 taken from the company's express questionnaire «Инвестициялар учун объект тайёргарлигининг экспресс-анкетаси»
-(`uz.docx`) / «Экспресс-анкета готовности объекта к инвестициям» (`ru.docx`). The client is asked for
-**16 documents, all required** (no "NA" exemptions); each percentage step is one of them (≈ 6%):
+(`uz.docx`) / «Экспресс-анкета готовности объекта к инвестициям» (`ru.docx`). The client is asked to send each one
+as a separate file:
 
-| # | Key | Document |
-| --- | --- | --- |
-| 1 | `ustav` | Company charter |
-| 2 | `egrpo` | Extract from the state register (ЕГРПО), ≤ 3 months old |
-| 3 | `ruxsatnoma` | Electronic subsoil use permit |
-| 4 | `litsenziya` | Electronic subsoil use licence |
-| 5 | `kelishuv` | Licence agreement (shartnoma) under resolution No. 133 |
-| 6 | `uter` | UTER (УТЭР) |
-| 7 | `tia` | Feasibility study (TIA / ТЭО) |
-| 8 | `tog_ajratmasi` | Mining allotment project |
-| 9 | `forma_5gr` | Proof that form 5-GR was submitted |
-| 10 | `zvos` | Environmental package: ZVOS |
-| 11 | `zep` | Environmental package: ZEP |
-| 12 | `pdv` | Environmental package: PDV |
-| 13 | `limitlar` | Environmental package: limits |
-| 14 | `epb` | Industrial safety expert review (EPB) reports for hazardous facilities (OPO) |
-| 15 | `yer` | Land allotment decisions |
-| 16 | `anketa` | The filled-in questionnaire with the signed non-disclosure agreement (NDA); also gives the company name |
+| # | Document |
+| --- | --- |
+| 1 | Company charter |
+| 2 | Extract from the state register (ЕГРПО) |
+| 3 | Electronic subsoil use permit |
+| 4 | Electronic subsoil use licence |
+| 5 | Licence agreement (shartnoma) under resolution No. 133 |
+| 6 | UTER (УТЭР) |
+| 7 | Feasibility study (TIA / ТЭО) |
+| 8 | Mining allotment project |
+| 9 | Proof that form 5-GR was submitted |
+| 10 | Environmental package: ZVOS |
+| 11 | Environmental package: ZEP |
+| 12 | Environmental package: PDV |
+| 13 | Environmental package: limits |
+| 14 | Industrial safety expert review (EPB) reports for hazardous facilities (OPO) |
+| 15 | Land allotment decisions |
+| 16 | The filled-in questionnaire with the signed non-disclosure agreement (NDA) |
 
-Each document may come as its own file, or several documents in one file (for example the charter and the register
-extract in one PDF): Claude lists every document it finds in a file and accepts or rejects each one on its own. A
-file that holds several documents is saved once and hard-linked into each document's folder.
+**The bot does not check the files** (no Claude, no format check): it does not know which file is which document.
+It only counts them:
 
-A document is ✅ when accepted, ❌ when rejected, ⬜ when not sent yet. The client may take minutes or days: the owner
-is sent nothing while the package is incomplete. When all 16 have been sent and accepted, the owner gets **one 🎉
-message** with the status, then the whole package in **albums of up to 10 files** (Telegram's limit; 16 files → 10 + 6),
-each file captioned with the documents it holds. Files go by Telegram `file_id`, so files over 50 MB need no
-re-upload; if an album fails, its files are sent one by one. A newer accepted copy later is sent as 🔄 update. The 📎
-button in the client's folder sends the package (latest accepted file per document) at any time. If the template's
-list of required documents changes, a package completed under the old list is announced again once the new list is
-complete.
+1. A file is downloaded into `data/clients/<id>/inbox/` (kept across restarts), then moved to `received/` and
+   counted. Files over `MAX_FILE_MB`, or over 20 MB without `TELEGRAM_API_ID` / `TELEGRAM_API_HASH`, are refused
+   and not counted (`refused.jsonl`).
+2. The client gets `📥 N ta fayl qabul qilindi` with the names and `Qabul qilingan fayllar: X/16`, with the list of
+   the 16 documents as a reminder. "holat" / "статус" / 📊 shows the same.
+3. The client may take minutes or days: the admin is sent nothing before. When the 16th file arrives, the admin
+   gets **one 🎉 message**, then **every file** in **albums of up to 10** (Telegram's limit; 16 files → 10 + 6),
+   numbered in the order they came (`📄 3/16 — name`). If more than 16 come in one batch, all of them are sent.
+   If an album fails, its files are sent one by one.
+4. Files after that go to the admin one by one as `🔄 Qo'shimcha fayl (17-fayl): name`.
+5. The 📎 button in the client's folder sends all received files at any time.
 
-To make a document optional again, add `"required": false` to it in `template.json`; to exempt it when the
-questionnaire marks an item "NA", put the item numbers into its part's `naItems`.
-
-How a file is checked (`src/documentReview.ts`):
-
-1. It is downloaded into `data/clients/<id>/inbox/` (kept across restarts and usage limits).
-2. DOCX and XLSX text is extracted in the bot (checkbox states ☐/☒ and highlighted text are kept); TXT/CSV are
-   read as is. PDF and images are opened by Claude itself: the CLI runs in a fresh 0700 folder holding only that
-   file, with `--tools Read --restricted --allowedTools Read --permission-prompts none`, so it can read nothing
-   else. Other formats (DOC, ZIP …) are rejected with a request for PDF/DOCX/XLSX/JPG/PNG.
-3. Claude gets the template (each part's acceptance checks), the summaries in [`laws/`](laws/), the company
-   from the accepted questionnaire and the file, and answers with JSON: every listed document the file holds, each
-   accepted or rejected, reasons in the client's language.
-4. Accepted → `accepted/<key>/`; rejected → `rejected/` with `reasons.jsonl`. A later wrong
-   copy never undoes an accepted document. The accepted questionnaire also records the company.
-5. Progress = accepted / 16 required documents:
-   `Tayyor 50% (8/16) · Xato 6% (1) · Yetishmaydi 44% (7)` and one numbered line per document with ✅ ❌ ⬜,
-   and the reasons.
-
-To add a document or change a check, edit `template.json` (read fresh for every file) and push. A new template
-goes into its own folder with the same layout; `DEFAULT_TEMPLATE_ID` in `src/templates.ts` picks the active one.
-The service contract template can be added the same way later.
-
-`npm run review -- path/to/file.pdf --lang ru` checks one local file and prints the verdict, without Telegram and
-without saving anything.
+The number of files in a package is the number of required documents in `template.json` (16; 16 also when the
+template cannot be read). Clients from the earlier version, when files were checked, keep their accepted files: they
+are counted as received (a file that held several documents once).
 
 ## How Claude is called
 
@@ -195,10 +174,10 @@ Everything is stored in `data/` (on Railway: the volume at `/app/data`), directo
 | `users.json` | People who wrote to the bot (name, @username, ID, counts) for the `users` list |
 | `mtproto.session` | The MTProto session (an auth key) for downloading files over 20 MB; keep it private |
 | `clients/<id>/chat.txt` | The whole conversation with this person as plain text |
-| `clients/<id>/accepted/<doc>/` | Files that passed the template check |
-| `clients/<id>/rejected/` | Files that did not, with `reasons.jsonl` |
-| `clients/<id>/status.json` | Per-document state, used for the percentages |
-| `clients/<id>/inbox/` | Files waiting for review |
+| `clients/<id>/received/` | Every file the client sent (not checked) |
+| `clients/<id>/refused.jsonl` | Files that could not be taken (too large, download failed) |
+| `clients/<id>/status.json` | The received files in order and whether the package went to the admin |
+| `clients/<id>/inbox/` | Files waiting for the batch |
 
 History and previews older than `HISTORY_TTL_DAYS` are deleted. Client folders are kept until the owner deletes
 the chat with 🗑; the client's documents (licences, charters …) are confidential under the questionnaire's NDA. Messages from the people who write to the company
@@ -229,7 +208,7 @@ personal-data requirements, before you connect the bot.
    https://my.telegram.org → *API development tools*, create an app (any name) and add its numbers as
    `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`. The bot then downloads large files over MTProto with its own
    token, connecting only for the download. The log says `Files over 20 MB: enabled (MTProto login as @…)`.
-   Keep the api_hash secret like a token. Mind the volume size: accepted files are kept in `data/clients/`.
+   Keep the api_hash secret like a token. Mind the volume size: received files are kept in `data/clients/`.
 6. **Volume (the bot's memory).** Right-click the canvas (or Cmd+K / Ctrl+K) → *Volume* → choose the service →
    mount path exactly `/app/data` → *Deploy*. Everything in the table above is written there and survives
    redeploys. Without a volume, the memory, users, pause and limit state are lost on every deploy; the log then
@@ -274,7 +253,6 @@ variables are ignored and nothing is written to `process.env`.
 | `node dist/bot.js --settings-from-env` | Container mode (Railway): settings from environment variables, which are then removed from `process.env` | same |
 | `npm run check-claude` | Checks the Claude CLI without Telegram | 0 ok, 1 check failed, 2 config error |
 | `npm run try -- "text"` | Shows the reply to a made-up message (language, escalation, reply) | 0 ok, 1 Claude failed, 2 config error |
-| `npm run review -- file [--lang uz\|ru\|en]` | Checks one local file against the template and prints the verdict | 0 ok, 1 Claude failed, 2 config error or no file |
 | `npm run typecheck` / `npm test` / `npm run build` | TypeScript check, tests (offline), compile to `dist/` | |
 
 `--check-claude` and `--try` also work with `--settings-from-env` and do not need Telegram settings.
@@ -283,8 +261,8 @@ variables are ignored and nothing is written to `process.env`.
 
 `npm test` runs offline: Telegram calls go to a recording transformer (`tests/harness.ts`), file downloads are
 served from memory and Claude is replaced by a scripted generator. `tests/documents.test.ts` covers the template,
-DOCX/XLSX text, review answers, batches of many files, preview mode, usage limits across restarts, business
-chats, chat.txt, the questionnaire, the client status and deleting a chat.
+counting files, the package of 16 in albums, extras after it, preview mode, large files, the inbox across restarts,
+business chats, chat.txt, the questionnaire, the client status and deleting a chat.
 
 ### Files
 
@@ -293,17 +271,17 @@ src/bot.ts         entry point, CLI flags, startup checks, long polling with @gr
 src/config.ts      settings from .env or environment variables
 src/claudeCli.ts   claude -p wrapper, isolation, errors
 src/language.ts    language hint (uz/ru/en)
-src/prompts.ts     system and user prompts, [SKIP]/[ESCALATE]/[SEND_TEMPLATE], document review prompts
+src/prompts.ts     system and user prompts, [SKIP]/[ESCALATE]/[SEND_TEMPLATE]
 src/store.ts       history, duplicates, state, previews (atomic JSON files)
 src/templates.ts   loads templates/<id>/template.json
-src/clientFolder.ts  data/clients/<id>/: chat.txt, accepted/rejected files, status, percentages
-src/documentReview.ts  DOCX/XLSX text, inbox, one-file check with Claude, JSON verdict
+src/clientFolder.ts  data/clients/<id>/: chat.txt, received files, status, the client status text
+src/documentReview.ts  the inbox of files waiting for the batch (files are not checked any more)
 src/largeFiles.ts  files over 20 MB: Bot API file_id decoding and MTProto download (GramJS)
-src/service.ts     Assistant: message flow, review batches, owner commands
+src/service.ts     Assistant: message flow, file batches and the package, owner commands
 src/handlers.ts    grammY router
 company.md         company profile (fill in)
 templates/         document templates (blank questionnaire uz/ru + template.json)
-laws/              lex.uz summaries used by document checks
+laws/              lex.uz summaries (not used since files are no longer checked)
 tests/             vitest tests
 Dockerfile, railway.json, .dockerignore
 ```

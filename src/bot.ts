@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
@@ -13,10 +12,8 @@ import {
   type Settings,
   settingsFromProcessEnv,
 } from "./config.js";
-import { ClientFolders } from "./clientFolder.js";
-import { Inbox, readLaws, reviewFile } from "./documentReview.js";
 import { ALLOWED_UPDATES, buildComposer } from "./handlers.js";
-import { detectLanguage, type Language, LANGUAGE_NAMES } from "./language.js";
+import { detectLanguage, LANGUAGE_NAMES } from "./language.js";
 import { loadTemplate } from "./templates.js";
 import { buildSystemPrompt, buildUserPrompt, SKIP_TOKEN, splitEscalation, splitTemplate } from "./prompts.js";
 import {
@@ -44,20 +41,18 @@ async function main(): Promise<number> {
         "settings-from-env": { type: "boolean", default: false },
         "check-claude": { type: "boolean", default: false },
         try: { type: "string" },
-        review: { type: "string" },
-        lang: { type: "string" },
       },
       strict: true,
       allowPositionals: false,
     }).values;
   } catch (err) {
     logError(`Invalid arguments: ${errorMessage(err)}`);
-    logError('Usage: bot.js [--settings-from-env] [--check-claude | --try "message" | --review file [--lang uz|ru|en]]');
+    logError('Usage: bot.js [--settings-from-env] [--check-claude | --try "message"]');
     return 2;
   }
 
   const fromEnv = args["settings-from-env"] === true;
-  const needsTelegram = !args["check-claude"] && args.try === undefined && args.review === undefined;
+  const needsTelegram = !args["check-claude"] && args.try === undefined;
 
   let settings: Settings;
   try {
@@ -83,74 +78,7 @@ async function main(): Promise<number> {
 
   if (args["check-claude"]) return checkClaude(settings);
   if (args.try !== undefined) return tryReply(settings, args.try);
-  if (args.review !== undefined) return tryReview(settings, args.review, args.lang);
   return runBot(settings);
-}
-
-/** Checks one local file against the template, as if a client had sent it. Nothing is saved or sent. */
-async function tryReview(settings: Settings, file: string, lang: string | undefined): Promise<number> {
-  const language: Language = lang === "ru" || lang === "en" ? lang : "uz";
-  if (!fs.existsSync(file)) {
-    logError(`Usage: npm run review -- <file> [--lang uz|ru|en] (${file} does not exist)`);
-    return 2;
-  }
-  let template;
-  try {
-    template = loadTemplate(settings.templatesDir);
-  } catch (err) {
-    logError(errorMessage(err));
-    return 2;
-  }
-  // A throwaway client folder outside data/, removed afterwards.
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "review-"));
-  try {
-    const folders = new ClientFolders(path.join(scratch, "clients"), () => Date.now() / 1000);
-    const inbox = new Inbox(folders);
-    const copy = path.join(scratch, "upload");
-    fs.copyFileSync(file, copy);
-    const chat = { target: { kind: "direct" as const }, chatId: 1, chatName: "Test client", language };
-    const entry = inbox.add(chat, copy, path.basename(file), 1, Date.now() / 1000);
-    const verdict = await reviewFile({
-      generator: makeClaudeCli(settings),
-      companyName: settings.companyName,
-      template,
-      laws: readLaws(settings.lawsDir),
-      folders,
-      inbox,
-      userId: 1,
-      file: entry,
-      language,
-      workdir: path.join(scratch, "claude-run"),
-      now: new Date(),
-    });
-    console.log(
-      JSON.stringify(
-        {
-          file: entry.name,
-          verdict: verdict.kind === "unchecked" ? "unchecked" : verdict.accepted.length > 0 ? "accepted" : "rejected",
-          accepted:
-            verdict.kind === "unchecked"
-              ? []
-              : verdict.accepted.map((m) => ({ doc: m.doc.key, parts: m.parts.map((part) => part.key) })),
-          rejected:
-            verdict.kind === "unchecked"
-              ? []
-              : verdict.rejected.map((m) => ({ doc: m.doc.key, parts: m.parts.map((part) => part.key), reasons: m.reasons })),
-          reasons: verdict.kind === "unchecked" ? [] : verdict.reasons,
-          summary: verdict.kind === "unchecked" ? verdict.reason : verdict.summary,
-          applicant: verdict.kind === "unchecked" ? null : verdict.applicant,
-        },
-        null,
-        2,
-      ),
-    );
-    return 0;
-  } catch (err) {
-    logError(`Review failed: ${err instanceof ClaudeError ? err.message : errorMessage(err)}`);
-    return 1;
-  } finally {
-    fs.rmSync(scratch, { recursive: true, force: true });
-  }
 }
 
 async function checkClaude(settings: Settings): Promise<number> {
@@ -274,9 +202,9 @@ async function runBot(settings: Settings): Promise<number> {
   }
   try {
     const template = loadTemplate(settings.templatesDir);
-    log(`Document template: ${template.id} (${template.documents.length} documents)`);
+    log(`Document template: ${template.id} (a package is ${template.documents.filter((d) => d.required).length} files)`);
   } catch (err) {
-    logError(`WARNING: ${errorMessage(err)}. Files that clients send cannot be checked.`);
+    logError(`WARNING: ${errorMessage(err)}. A package is counted as 16 files.`);
   }
   if (assistant.mtproto) {
     // Checked in the background so a slow or failing MTProto login never delays the bot itself.
@@ -292,8 +220,8 @@ async function runBot(settings: Settings): Promise<number> {
     log("Files over 20 MB: off (set TELEGRAM_API_ID and TELEGRAM_API_HASH from my.telegram.org to accept them).");
   }
   const waiting = assistant.inbox.pending();
-  if (waiting.length > 0) log(`Resuming the review of files from ${waiting.length} client(s).`);
-  assistant.resumePendingReviews(bot.api);
+  if (waiting.length > 0) log(`Resuming the files waiting from ${waiting.length} client(s).`);
+  assistant.resumePendingFiles(bot.api);
 
   const runner = run(bot, { runner: { fetch: { allowed_updates: ALLOWED_UPDATES } } });
   let stopping = false;

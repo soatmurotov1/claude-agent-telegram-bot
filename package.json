@@ -13,8 +13,7 @@
     "test": "vitest run",
     "start": "node dist/bot.js",
     "check-claude": "tsx src/bot.ts --check-claude",
-    "try": "tsx src/bot.ts --try",
-    "review": "tsx src/bot.ts --review"
+    "try": "tsx src/bot.ts --try"
   },
   "dependencies": {
     "@grammyjs/runner": "^2.0.3",
