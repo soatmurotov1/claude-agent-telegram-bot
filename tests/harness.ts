@@ -36,6 +36,8 @@ export class RecordingApi {
   readonly calls: ApiCall[] = [];
   connection: BusinessConnection | null = null;
   #nextMessageId = 5000;
+  /** Makes sendMediaGroup fail, to test the one-by-one fallback. */
+  failMediaGroup = false;
 
   install(bot: Bot): void {
     const transformer: Transformer = async (_prev, method, payload) => {
@@ -51,6 +53,18 @@ export class RecordingApi {
         return { ok: true, result: structuredClone(this.connection) };
       }
       return { ok: false, error_code: 400, description: "Bad Request: business connection not found" };
+    }
+    if (method === "sendMediaGroup") {
+      if (this.failMediaGroup) return { ok: false, error_code: 400, description: "Bad Request: album failed" };
+      const media = Array.isArray(payload.media) ? payload.media : [];
+      return {
+        ok: true,
+        result: media.map(() => ({
+          message_id: this.#nextMessageId++,
+          date: 1_800_000_000,
+          chat: { id: Number(payload.chat_id), type: "private", first_name: "Chat" },
+        })),
+      };
     }
     if (method === "sendMessage" || method === "sendDocument") {
       return {
@@ -118,7 +132,28 @@ export class Clock {
   }
 }
 
-/** A review answer as Claude would write it. No `parts` means the file holds every part of the document. */
+/** A review answer in the current form: every listed document the file holds, each with its own verdict. */
+export function verdicts(
+  items: { doc: string; accepted: boolean; parts?: string[]; reasons?: string[] }[],
+  opts: { reasons?: string[]; applicant?: Record<string, unknown> } = {},
+): string {
+  return JSON.stringify({
+    documents: items.map((item) => ({
+      doc: item.doc,
+      parts: item.parts ?? [],
+      verdict: item.accepted ? "accepted" : "rejected",
+      reasons: item.reasons ?? [],
+    })),
+    reasons: opts.reasons ?? [],
+    summary: items.map((item) => item.doc).join(", ") || "file",
+    applicant: opts.applicant ?? null,
+  });
+}
+
+/**
+ * A review answer in the older one-document form, still understood. No `parts` means the file holds every part of
+ * the document.
+ */
 export function verdict(
   doc: string | null,
   accepted: boolean,

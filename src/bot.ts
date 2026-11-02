@@ -127,12 +127,18 @@ async function tryReview(settings: Settings, file: string, lang: string | undefi
       JSON.stringify(
         {
           file: entry.name,
-          verdict: verdict.kind,
-          doc: verdict.kind === "unchecked" ? null : (verdict.doc?.key ?? null),
-          parts: verdict.kind === "unchecked" ? [] : verdict.parts.map((part) => part.key),
-          reasons: verdict.kind === "rejected" ? verdict.reasons : [],
+          verdict: verdict.kind === "unchecked" ? "unchecked" : verdict.accepted.length > 0 ? "accepted" : "rejected",
+          accepted:
+            verdict.kind === "unchecked"
+              ? []
+              : verdict.accepted.map((m) => ({ doc: m.doc.key, parts: m.parts.map((part) => part.key) })),
+          rejected:
+            verdict.kind === "unchecked"
+              ? []
+              : verdict.rejected.map((m) => ({ doc: m.doc.key, parts: m.parts.map((part) => part.key), reasons: m.reasons })),
+          reasons: verdict.kind === "unchecked" ? [] : verdict.reasons,
           summary: verdict.kind === "unchecked" ? verdict.reason : verdict.summary,
-          applicant: verdict.kind === "accepted" ? verdict.applicant : null,
+          applicant: verdict.kind === "unchecked" ? null : verdict.applicant,
         },
         null,
         2,

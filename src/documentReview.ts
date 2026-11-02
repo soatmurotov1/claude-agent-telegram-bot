@@ -176,15 +176,28 @@ export function readLaws(dir: string): string {
   return text.length > MAX_LAWS_CHARS ? text.slice(0, MAX_LAWS_CHARS) : text;
 }
 
-export interface ReviewAnswer {
-  doc: string | null;
-  /** Part keys of `doc` the file contains; never empty when doc is set. */
+/** One listed document Claude found in a file, with its own verdict. */
+export interface ReviewItem {
+  doc: string;
+  /** Part keys of `doc` the file contains; never empty. */
   parts: string[];
   verdict: "accepted" | "rejected";
+  reasons: string[];
+}
+
+export interface ReviewAnswer {
+  /** Every listed document the file holds (one file may hold several, e.g. the charter and the register extract). */
+  items: ReviewItem[];
+  /** Why the file was rejected when it holds none of the listed documents. */
   reasons: string[];
   summary: string;
   applicant: Applicant | null;
 }
+
+const reasonList = (value: unknown): string[] =>
+  Array.isArray(value)
+    ? value.filter((r): r is string => typeof r === "string" && r.trim() !== "").map((r) => r.trim()).slice(0, 5)
+    : [];
 
 export class ReviewParseError extends Error {
   constructor(message: string) {
@@ -205,24 +218,51 @@ export function parseReview(raw: string, template: Template): ReviewAnswer {
     throw new ReviewParseError("the answer is not valid JSON");
   }
   if (!isRecord(data)) throw new ReviewParseError("the answer is not a JSON object");
-  if (data.verdict !== "accepted" && data.verdict !== "rejected") throw new ReviewParseError("verdict is missing");
-  // Claude sometimes names a part ("egrpo") where the document ("ustav_egrpo") is asked for.
-  const named = typeof data.doc === "string" ? data.doc : "";
-  const found =
-    template.documents.find((d) => d.key === named) ??
-    template.documents.find((d) => d.parts.some((part) => part.key === named)) ??
-    null;
-  const doc = found?.key ?? null;
-  const partKeys = new Set(found?.parts.map((part) => part.key) ?? []);
-  let parts = Array.isArray(data.parts)
-    ? [...new Set(data.parts.filter((p): p is string => typeof p === "string" && partKeys.has(p)))]
-    : [];
-  if (found && parts.length === 0) parts = partKeys.has(named) ? [named] : [...partKeys];
-  const reasons = Array.isArray(data.reasons)
-    ? data.reasons.filter((r): r is string => typeof r === "string" && r.trim() !== "").map((r) => r.trim()).slice(0, 5)
-    : [];
+  // {"documents": [{doc, parts, verdict, reasons}, ...]}; the older one-document form {doc, parts, verdict} too.
+  let rawItems: unknown[];
+  if (Array.isArray(data.documents)) rawItems = data.documents;
+  else if (data.verdict === "accepted" || data.verdict === "rejected") rawItems = data.doc == null ? [] : [data];
+  else throw new ReviewParseError("verdict is missing");
+
+  const merged = new Map<string, ReviewItem>();
+  const strayReasons: string[] = [];
+  for (const raw of rawItems) {
+    if (!isRecord(raw)) continue;
+    if (raw.verdict !== "accepted" && raw.verdict !== "rejected") throw new ReviewParseError("a document has no verdict");
+    // Claude sometimes names a part where the document is asked for.
+    const named = typeof raw.doc === "string" ? raw.doc : "";
+    const found =
+      template.documents.find((d) => d.key === named) ??
+      template.documents.find((d) => d.parts.some((part) => part.key === named)) ??
+      null;
+    const reasons = reasonList(raw.reasons);
+    if (!found) {
+      // A file that is none of the listed documents can never be accepted.
+      strayReasons.push(...reasons);
+      continue;
+    }
+    const partKeys = new Set(found.parts.map((part) => part.key));
+    let parts = Array.isArray(raw.parts)
+      ? [...new Set(raw.parts.filter((p): p is string => typeof p === "string" && partKeys.has(p)))]
+      : [];
+    if (parts.length === 0) parts = partKeys.has(named) ? [named] : [...partKeys];
+    const known = merged.get(found.key);
+    if (!known) {
+      merged.set(found.key, { doc: found.key, parts, verdict: raw.verdict, reasons: raw.verdict === "accepted" ? [] : reasons });
+    } else {
+      // The same document named twice: accepted if any mention was, with all parts named.
+      known.parts = [...new Set([...known.parts, ...parts])];
+      if (raw.verdict === "accepted") {
+        known.verdict = "accepted";
+        known.reasons = [];
+      } else if (known.verdict === "rejected") known.reasons = [...known.reasons, ...reasons].slice(0, 5);
+    }
+  }
+  const items = [...merged.values()];
+  const topReasons = Array.isArray(data.documents) || data.doc == null ? reasonList(data.reasons) : [];
+  const reasons = [...topReasons, ...strayReasons].slice(0, 5);
   let applicant: Applicant | null = null;
-  if (doc === "anketa" && isRecord(data.applicant)) {
+  if (items.some((item) => item.doc === "anketa" && item.verdict === "accepted") && isRecord(data.applicant)) {
     const { company, direction, na_items: naItems } = data.applicant;
     applicant = {
       company: typeof company === "string" ? company.trim() : "",
@@ -230,12 +270,8 @@ export function parseReview(raw: string, template: Template): ReviewAnswer {
       naItems: Array.isArray(naItems) ? naItems.filter((n): n is number => Number.isInteger(n) && n >= 1 && n <= 10) : [],
     };
   }
-  // A file that is none of the listed documents can never be accepted.
-  const verdict = doc === null ? "rejected" : data.verdict;
   return {
-    doc,
-    parts,
-    verdict,
+    items,
     reasons,
     summary: typeof data.summary === "string" ? data.summary.trim() : "",
     applicant,
@@ -311,10 +347,33 @@ function toInbox(value: unknown): InboxData | null {
   return { chat: toChat(value.chat), files };
 }
 
+/** A listed document found in a file, with the parts it holds and, when rejected, why. */
+export interface DocMatch {
+  doc: TemplateDoc;
+  parts: TemplatePart[];
+  reasons: string[];
+}
+
+/**
+ * The result of checking one file. A reviewed file may hold several listed documents: each is accepted or rejected
+ * on its own. When it holds none of them, `accepted` and `rejected` are empty and `reasons` says why.
+ */
 export type FileVerdict =
-  | { kind: "accepted"; file: InboxFile; doc: TemplateDoc; parts: TemplatePart[]; summary: string; applicant: Applicant | null }
-  | { kind: "rejected"; file: InboxFile; doc: TemplateDoc | null; parts: TemplatePart[]; reasons: string[]; summary: string }
+  | {
+      kind: "reviewed";
+      file: InboxFile;
+      accepted: DocMatch[];
+      rejected: DocMatch[];
+      reasons: string[];
+      summary: string;
+      applicant: Applicant | null;
+    }
   | { kind: "unchecked"; file: InboxFile; reason: string };
+
+/** A file rejected as a whole (unsupported format, unreadable, not checked), not matched to any document. */
+export function rejectedFile(file: InboxFile, reasons: string[], summary = ""): FileVerdict {
+  return { kind: "reviewed", file, accepted: [], rejected: [], reasons, summary, applicant: null };
+}
 
 /**
  * Files a client sent that wait for review, in data/clients/<id>/inbox/. They survive restarts, and a batch that
@@ -409,26 +468,17 @@ export async function reviewFile(opts: {
   const { generator, template, folders, inbox, userId, file, language } = opts;
   const source = inbox.path(userId, file);
   const kind = fileKind(file.name);
-  if (kind === "unsupported") {
-    return { kind: "rejected", file, doc: null, parts: [], reasons: [UNSUPPORTED_REASON[language]], summary: "" };
-  }
+  if (kind === "unsupported") return rejectedFile(file, [UNSUPPORTED_REASON[language]]);
 
   let text: string | null;
   try {
     text = await extractText(source, kind);
   } catch (err) {
-    return {
-      kind: "rejected",
-      file,
-      doc: null,
-      parts: [],
-      reasons: [UNREADABLE_REASON[language]],
-      summary: err instanceof Error ? err.message : "",
-    };
+    return rejectedFile(file, [UNREADABLE_REASON[language]], err instanceof Error ? err.message : "");
   }
 
   const status = folders.status(userId);
-  const accepted = Object.values(status.docs).flatMap((record) =>
+  const acceptedParts = Object.values(status.docs).flatMap((record) =>
     Object.entries(record.parts)
       .filter(([, part]) => part.state === "accepted")
       .map(([key]) => key),
@@ -439,7 +489,7 @@ export async function reviewFile(opts: {
   if (text !== null) {
     raw = await generator.generate(
       system,
-      buildReviewUserPrompt({ name: file.name, text, workName: null }, { company: status.applicant?.company ?? "", accepted }, language),
+      buildReviewUserPrompt({ name: file.name, text, workName: null }, { company: status.applicant?.company ?? "", accepted: acceptedParts }, language),
     );
   } else {
     if (!generator.review) return { kind: "unchecked", file, reason: "this generator cannot open files" };
@@ -452,7 +502,7 @@ export async function reviewFile(opts: {
       fs.copyFileSync(source, path.join(dir, workName));
       raw = await generator.review(
         system,
-        buildReviewUserPrompt({ name: file.name, text: null, workName }, { company: status.applicant?.company ?? "", accepted }, language),
+        buildReviewUserPrompt({ name: file.name, text: null, workName }, { company: status.applicant?.company ?? "", accepted: acceptedParts }, language),
         dir,
       );
     } finally {
@@ -466,13 +516,19 @@ export async function reviewFile(opts: {
   } catch (err) {
     return { kind: "unchecked", file, reason: err instanceof Error ? err.message : String(err) };
   }
-  const doc = answer.doc === null ? null : (template.documents.find((d) => d.key === answer.doc) ?? null);
-  const parts = doc ? doc.parts.filter((part) => answer.parts.includes(part.key)) : [];
-  if (doc && answer.verdict === "accepted") {
-    return { kind: "accepted", file, doc, parts, summary: answer.summary, applicant: answer.applicant };
+  const accepted: DocMatch[] = [];
+  const rejected: DocMatch[] = [];
+  // Template order, so the summary lists documents by their numbers.
+  for (const doc of template.documents) {
+    const item = answer.items.find((i) => i.doc === doc.key);
+    if (!item) continue;
+    const match: DocMatch = { doc, parts: doc.parts.filter((part) => item.parts.includes(part.key)), reasons: item.reasons };
+    (item.verdict === "accepted" ? accepted : rejected).push(match);
   }
-  const reasons = answer.reasons.length > 0 ? answer.reasons : doc === null ? [NOT_LISTED_REASON[language]] : [];
-  return { kind: "rejected", file, doc, parts, reasons, summary: answer.summary };
+  const reasons =
+    answer.reasons.length > 0 ? answer.reasons : accepted.length + rejected.length === 0 ? [NOT_LISTED_REASON[language]] : [];
+  const applicant = accepted.some((m) => m.doc.key === "anketa") ? answer.applicant : null;
+  return { kind: "reviewed", file, accepted, rejected, reasons, summary: answer.summary, applicant };
 }
 
 const UNSUPPORTED_REASON: Record<Language, string> = {

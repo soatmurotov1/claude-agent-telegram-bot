@@ -57,7 +57,7 @@ Common to both:
 | Someone writes to the bot directly | Claude answers from `company.md` (sent only with `AUTO_SEND=true`); the admin gets no copy |
 | A client sends files or photos (also 10-50 at once) | Collected for `REVIEW_BATCH_SECONDS` (15 s) after the last one, then each is checked against the template; one summary goes to the client. The admin gets nothing until the package is complete |
 | A file cannot be checked (bad JSON from Claude, CLI error) | Kept in the inbox and checked again after `REVIEW_RETRY_SECONDS` (5 min), at most `MAX_REVIEW_ATTEMPTS` (3) times; then the client is asked to send a PDF or a clearer scan |
-| All 5 documents sent and accepted | The admin gets one 🎉 message with the status and the whole package (every accepted file, by `file_id`, so any size); a newer accepted copy later is sent as 🔄 update |
+| All 16 documents sent and accepted (however long it takes) | The admin gets one 🎉 message with the status, then the whole package in albums of up to 10 files (by `file_id`, so any size); a newer accepted copy later is sent as 🔄 update |
 | A file is larger than 20 MB | Downloaded over MTProto when `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` are set (up to `MAX_FILE_MB`, default and maximum 2000); otherwise the client is asked to compress or split it |
 | Client writes "holat" / "статус" / presses 📊 | Their document status, without Claude |
 | Client writes "anketa" / "анкета" / presses 📄, or Claude adds `[SEND_TEMPLATE]` | The blank questionnaire is sent (Russian for Russian and English speakers) |
@@ -96,22 +96,43 @@ Anyone else who sends `/start` gets a short Uzbek welcome and a keyboard with **
 
 The documents asked for are defined in [`templates/investment-checklist/template.json`](templates/investment-checklist/template.json),
 taken from the company's express questionnaire «Инвестициялар учун объект тайёргарлигининг экспресс-анкетаси»
-(`uz.docx`) / «Экспресс-анкета готовности объекта к инвестициям» (`ru.docx`). The client is asked for the
-**5 documents of step 3** of the questionnaire; each percentage step is one of them (20%):
+(`uz.docx`) / «Экспресс-анкета готовности объекта к инвестициям» (`ru.docx`). The client is asked for
+**16 documents, all required** (no "NA" exemptions); each percentage step is one of them (≈ 6%):
 
-| # | Document key | Parts (one file, or one file per part) | Part not needed when the questionnaire marks item NA |
-| --- | --- | --- | --- |
-| 1 | `ustav_egrpo` | `ustav` charter, `egrpo` register extract (≤ 3 months old) | 1, 2 |
-| 2 | `ruxsatnoma_kelishuv` | `ruxsatnoma` subsoil use permit, `kelishuv` licence agreement (resolution No. 133) | 3, 3 |
-| 3 | `loyiha_5gr` | `loyiha` project documents (UTER, TEO, mining allotment), `5gr` proof of form 5-GR | 5, 6 |
-| 4 | `ekologik_paket` | `ekologiya` ZVOS/ZEP, PDV, limits, environmental review conclusion | 7 |
-| 5 | `epb_yer` | `epb` industrial safety review reports, `yer` land allotment decision | 8, 9 |
-| – | `anketa` (optional) | The filled-in questionnaire with the signed NDA; not counted, gives the company name and NA items | – |
+| # | Key | Document |
+| --- | --- | --- |
+| 1 | `ustav` | Company charter |
+| 2 | `egrpo` | Extract from the state register (ЕГРПО), ≤ 3 months old |
+| 3 | `ruxsatnoma` | Electronic subsoil use permit |
+| 4 | `litsenziya` | Electronic subsoil use licence |
+| 5 | `kelishuv` | Licence agreement (shartnoma) under resolution No. 133 |
+| 6 | `uter` | UTER (УТЭР) |
+| 7 | `tia` | Feasibility study (TIA / ТЭО) |
+| 8 | `tog_ajratmasi` | Mining allotment project |
+| 9 | `forma_5gr` | Proof that form 5-GR was submitted |
+| 10 | `zvos` | Environmental package: ZVOS |
+| 11 | `zep` | Environmental package: ZEP |
+| 12 | `pdv` | Environmental package: PDV |
+| 13 | `limitlar` | Environmental package: limits |
+| 14 | `epb` | Industrial safety expert review (EPB) reports for hazardous facilities (OPO) |
+| 15 | `yer` | Land allotment decisions |
+| 16 | `anketa` | The filled-in questionnaire with the signed non-disclosure agreement (NDA); also gives the company name |
 
-A document is ✅ when all its needed parts are accepted, 🟡 when only some are, ❌ when a part was rejected.
-The owner is sent nothing while the package is incomplete. When every required document has been sent and
-accepted, the owner gets a 🎉 message once with the status and all accepted files (sent by Telegram `file_id`, so
-files over 50 MB need no re-upload). The 📎 button in the client's folder sends the accepted files at any time.
+Each document may come as its own file, or several documents in one file (for example the charter and the register
+extract in one PDF): Claude lists every document it finds in a file and accepts or rejects each one on its own. A
+file that holds several documents is saved once and hard-linked into each document's folder.
+
+A document is ✅ when accepted, ❌ when rejected, ⬜ when not sent yet. The client may take minutes or days: the owner
+is sent nothing while the package is incomplete. When all 16 have been sent and accepted, the owner gets **one 🎉
+message** with the status, then the whole package in **albums of up to 10 files** (Telegram's limit; 16 files → 10 + 6),
+each file captioned with the documents it holds. Files go by Telegram `file_id`, so files over 50 MB need no
+re-upload; if an album fails, its files are sent one by one. A newer accepted copy later is sent as 🔄 update. The 📎
+button in the client's folder sends the package (latest accepted file per document) at any time. If the template's
+list of required documents changes, a package completed under the old list is announced again once the new list is
+complete.
+
+To make a document optional again, add `"required": false` to it in `template.json`; to exempt it when the
+questionnaire marks an item "NA", put the item numbers into its part's `naItems`.
 
 How a file is checked (`src/documentReview.ts`):
 
@@ -121,13 +142,13 @@ How a file is checked (`src/documentReview.ts`):
    file, with `--tools Read --restricted --allowedTools Read --permission-prompts none`, so it can read nothing
    else. Other formats (DOC, ZIP …) are rejected with a request for PDF/DOCX/XLSX/JPG/PNG.
 3. Claude gets the template (each part's acceptance checks), the summaries in [`laws/`](laws/), the company
-   from the accepted questionnaire and the file, and answers with JSON: which document and which of its parts the
-   file holds, accepted or rejected, reasons in the client's language.
+   from the accepted questionnaire and the file, and answers with JSON: every listed document the file holds, each
+   accepted or rejected, reasons in the client's language.
 4. Accepted → `accepted/<key>/`; rejected → `rejected/` with `reasons.jsonl`. A later wrong
-   copy never undoes an accepted part. The accepted questionnaire also records the company and the items marked "NA".
-5. Progress = accepted / 5 required documents (minus those whose parts are all NA):
-   `Tayyor 60% (3/5) · Xato 20% (1) · Yetishmaydi 20% (1)` and one numbered line per document with ✅ 🟡 ❌ ⬜ ➖,
-   the reasons and the parts still missing.
+   copy never undoes an accepted document. The accepted questionnaire also records the company.
+5. Progress = accepted / 16 required documents:
+   `Tayyor 50% (8/16) · Xato 6% (1) · Yetishmaydi 44% (7)` and one numbered line per document with ✅ ❌ ⬜,
+   and the reasons.
 
 To add a document or change a check, edit `template.json` (read fresh for every file) and push. A new template
 goes into its own folder with the same layout; `DEFAULT_TEMPLATE_ID` in `src/templates.ts` picks the active one.
