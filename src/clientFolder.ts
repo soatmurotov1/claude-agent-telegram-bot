@@ -2,143 +2,73 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Language } from "./language.js";
 import { appendJsonl, type Clock, ensurePrivateDir, isRecord, JsonFile } from "./store.js";
-import type { Template, TemplateDoc, TemplatePart } from "./templates.js";
 
-/** "partial": some parts of the document were accepted, the others have not been sent yet. */
-export type DocState = "accepted" | "rejected" | "partial" | "missing" | "na";
-
-export interface PartRecord {
-  state: "accepted" | "rejected";
-  /** Why the latest file for this part was rejected; empty once it is accepted. */
-  reasons: string[];
+/** One file a client sent, as saved in their folder. Files are not checked: they are only counted and passed on. */
+export interface ReceivedFile {
+  /** Path inside the client folder, e.g. "received/20261102-114700_Ustav.pdf". */
+  path: string;
+  /** The name the client gave it. */
+  name: string;
+  /** Telegram file_id, so the file can be passed on without uploading it again (any size). */
+  fileId?: string;
   ts: number;
 }
 
-export interface DocRecord {
-  /** Accepted file names under accepted/<doc key>/, oldest first. */
-  files: string[];
-  /** Telegram file_id per accepted file name, to pass files on without uploading them (no 50 MB upload limit). */
-  fileIds: Record<string, string>;
-  parts: Record<string, PartRecord>;
-}
-
-export interface AcceptedFile {
-  docKey: string;
-  /** Absolute path of the saved copy. */
-  file: string;
-  /** The name the client gave it. */
-  name: string;
-  /** The saved name (time stamp + name); the same for every document one file was accepted for. */
-  saved: string;
-  fileId?: string;
-}
-
-/** One file of the package for the owner, with every document it was accepted for (one file may hold several). */
+/** A received file with its absolute path, ready to be sent. */
 export interface PackageFile {
-  docKeys: string[];
+  /** 1-based number of the file in the order the client sent it. */
+  number: number;
   file: string;
   name: string;
   fileId?: string;
-}
-
-/** The documents (and their parts) one file was found to contain. */
-export interface DocParts {
-  docKey: string;
-  partKeys: readonly string[];
-}
-
-/** What the accepted questionnaire said about the client, used to check the other documents. */
-export interface Applicant {
-  company: string;
-  direction: string;
-  /** Questionnaire items (1-10) marked "not applicable". */
-  naItems: number[];
 }
 
 export interface ClientStatus {
-  template: string;
-  applicant: Applicant | null;
-  docs: Record<string, DocRecord>;
-  /** When every required document was first accepted (the owner is told once), or null. */
-  completedAt: number | null;
-  /**
-   * The required document keys the package was complete for. When the template's list changes (for example from
-   * 5 to 16 documents), an earlier completion no longer counts and the owner is told again once the new list is done.
-   */
-  completedFor: string;
+  /** Every file the client sent, oldest first. */
+  received: ReceivedFile[];
+  /** When the whole package went to the owner (once), or null. */
+  packageSentAt: number | null;
 }
 
-export interface ProgressItem {
-  doc: TemplateDoc;
-  state: DocState;
-  /** Rejected parts not accepted since, with the reasons. */
-  rejectedParts: { part: TemplatePart; reasons: string[] }[];
-  /** Required parts not accepted yet. */
-  missingParts: TemplatePart[];
+function toReceived(value: unknown): ReceivedFile | null {
+  if (!isRecord(value) || typeof value.path !== "string" || typeof value.name !== "string") return null;
+  const file: ReceivedFile = { path: value.path, name: value.name, ts: typeof value.ts === "number" ? value.ts : 0 };
+  if (typeof value.fileId === "string") file.fileId = value.fileId;
+  return file;
 }
 
-export interface Progress {
-  /** Required documents still needed (not optional, not marked "not applicable"). */
-  total: number;
-  accepted: number;
-  rejected: number;
-  /** Not sent yet or only partly sent. */
-  missing: number;
-  readyPct: number;
-  errorPct: number;
-  missingPct: number;
-  /** Required documents first, then optional ones (the questionnaire). */
-  items: ProgressItem[];
+/**
+ * Files of the earlier layout, when the bot checked every file: accepted/<doc>/<name> listed per document in
+ * status.json. They count as received; a file that held several documents is counted once.
+ */
+function fromCheckedLayout(docs: unknown): ReceivedFile[] {
+  if (!isRecord(docs)) return [];
+  const out: ReceivedFile[] = [];
+  const seen = new Set<string>();
+  for (const [docKey, record] of Object.entries(docs)) {
+    if (!isRecord(record) || !Array.isArray(record.files)) continue;
+    const fileIds = isRecord(record.fileIds) ? record.fileIds : {};
+    for (const saved of record.files) {
+      if (typeof saved !== "string" || seen.has(saved)) continue;
+      seen.add(saved);
+      const fileId = fileIds[saved];
+      out.push({
+        path: path.join("accepted", docKey, saved),
+        name: saved.replace(/^\d{8}-\d{6}_/, ""),
+        ts: 0,
+        ...(typeof fileId === "string" ? { fileId } : {}),
+      });
+    }
+  }
+  return out;
 }
-
-const stringList = (value: unknown): string[] =>
-  Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
 
 function toStatus(value: unknown): ClientStatus | null {
   if (!isRecord(value)) return null;
-  const docs: Record<string, DocRecord> = {};
-  if (isRecord(value.docs)) {
-    for (const [key, raw] of Object.entries(value.docs)) {
-      // Records without parts come from an older template layout and are dropped.
-      if (!isRecord(raw) || !isRecord(raw.parts)) continue;
-      const parts: Record<string, PartRecord> = {};
-      for (const [partKey, part] of Object.entries(raw.parts)) {
-        if (!isRecord(part) || (part.state !== "accepted" && part.state !== "rejected")) continue;
-        parts[partKey] = { state: part.state, reasons: stringList(part.reasons), ts: typeof part.ts === "number" ? part.ts : 0 };
-      }
-      const fileIds: Record<string, string> = {};
-      if (isRecord(raw.fileIds)) {
-        for (const [name, id] of Object.entries(raw.fileIds)) if (typeof id === "string") fileIds[name] = id;
-      }
-      docs[key] = { files: stringList(raw.files), fileIds, parts };
-    }
-  }
-  let applicant: Applicant | null = null;
-  if (isRecord(value.applicant)) {
-    const { company, direction, naItems } = value.applicant;
-    applicant = {
-      company: typeof company === "string" ? company : "",
-      direction: typeof direction === "string" ? direction : "",
-      naItems: Array.isArray(naItems) ? naItems.filter((n): n is number => Number.isInteger(n)) : [],
-    };
-  }
-  return {
-    template: typeof value.template === "string" ? value.template : "",
-    applicant,
-    docs,
-    completedAt: typeof value.completedAt === "number" ? value.completedAt : null,
-    completedFor: typeof value.completedFor === "string" ? value.completedFor : "",
-  };
-}
-
-/** Hard-links a saved file (no extra disk space for a file that holds several documents), or copies it. */
-function linkOrCopy(source: string, target: string): void {
-  try {
-    fs.linkSync(source, target);
-  } catch {
-    fs.copyFileSync(source, target);
-    fs.chmodSync(target, 0o600);
-  }
+  const received = Array.isArray(value.received)
+    ? value.received.map(toReceived).filter((f): f is ReceivedFile => f !== null)
+    : fromCheckedLayout(value.docs);
+  return { received, packageSentAt: typeof value.packageSentAt === "number" ? value.packageSentAt : null };
 }
 
 /** A file name that is safe on every file system, keeping letters of any script. */
@@ -181,9 +111,9 @@ function chatTime(epochSeconds: number): string {
 /**
  * One folder per client under data/clients/<userId>/:
  *   chat.txt            the whole conversation as plain text
- *   accepted/<doc>/     files that passed the template check
- *   rejected/           files that did not, with rejected/reasons.jsonl
- *   status.json         per-document state for the progress figures
+ *   received/           every file the client sent (not checked)
+ *   refused.jsonl       files that could not be taken (too large, download failed)
+ *   status.json         the received files and whether the package went to the owner
  * Folders are kept until the owner deletes the chat; HISTORY_TTL_DAYS does not apply to them.
  */
 export class ClientFolders {
@@ -233,7 +163,7 @@ export class ClientFolders {
   #statusFile(userId: number): JsonFile<ClientStatus> {
     return new JsonFile<ClientStatus>(
       path.join(this.dir(userId), "status.json"),
-      () => ({ template: "", applicant: null, docs: {}, completedAt: null, completedFor: "" }),
+      () => ({ received: [], packageSentAt: null }),
       toStatus,
     );
   }
@@ -251,150 +181,47 @@ export class ClientFolders {
     return status;
   }
 
-  setApplicant(userId: number, templateId: string, applicant: Applicant): void {
+  /** Copies a file the client sent into received/ and counts it. Returns its number (1-based). */
+  receive(userId: number, source: string, originalName: string, fileId?: string): number {
+    const dir = this.#ensure(userId, "received");
+    let name = `${stamp(this.clock())}_${safeFileName(originalName)}`;
+    // Two files with the same name in the same second.
+    for (let i = 2; fs.existsSync(path.join(dir, name)); i++) name = `${stamp(this.clock())}-${i}_${safeFileName(originalName)}`;
+    const target = path.join(dir, name);
+    fs.copyFileSync(source, target);
+    fs.chmodSync(target, 0o600);
+    let count = 0;
     this.#update(userId, (status) => {
-      status.template = templateId;
-      status.applicant = applicant;
+      status.received.push({ path: path.join("received", name), name: originalName, ts: this.clock(), ...(fileId ? { fileId } : {}) });
+      count = status.received.length;
     });
+    return count;
   }
 
-  /**
-   * Saves an accepted file under accepted/<docKey>/ for every document it holds (one copy, hard-linked into the
-   * other folders) and marks those parts accepted. Returns the saved path (in the first document's folder).
-   */
-  accept(
-    userId: number,
-    templateId: string,
-    docs: readonly DocParts[],
-    source: string,
-    originalName: string,
-    fileId?: string,
-  ): string {
-    if (docs.length === 0) throw new Error("accept() needs at least one document");
-    const name = `${stamp(this.clock())}_${safeFileName(originalName)}`;
-    let first: string | null = null;
-    for (const { docKey } of docs) {
-      const target = path.join(this.#ensure(userId, "accepted", docKey), name);
-      if (first === null) {
-        fs.copyFileSync(source, target);
-        fs.chmodSync(target, 0o600);
-        first = target;
-      } else if (!fs.existsSync(target)) {
-        linkOrCopy(first, target);
-      }
-    }
-    this.#update(userId, (status) => {
-      status.template = templateId;
-      for (const { docKey, partKeys } of docs) {
-        const record = status.docs[docKey] ?? { files: [], fileIds: {}, parts: {} };
-        if (!record.files.includes(name)) record.files.push(name);
-        if (fileId) record.fileIds[name] = fileId;
-        for (const part of partKeys) record.parts[part] = { state: "accepted", reasons: [], ts: this.clock() };
-        status.docs[docKey] = record;
-      }
-    });
-    return first ?? "";
+  /** Remembers a file that could not be taken (too large, download failed), with the reason. */
+  refuse(userId: number, originalName: string, reason: string): void {
+    this.#ensure(userId);
+    appendJsonl(path.join(this.dir(userId), "refused.jsonl"), { ts: this.clock(), original: originalName, reason });
   }
 
-  /**
-   * Remembers that every required document (`requiredKeys`) has been accepted. Returns true the first time for
-   * this list of documents, so the owner is told once, and again only if the template's list changes.
-   */
-  markComplete(userId: number, requiredKeys: readonly string[]): boolean {
-    const signature = [...requiredKeys].sort().join(",");
+  /** Remembers that the whole package went to the owner. Returns true the first time only. */
+  markPackageSent(userId: number): boolean {
     let first = false;
     this.#update(userId, (status) => {
-      if (status.completedAt !== null && status.completedFor === signature) return;
-      status.completedAt = this.clock();
-      status.completedFor = signature;
+      if (status.packageSentAt !== null) return;
+      status.packageSentAt = this.clock();
       first = true;
     });
     return first;
   }
 
-  /**
-   * Copies a rejected file to rejected/ with its reasons and marks the parts of `docs` rejected, each with its own
-   * reasons. A part that was already accepted stays accepted: a later wrong copy does not undo a good one. `docs`
-   * is empty for files that match no listed document; `reasons` then says why.
-   */
-  reject(
-    userId: number,
-    templateId: string,
-    docs: readonly (DocParts & { reasons: string[] })[],
-    source: string | null,
-    originalName: string,
-    reasons: string[],
-  ): void {
-    const dir = this.#ensure(userId, "rejected");
-    const name = `${stamp(this.clock())}_${safeFileName(originalName)}`;
-    if (source) {
-      const target = path.join(dir, name);
-      if (!fs.existsSync(target)) linkOrCopy(source, target);
-    }
-    appendJsonl(path.join(dir, "reasons.jsonl"), {
-      ts: this.clock(),
-      file: source ? name : null,
-      original: originalName,
-      docs: docs.map(({ docKey, partKeys, reasons: own }) => ({ doc: docKey, parts: partKeys, reasons: own })),
-      reasons,
+  /** The received files that still exist on disk, numbered in the order the client sent them. */
+  receivedFiles(userId: number): PackageFile[] {
+    return this.status(userId).received.flatMap((entry, i): PackageFile[] => {
+      const file = path.join(this.dir(userId), entry.path);
+      if (!fs.existsSync(file)) return [];
+      return [{ number: i + 1, file, name: entry.name, ...(entry.fileId ? { fileId: entry.fileId } : {}) }];
     });
-    const marked = docs.filter((doc) => doc.partKeys.length > 0);
-    if (marked.length === 0) return;
-    this.#update(userId, (status) => {
-      status.template = templateId;
-      for (const { docKey, partKeys, reasons: own } of marked) {
-        const record = status.docs[docKey] ?? { files: [], fileIds: {}, parts: {} };
-        for (const part of partKeys) {
-          if (record.parts[part]?.state === "accepted") continue;
-          record.parts[part] = { state: "rejected", reasons: own.length ? own : reasons, ts: this.clock() };
-        }
-        status.docs[docKey] = record;
-      }
-    });
-  }
-
-  /**
-   * The package for the owner: the latest accepted file of every document in `order` (template order), a file that
-   * holds several documents only once, with all of them.
-   */
-  packageFiles(userId: number, order: readonly string[]): PackageFile[] {
-    const latest = new Map<string, AcceptedFile>();
-    for (const file of this.acceptedFiles(userId, order)) {
-      if (order.includes(file.docKey)) latest.set(file.docKey, file);
-    }
-    const out: PackageFile[] = [];
-    const bySaved = new Map<string, PackageFile>();
-    for (const key of order) {
-      const file = latest.get(key);
-      if (!file) continue;
-      const known = bySaved.get(file.saved);
-      if (known) {
-        known.docKeys.push(key);
-        continue;
-      }
-      const entry: PackageFile = { docKeys: [key], file: file.file, name: file.name, ...(file.fileId ? { fileId: file.fileId } : {}) };
-      bySaved.set(file.saved, entry);
-      out.push(entry);
-    }
-    return out;
-  }
-
-  /** Accepted files, grouped by document in `order` (template order), then any others. */
-  acceptedFiles(userId: number, order: readonly string[] = []): AcceptedFile[] {
-    const status = this.status(userId);
-    const keys = [...order.filter((key) => key in status.docs), ...Object.keys(status.docs).filter((k) => !order.includes(k))];
-    const out: AcceptedFile[] = [];
-    for (const docKey of keys) {
-      const record = status.docs[docKey];
-      if (!record) continue;
-      for (const saved of record.files) {
-        const file = path.join(this.dir(userId), "accepted", docKey, saved);
-        if (!fs.existsSync(file)) continue;
-        const fileId = record.fileIds[saved];
-        out.push({ docKey, file, name: saved.replace(/^\d{8}-\d{6}_/, ""), saved, ...(fileId ? { fileId } : {}) });
-      }
-    }
-    return out;
   }
 
   /** Removes the whole client folder. Returns true when there was one. */
@@ -406,134 +233,45 @@ export class ClientFolders {
   }
 }
 
-/** Whether a part is not needed because the questionnaire marked all its items "not applicable". */
-export function isNotApplicable(part: TemplatePart, applicant: Applicant | null): boolean {
-  if (!applicant || part.naItems.length === 0) return false;
-  return part.naItems.every((item) => applicant.naItems.includes(item));
-}
-
-/** The state of one document from the states of its required parts. */
-export function docProgress(doc: TemplateDoc, status: ClientStatus): ProgressItem {
-  const needed = doc.parts.filter((part) => !isNotApplicable(part, status.applicant));
-  if (needed.length === 0) return { doc, state: "na", rejectedParts: [], missingParts: [] };
-  const parts = status.docs[doc.key]?.parts ?? {};
-  const accepted = needed.filter((part) => parts[part.key]?.state === "accepted");
-  const rejectedParts = needed
-    .filter((part) => parts[part.key]?.state === "rejected")
-    .map((part) => ({ part, reasons: parts[part.key]?.reasons ?? [] }));
-  const missingParts = needed.filter((part) => parts[part.key]?.state !== "accepted");
-  let state: DocState = "missing";
-  if (accepted.length === needed.length) state = "accepted";
-  else if (rejectedParts.length > 0) state = "rejected";
-  else if (accepted.length > 0) state = "partial";
-  return { doc, state, rejectedParts, missingParts };
-}
-
-export function progress(status: ClientStatus, template: Template): Progress {
-  const required = template.documents.filter((doc) => doc.required).map((doc) => docProgress(doc, status));
-  const optional = template.documents.filter((doc) => !doc.required).map((doc) => docProgress(doc, status));
-  const count = (...states: DocState[]): number => required.filter((item) => states.includes(item.state)).length;
-  const accepted = count("accepted");
-  const rejected = count("rejected");
-  const missing = count("missing", "partial");
-  const total = accepted + rejected + missing;
-  const readyPct = total === 0 ? 100 : Math.round((accepted / total) * 100);
-  const errorPct = total === 0 ? 0 : Math.round((rejected / total) * 100);
-  return {
-    total,
-    accepted,
-    rejected,
-    missing,
-    readyPct,
-    errorPct,
-    missingPct: Math.max(0, 100 - readyPct - errorPct),
-    items: [...required, ...optional],
-  };
-}
-
-const PROGRESS_WORDS: Record<
+const STATUS_WORDS: Record<
   Language,
-  {
-    title: string;
-    ready: string;
-    errors: string;
-    missing: string;
-    na: string;
-    stillMissing: string;
-    optional: string;
-    fix: string;
-    next: string;
-    done: string;
-  }
+  { title: string; received: (n: number, total: number) => string; more: (n: number) => string; done: string; list: string }
 > = {
   uz: {
     title: "📊 Hujjatlar holati",
-    ready: "Tayyor",
-    errors: "Xato",
-    missing: "Yetishmaydi",
-    na: "kerak emas",
-    stillMissing: "yetishmaydi",
-    optional: "ixtiyoriy",
-    fix: "Xato hujjatlarni tuzatib, qayta yuboring.",
-    next: "Qolgan hujjatlarni shu chatga fayl qilib yuboring.",
-    done: "Barcha hujjatlar qabul qilindi va mutaxassisimizga yuborildi.",
+    received: (n, total) => `Qabul qilingan fayllar: ${n}/${total}`,
+    more: (n) => `Yana ${n} ta fayl yuboring.`,
+    done: "Barcha fayllar qabul qilindi va mutaxassisimizga yuborildi.",
+    list: "Kerakli hujjatlar:",
   },
   ru: {
     title: "📊 Статус документов",
-    ready: "Готово",
-    errors: "С ошибками",
-    missing: "Не хватает",
-    na: "не требуется",
-    stillMissing: "не хватает",
-    optional: "по желанию",
-    fix: "Исправьте документы с ошибками и отправьте их ещё раз.",
-    next: "Остальные документы отправьте файлами в этот чат.",
-    done: "Все документы приняты и переданы нашему специалисту.",
+    received: (n, total) => `Получено файлов: ${n}/${total}`,
+    more: (n) => `Отправьте ещё ${n}.`,
+    done: "Все файлы получены и переданы нашему специалисту.",
+    list: "Нужные документы:",
   },
   en: {
     title: "📊 Document status",
-    ready: "Ready",
-    errors: "With errors",
-    missing: "Missing",
-    na: "not needed",
-    stillMissing: "missing",
-    optional: "optional",
-    fix: "Please correct the documents with errors and send them again.",
-    next: "Please send the remaining documents as files in this chat.",
-    done: "All documents have been accepted and passed to our specialist.",
+    received: (n, total) => `Files received: ${n}/${total}`,
+    more: (n) => `Please send ${n} more.`,
+    done: "All files have been received and passed to our specialist.",
+    list: "Documents needed:",
   },
 };
 
-/** The client-facing progress message: percentages and one numbered line per required document. */
-export function progressText(p: Progress, language: Language | null): string {
-  const lang = language ?? "uz";
-  const w = PROGRESS_WORDS[lang];
-  const lines = [
-    w.title,
-    `${w.ready}: ${p.readyPct}% (${p.accepted}/${p.total}) · ${w.errors}: ${p.errorPct}% (${p.rejected}) · ` +
-      `${w.missing}: ${p.missingPct}% (${p.missing})`,
-    "",
-  ];
-  let n = 0;
-  for (const item of p.items) {
-    const title = item.doc.required ? `${++n}. ${item.doc.title[lang]}` : `${item.doc.title[lang]} (${w.optional})`;
-    const several = item.doc.parts.length > 1;
-    const reasons = item.rejectedParts.flatMap(({ part, reasons: list }) =>
-      several ? list.map((reason) => `${part.title[lang]}: ${reason}`) : list,
-    );
-    const missing = item.missingParts.filter((part) => !item.rejectedParts.some((r) => r.part.key === part.key));
-    const missingText = several && missing.length ? ` — ${w.stillMissing}: ${missing.map((part) => part.title[lang]).join(", ")}` : "";
-    if (item.state === "accepted") lines.push(`✅ ${title}`);
-    else if (item.state === "na") lines.push(`➖ ${title} (${w.na})`);
-    else if (item.state === "missing") lines.push(`⬜ ${title}`);
-    else if (item.state === "partial") lines.push(`🟡 ${title}${missingText}`);
-    else lines.push(`❌ ${title}${reasons.length ? `: ${reasons.join("; ")}` : ""}${missingText}`);
+/**
+ * The client-facing status: how many files arrived out of how many are needed, and the list of documents as a
+ * reminder (files are not checked, so the list has no ticks).
+ */
+export function statusText(received: number, total: number, titles: readonly string[], language: Language | null): string {
+  const w = STATUS_WORDS[language ?? "uz"];
+  const lines = [w.title, w.received(Math.min(received, total), total), ""];
+  if (received >= total) {
+    lines.push(w.done);
+  } else {
+    lines.push(w.more(total - received));
+    if (titles.length > 0) lines.push("", w.list, ...titles.map((title, i) => `${i + 1}. ${title}`));
   }
-  lines.push("");
-  if (p.total > 0 && p.accepted === p.total) lines.push(w.done);
-  else {
-    if (p.rejected > 0) lines.push(w.fix);
-    if (p.missing > 0) lines.push(w.next);
-  }
-  return lines.join("\n").trim();
+  return lines.join("\n");
 }

@@ -136,14 +136,14 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
     });
   });
 
-  // 📎 The files of this client that passed the template check.
+  // 📎 Every file this client sent.
   composer.callbackQuery(new RegExp(`^${FILES_CALLBACK_PREFIX}(\\d+)$`), async (ctx) => {
     await ctx.answerCallbackQuery();
     if (ctx.from.id !== settings.ownerId) return;
     const userId = Number(ctx.match[1]);
     const sent = await assistant.sendAcceptedFilesToOwner(ctx.api, userId);
     if (sent === 0) {
-      await ctx.api.sendMessage(settings.ownerId, "Bu mijozdan hali birorta hujjat qabul qilinmagan.", {
+      await ctx.api.sendMessage(settings.ownerId, "Bu mijozdan hali birorta fayl kelmagan.", {
         reply_markup: OWNER_KEYBOARD,
       });
     }
