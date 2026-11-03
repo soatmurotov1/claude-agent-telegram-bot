@@ -204,7 +204,7 @@ async function runBot(settings: Settings): Promise<number> {
     const template = loadTemplate(settings.templatesDir);
     log(`Document template: ${template.id} (a package is ${template.documents.filter((d) => d.required).length} files)`);
   } catch (err) {
-    logError(`WARNING: ${errorMessage(err)}. A package is counted as 16 files.`);
+    logError(`WARNING: ${errorMessage(err)}. A package is counted as 14 files.`);
   }
   if (assistant.mtproto) {
     // Checked in the background so a slow or failing MTProto login never delays the bot itself.
@@ -222,6 +222,8 @@ async function runBot(settings: Settings): Promise<number> {
   const waiting = assistant.inbox.pending();
   if (waiting.length > 0) log(`Resuming the files waiting from ${waiting.length} client(s).`);
   assistant.resumePendingFiles(bot.api);
+  assistant.startDailyReport(bot.api);
+  log(`Daily report to the admin: every day at ${String(settings.dailyReportHour).padStart(2, "0")}:00 (Tashkent time).`);
 
   const runner = run(bot, { runner: { fetch: { allowed_updates: ALLOWED_UPDATES } } });
   let stopping = false;

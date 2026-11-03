@@ -28,6 +28,8 @@ export interface ClientStatus {
   received: ReceivedFile[];
   /** When the whole package went to the owner (once), or null. */
   packageSentAt: number | null;
+  /** Keys of the documents the client said they do not have («❌ Menda yo'q»); they are not asked for. */
+  missing: string[];
 }
 
 function toReceived(value: unknown): ReceivedFile | null {
@@ -68,7 +70,10 @@ function toStatus(value: unknown): ClientStatus | null {
   const received = Array.isArray(value.received)
     ? value.received.map(toReceived).filter((f): f is ReceivedFile => f !== null)
     : fromCheckedLayout(value.docs);
-  return { received, packageSentAt: typeof value.packageSentAt === "number" ? value.packageSentAt : null };
+  const missing = Array.isArray(value.missing)
+    ? [...new Set(value.missing.filter((key): key is string => typeof key === "string"))]
+    : [];
+  return { received, packageSentAt: typeof value.packageSentAt === "number" ? value.packageSentAt : null, missing };
 }
 
 /** A file name that is safe on every file system, keeping letters of any script. */
@@ -113,7 +118,8 @@ function chatTime(epochSeconds: number): string {
  *   chat.txt            the whole conversation as plain text
  *   received/           every file the client sent (not checked)
  *   refused.jsonl       files that could not be taken (too large, download failed)
- *   status.json         the received files and whether the package went to the owner
+ *   status.json         the received files, the documents the client does not have, and whether the
+ *                       package went to the owner
  * Folders are kept until the owner deletes the chat; HISTORY_TTL_DAYS does not apply to them.
  */
 export class ClientFolders {
@@ -163,7 +169,7 @@ export class ClientFolders {
   #statusFile(userId: number): JsonFile<ClientStatus> {
     return new JsonFile<ClientStatus>(
       path.join(this.dir(userId), "status.json"),
-      () => ({ received: [], packageSentAt: null }),
+      () => ({ received: [], packageSentAt: null, missing: [] }),
       toStatus,
     );
   }
@@ -204,6 +210,15 @@ export class ClientFolders {
     appendJsonl(path.join(this.dir(userId), "refused.jsonl"), { ts: this.clock(), original: originalName, reason });
   }
 
+  /** Marks a document as one the client does not have, or unmarks it. Returns the keys marked now. */
+  toggleMissing(userId: number, key: string): string[] {
+    return this.#update(userId, (status) => {
+      status.missing = status.missing.includes(key)
+        ? status.missing.filter((k) => k !== key)
+        : [...status.missing, key];
+    }).missing;
+  }
+
   /** Remembers that the whole package went to the owner. Returns true the first time only. */
   markPackageSent(userId: number): boolean {
     let first = false;
@@ -235,43 +250,83 @@ export class ClientFolders {
 
 const STATUS_WORDS: Record<
   Language,
-  { title: string; received: (n: number, total: number) => string; more: (n: number) => string; done: string; list: string }
+  {
+    title: string;
+    received: (n: number, total: number) => string;
+    missing: (n: number) => string;
+    more: (n: number) => string;
+    done: string;
+    allMissing: string;
+    list: string;
+    absent: string;
+    hint: string;
+  }
 > = {
   uz: {
     title: "📊 Hujjatlar holati",
     received: (n, total) => `Qabul qilingan fayllar: ${n}/${total}`,
+    missing: (n) => `«Menda yo'q» deb belgilangan: ${n} ta hujjat`,
     more: (n) => `Yana ${n} ta fayl yuboring.`,
     done: "Barcha fayllar qabul qilindi va mutaxassisimizga yuborildi.",
-    list: "Kerakli hujjatlar:",
+    allMissing: "Barcha hujjatlar «menda yo'q» deb belgilangan.",
+    list: "Kerakli hujjatlar (har birini alohida fayl qilib yuboring):",
+    absent: "yo'q",
+    hint: "Biror hujjat sizda bo'lmasa, «❌ Menda yo'q hujjatlar» tugmasini bosing.",
   },
   ru: {
     title: "📊 Статус документов",
     received: (n, total) => `Получено файлов: ${n}/${total}`,
+    missing: (n) => `Отмечено «у меня нет»: ${n}`,
     more: (n) => `Отправьте ещё ${n}.`,
     done: "Все файлы получены и переданы нашему специалисту.",
-    list: "Нужные документы:",
+    allMissing: "Все документы отмечены как отсутствующие.",
+    list: "Нужные документы (каждый отдельным файлом):",
+    absent: "нет",
+    hint: "Если какого-то документа у Вас нет, нажмите «❌ Menda yo'q hujjatlar».",
   },
   en: {
     title: "📊 Document status",
     received: (n, total) => `Files received: ${n}/${total}`,
+    missing: (n) => `Marked as "I don't have it": ${n}`,
     more: (n) => `Please send ${n} more.`,
     done: "All files have been received and passed to our specialist.",
-    list: "Documents needed:",
+    allMissing: "All documents are marked as missing.",
+    list: "Documents needed (each as a separate file):",
+    absent: "missing",
+    hint: "If you do not have a document, press «❌ Menda yo'q hujjatlar».",
   },
 };
 
 /**
  * The client-facing status: how many files arrived out of how many are needed, and the list of documents as a
- * reminder (files are not checked, so the list has no ticks).
+ * reminder (files are not checked, so the list has no ticks). `missing` holds the 0-based positions in `titles` of
+ * the documents the client does not have: they are marked ❌ and not counted in `total`.
  */
-export function statusText(received: number, total: number, titles: readonly string[], language: Language | null): string {
+export function statusText(
+  received: number,
+  total: number,
+  titles: readonly string[],
+  language: Language | null,
+  { missing = new Set<number>(), hint = false }: { missing?: ReadonlySet<number>; hint?: boolean } = {},
+): string {
   const w = STATUS_WORDS[language ?? "uz"];
-  const lines = [w.title, w.received(Math.min(received, total), total), ""];
-  if (received >= total) {
+  const lines = [w.title, w.received(Math.min(received, total), total)];
+  if (missing.size > 0) lines.push(w.missing(missing.size));
+  lines.push("");
+  if (total === 0) {
+    lines.push(w.allMissing);
+  } else if (received >= total) {
     lines.push(w.done);
   } else {
     lines.push(w.more(total - received));
-    if (titles.length > 0) lines.push("", w.list, ...titles.map((title, i) => `${i + 1}. ${title}`));
+    if (titles.length > 0) {
+      lines.push(
+        "",
+        w.list,
+        ...titles.map((title, i) => (missing.has(i) ? `${i + 1}. ❌ ${title} — ${w.absent}` : `${i + 1}. ${title}`)),
+      );
+    }
+    if (hint) lines.push("", w.hint);
   }
   return lines.join("\n");
 }
