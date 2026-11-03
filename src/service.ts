@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { GrammyError, HttpError, InputFile, InputMediaBuilder, type Api } from "grammy";
 import type { BusinessConnection, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup } from "grammy/types";
 import { ClaudeCLI, ClaudeError, ClaudeLimitError } from "./claudeCli.js";
@@ -88,6 +90,31 @@ export const DELETE_CONFIRM_CALLBACK_PREFIX = "delete-yes:";
 export const DELETE_CANCEL_CALLBACK = "delete-no";
 /** Files a client sends are counted this long after the last one arrives, as one batch (one summary message). */
 export const REVIEW_BATCH_SECONDS = 15;
+/** Most files accepted from one client (a package is 14); more are refused so nobody can fill the disk. */
+export const MAX_FILES_PER_CLIENT = 60;
+/** Files downloaded from Telegram at the same time, to keep memory and the connection under control. */
+const PARALLEL_DOWNLOADS = 3;
+
+/** Lets at most `size` tasks run at the same time; the rest wait their turn. */
+class Semaphore {
+  #free: number;
+  readonly #waiting: (() => void)[] = [];
+  constructor(size: number) {
+    this.#free = size;
+  }
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    if (this.#free > 0) this.#free--;
+    else await new Promise<void>((resolve) => this.#waiting.push(resolve));
+    try {
+      return await task();
+    } finally {
+      const next = this.#waiting.shift();
+      if (next) next();
+      else this.#free++;
+    }
+  }
+}
+
 /** Files in a complete package when the template cannot be read (one per required document). */
 export const DEFAULT_PACKAGE_SIZE = 14;
 /** callback_data prefix of a document button in the «❌ Menda yo'q» menu, and of its "done" button. */
@@ -430,6 +457,7 @@ export class Assistant {
   readonly #clock: Clock;
   readonly #previewSink: (preview: Preview) => void;
   readonly #downloadFile: FileDownloader;
+  readonly #downloadSlots = new Semaphore(PARALLEL_DOWNLOADS);
   readonly #downloadLargeFile: LargeFileDownloader | null;
   /** Set when TELEGRAM_API_ID/HASH are configured, for the startup check. */
   readonly mtproto: MtprotoDownloader | null = null;
@@ -447,7 +475,8 @@ export class Assistant {
   ) {
     this.#clock = clock;
     this.#previewSink = previewSink;
-    this.#downloadFile = downloadFile ?? ((api, fileId, target) => telegramDownload(api, settings.botToken, fileId, target));
+    const download = downloadFile ?? ((api, fileId, target) => telegramDownload(api, settings.botToken, fileId, target));
+    this.#downloadFile = (api, fileId, target) => this.#downloadSlots.run(() => download(api, fileId, target));
     if (downloadLargeFile !== undefined) {
       this.#downloadLargeFile = downloadLargeFile;
     } else if (settings.telegramApiId && settings.telegramApiHash && settings.botToken) {
@@ -1079,6 +1108,14 @@ export class Assistant {
     if (file.size !== undefined && file.size > maxBytes) {
       log(`Chat ${chat.chatName} (${chat.chatId}): ${file.name} is larger than MAX_FILE_MB (${this.settings.maxFileMb}).`);
       await refuse(TOO_LARGE_REASON[lang](this.settings.maxFileMb));
+      return;
+    }
+    const kept =
+      (this.folders.exists(chat.chatId) ? this.folders.status(chat.chatId).received.length : 0) +
+      this.inbox.read(chat.chatId).files.length;
+    if (kept >= MAX_FILES_PER_CLIENT) {
+      log(`Chat ${chat.chatName} (${chat.chatId}): ${file.name} refused, already ${kept} files (MAX_FILES_PER_CLIENT).`);
+      await refuse(TOO_MANY_REASON[lang](MAX_FILES_PER_CLIENT));
       return;
     }
     const large = file.size !== undefined && file.size > BOT_API_DOWNLOAD_LIMIT;
@@ -1776,15 +1813,27 @@ export function fileOf(message: Message): { fileId: string; name: string; size?:
 }
 
 /** Downloads a file through the Bot API. The bot token is part of the URL, so it is kept out of error messages. */
-async function telegramDownload(api: Api, botToken: string, fileId: string, target: string): Promise<void> {
+export async function telegramDownload(api: Api, botToken: string, fileId: string, target: string): Promise<void> {
   try {
     const file = await api.getFile(fileId);
     if (!file.file_path) throw new Error("Telegram returned no file path");
     const response = await fetch(`https://api.telegram.org/file/bot${botToken}/${file.file_path}`);
-    if (!response.ok) throw new Error(`download failed: HTTP ${response.status}`);
-    const data = Buffer.from(await response.arrayBuffer());
-    if (data.length > BOT_API_DOWNLOAD_LIMIT) throw new Error("the file is too big for the Bot API (over 20 MB)");
-    await fs.promises.writeFile(target, data, { mode: 0o600, flag: "wx" });
+    if (!response.ok || !response.body) throw new Error(`download failed: HTTP ${response.status}`);
+    const tooBig = "the file is too big for the Bot API (over 20 MB)";
+    if (Number(response.headers.get("content-length") ?? 0) > BOT_API_DOWNLOAD_LIMIT) throw new Error(tooBig);
+    // Streamed to disk: the whole file is never held in memory (the server has 0.5 GB for dozens of files).
+    let bytes = 0;
+    const limit = new Transform({
+      transform(chunk: Buffer, _encoding, done) {
+        bytes += chunk.length;
+        done(bytes > BOT_API_DOWNLOAD_LIMIT ? new Error(tooBig) : null, chunk);
+      },
+    });
+    await pipeline(
+      Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]),
+      limit,
+      fs.createWriteStream(target, { mode: 0o600, flags: "wx" }),
+    );
   } catch (err) {
     const message = errorMessage(err);
     throw new Error(botToken ? message.split(botToken).join("[REDACTED]") : message);
@@ -1824,6 +1873,12 @@ const TOO_LARGE_REASON: Record<Language, (mb: number) => string> = {
   uz: (mb) => `fayl ${mb} MB dan katta. Uni siqib yoki qismlarga bo'lib yuboring`,
   ru: (mb) => `файл больше ${mb} МБ. Сожмите его или отправьте частями`,
   en: (mb) => `the file is larger than ${mb} MB. Please compress or split it`,
+};
+
+const TOO_MANY_REASON: Record<Language, (max: number) => string> = {
+  uz: (max) => `bitta mijozdan ${max} tadan ortiq fayl qabul qilinmaydi`,
+  ru: (max) => `от одного клиента принимается не более ${max} файлов`,
+  en: (max) => `no more than ${max} files are accepted from one client`,
 };
 
 /** For files over 20 MB while TELEGRAM_API_ID / TELEGRAM_API_HASH are not set. */

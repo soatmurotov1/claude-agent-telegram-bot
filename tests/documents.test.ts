@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ClientFolders, safeFileName, statusText } from "../src/clientFolder.js";
 import { decodeFileId, encodeFileId, FileIdError } from "../src/largeFiles.js";
 import { splitTemplate } from "../src/prompts.js";
-import { quickRequest } from "../src/service.js";
+import { MAX_FILES_PER_CLIENT, quickRequest, telegramDownload } from "../src/service.js";
 import { blankFor, loadTemplate } from "../src/templates.js";
 import { CLIENT_ID, CONNECTION_ID, cleanupHarnesses, makeHarness, OWNER_ID, PROJECT_DIR } from "./harness.js";
 
@@ -584,5 +584,65 @@ describe("daily report", () => {
     clearInterval(timer);
     clearInterval(again);
     expect(toOwner(h)).toHaveLength(1);
+  });
+});
+
+describe("weak spots", () => {
+  it("does not repeat the greeting and says the consultation is free for the owner of the site", async () => {
+    const h = makeHarness();
+    await h.send(h.directMessage("Salom"));
+    const system = h.generator.calls[0]?.system ?? "";
+    expect(system).toContain("only in your first reply of the conversation");
+    expect(system).toContain("obyekt egasi uchun");
+    expect(system).not.toContain("konsultatsiya ega uchun");
+    expect(system).not.toContain("faqat hujjat shablonga mosligini tekshiradi");
+  });
+
+  it(`refuses files over ${MAX_FILES_PER_CLIENT} from one client`, async () => {
+    const h = makeHarness();
+    for (let i = 1; i <= MAX_FILES_PER_CLIENT; i++) await h.send(h.directMessage(null, { file: pdf(`a${i}.pdf`) }));
+    await h.flush();
+    h.api.clear();
+    await h.send(h.directMessage(null, { file: pdf("ortiqcha.pdf") }));
+    await h.flush();
+    expect(String(h.api.sentTo(CLIENT_ID).at(-1)?.payload.text)).toContain(
+      `ortiqcha.pdf: bitta mijozdan ${MAX_FILES_PER_CLIENT} tadan ortiq fayl qabul qilinmaydi`,
+    );
+    expect(fs.readdirSync(path.join(h.clientDir(), "received"))).toHaveLength(MAX_FILES_PER_CLIENT);
+  });
+
+  describe("downloads from Telegram", () => {
+    const api = { getFile: async () => ({ file_path: "documents/f.pdf" }) } as never;
+    const realFetch = globalThis.fetch;
+    afterEach(() => {
+      globalThis.fetch = realFetch;
+    });
+    const serve = (body: Uint8Array, headers: Record<string, string> = {}) => {
+      globalThis.fetch = (async () => new Response(body, { status: 200, headers })) as typeof fetch;
+    };
+
+    it("writes the file to disk as a stream and keeps the bot token out of errors", async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dl-"));
+      try {
+        serve(Buffer.from("%PDF streamed"));
+        const target = path.join(dir, "out");
+        await telegramDownload(api, "123:SECRET", "id", target);
+        expect(fs.readFileSync(target, "utf8")).toBe("%PDF streamed");
+        globalThis.fetch = (async () => new Response("no", { status: 404 })) as typeof fetch;
+        await expect(telegramDownload(api, "123:SECRET", "id", path.join(dir, "x"))).rejects.toThrow("HTTP 404");
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("stops a file that is over 20 MB even when Telegram did not say its size", async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dl-"));
+      try {
+        serve(new Uint8Array(21 * 1024 * 1024));
+        await expect(telegramDownload(api, "123:SECRET", "id", path.join(dir, "big"))).rejects.toThrow(/too big/);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 });

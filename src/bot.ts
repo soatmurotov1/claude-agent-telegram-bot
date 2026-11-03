@@ -174,7 +174,7 @@ async function runBot(settings: Settings): Promise<number> {
   } else {
     log("Mode: PREVIEW (replies are only shown in the logs, nothing is sent)");
   }
-  log(`Direct chats: anyone may write to the bot; copies go to OWNER_ID ${settings.ownerId}`);
+  log(`Direct chats: anyone may write to the bot; the owner (OWNER_ID ${settings.ownerId}) gets only important requests, files and complete packages`);
   log(`Claude auth: ${settings.claudeAuthMode}`);
   log(`Claude binary: ${settings.claudeBin}`);
   log(`Data directory: ${settings.dataDir} (${assistant.history.chatCount()} chat(s) in memory)`);
