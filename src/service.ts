@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import { GrammyError, HttpError, InputFile, InputMediaBuilder, type Api } from "grammy";
 import type { BusinessConnection, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup } from "grammy/types";
 import { ClaudeCLI, ClaudeError, ClaudeLimitError } from "./claudeCli.js";
+import { buildDailyReport, type ReportClient, REPORT_WINDOW_SECONDS, tashkentDate, tashkentHour } from "./dailyReport.js";
 import { ClientFolders, type PackageFile, statusText } from "./clientFolder.js";
 import type { Settings } from "./config.js";
 import { Inbox, type InboxFile, type ReviewChat } from "./documentReview.js";
@@ -42,6 +43,7 @@ export const Outcome = {
   file_received: "file_received",
   status_shown: "status_shown",
   template_sent: "template_sent",
+  missing_menu: "missing_menu",
   error: "error",
 } as const;
 export type Outcome = (typeof Outcome)[keyof typeof Outcome];
@@ -87,15 +89,19 @@ export const DELETE_CANCEL_CALLBACK = "delete-no";
 /** Files a client sends are counted this long after the last one arrives, as one batch (one summary message). */
 export const REVIEW_BATCH_SECONDS = 15;
 /** Files in a complete package when the template cannot be read (one per required document). */
-export const DEFAULT_PACKAGE_SIZE = 16;
+export const DEFAULT_PACKAGE_SIZE = 14;
+/** callback_data prefix of a document button in the «❌ Menda yo'q» menu, and of its "done" button. */
+export const MISSING_CALLBACK_PREFIX = "miss:";
+export const MISSING_DONE_CALLBACK = "miss-done";
 
 /** Texts of the client's keyboard buttons in the bot's own chat. */
 export const CLIENT_STATUS_BUTTON = "📊 Hujjatlar holati";
 export const CLIENT_TEMPLATE_BUTTON = "📄 Anketa shabloni";
+export const CLIENT_MISSING_BUTTON = "❌ Menda yo'q hujjatlar";
 
 /** Persistent keyboard for clients in the bot's own chat. */
 export const CLIENT_KEYBOARD: ReplyKeyboardMarkup = {
-  keyboard: [[{ text: CLIENT_STATUS_BUTTON }, { text: CLIENT_TEMPLATE_BUTTON }]],
+  keyboard: [[{ text: CLIENT_STATUS_BUTTON }, { text: CLIENT_TEMPLATE_BUTTON }], [{ text: CLIENT_MISSING_BUTTON }]],
   resize_keyboard: true,
   is_persistent: true,
 };
@@ -109,16 +115,64 @@ const TEMPLATE_WORDS = new Set([
   "template",
 ]);
 
-/** A client's short request that is answered without Claude: their document status or the blank form. */
-export function quickRequest(text: string): "status" | "template" | null {
+const MISSING_WORDS = new Set([
+  "menda yo'q hujjatlar", "yo'q hujjatlar", "menda yo'q hujjat", "менда йўқ ҳужжатлар", "йўқ ҳужжатлар",
+  "у меня нет документов", "нет документов", "отсутствующие документы", "missing documents",
+]);
+
+/**
+ * A client's short request that is answered without Claude: their document status, the blank form, or the menu
+ * for marking the documents they do not have.
+ */
+export function quickRequest(text: string): "status" | "template" | "missing" | null {
   const normalized = text
     .toLowerCase()
-    .replace(/[\p{Extended_Pictographic}\uFE0F]/gu, "")
+    .replace(/[\p{Extended_Pictographic}\uFE0F\u274C]/gu, "")
+    .replace(/[‘’ʼʻ`´]/g, "'")
     .replace(/[.!?,:;]+/g, "")
+    .replace(/\s+/g, " ")
     .trim();
   if (STATUS_WORDS.has(normalized)) return "status";
   if (TEMPLATE_WORDS.has(normalized)) return "template";
+  if (MISSING_WORDS.has(normalized)) return "missing";
   return null;
+}
+
+const MISSING_MENU_WORDS: Record<Language, { intro: string; done: string }> = {
+  uz: {
+    intro:
+      "❌ Qaysi hujjatlar sizda yo'q? Ularni bosib belgilang (❌), qayta bossangiz belgi olinadi. Keyin " +
+      "«✅ Tayyor» ni bosing. Belgilangan hujjatlar so'ralmaydi va kerakli fayllar soni shuncha kamayadi.",
+    done: "✅ Tayyor",
+  },
+  ru: {
+    intro:
+      "❌ Каких документов у Вас нет? Отметьте их нажатием (❌), повторное нажатие снимает отметку. Затем " +
+      "нажмите «✅ Готово». Отмеченные документы не запрашиваются, и нужное число файлов уменьшается.",
+    done: "✅ Готово",
+  },
+  en: {
+    intro:
+      "❌ Which documents do you not have? Tap them to mark them (❌); tap again to unmark. Then press " +
+      "«✅ Done». Marked documents are not asked for, and the number of files needed goes down.",
+    done: "✅ Done",
+  },
+};
+
+/** The «❌ Menda yo'q» menu: one button per required document (❌ when marked), then the "done" button. */
+export function missingKeyboard(
+  docs: readonly { key: string; title: string }[],
+  missing: ReadonlySet<number>,
+  language: Language | null,
+): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      ...docs.map((doc, i) => [
+        { text: truncate(`${missing.has(i) ? "❌" : "⬜"} ${i + 1}. ${doc.title}`, 60), callback_data: `${MISSING_CALLBACK_PREFIX}${doc.key}` },
+      ]),
+      [{ text: MISSING_MENU_WORDS[language ?? "uz"].done, callback_data: MISSING_DONE_CALLBACK }],
+    ],
+  };
 }
 
 /** Buttons under a client's folder for the owner. */
@@ -515,8 +569,16 @@ export class Assistant {
     const blocked = this.#blocked(chat.chatKey);
     if (blocked === Outcome.owner_active || blocked === Outcome.paused) return null;
     if (quick === "status") {
-      await this.#deliver(api, chat, this.clientProgressText(chat.chatId, chat.language));
+      const hint = chat.target.kind === "direct";
+      await this.#deliver(api, chat, this.clientProgressText(chat.chatId, chat.language, { hint }));
       return Outcome.status_shown;
+    }
+    if (quick === "missing") {
+      // The menu needs inline buttons in the bot's own chat; in business chats Claude answers instead.
+      if (chat.target.kind !== "direct") return null;
+      const menu = this.missingMenu(chat.chatId, chat.language);
+      await this.#deliver(api, chat, menu.text, menu.keyboard);
+      return Outcome.missing_menu;
     }
     await this.#sendTemplate(api, chat);
     return Outcome.template_sent;
@@ -883,30 +945,92 @@ export class Assistant {
     return true;
   }
 
-  /** How many files make a complete package (one per required document of the template: 16), and their titles. */
-  #packageSpec(language: Language | null): { total: number; titles: string[] } {
+  /**
+   * The required documents of the template (14) with their titles, which of them the client marked as missing
+   * («❌ Menda yo'q», 0-based positions), and how many files make a complete package: one per required document the
+   * client has.
+   */
+  #packageSpec(
+    language: Language | null,
+    userId: number | null = null,
+  ): { total: number; docs: { key: string; title: string }[]; titles: string[]; missing: Set<number> } {
+    let docs: { key: string; title: string }[];
     try {
       const template = loadTemplate(this.settings.templatesDir);
-      const docs = template.documents.filter((doc) => doc.required);
-      return { total: docs.length, titles: docs.map((doc) => doc.title[language ?? "uz"]) };
+      docs = template.documents
+        .filter((doc) => doc.required)
+        .map((doc) => ({ key: doc.key, title: doc.title[language ?? "uz"] }));
     } catch (err) {
       logError(`Cannot read the document template, counting to ${DEFAULT_PACKAGE_SIZE} files: ${errorMessage(err)}`);
-      return { total: DEFAULT_PACKAGE_SIZE, titles: [] };
+      return { total: DEFAULT_PACKAGE_SIZE, docs: [], titles: [], missing: new Set() };
     }
+    const marked = userId !== null && this.folders.exists(userId) ? this.folders.status(userId).missing : [];
+    // Keys of documents no longer in the template are ignored.
+    const missing = new Set(docs.flatMap((doc, i) => (marked.includes(doc.key) ? [i] : [])));
+    return { total: docs.length - missing.size, docs, titles: docs.map((doc) => doc.title), missing };
   }
 
-  /** The client's status in their language: files received out of how many are needed. */
-  clientProgressText(userId: number, language: Language | null): string {
-    const { total, titles } = this.#packageSpec(language);
-    return statusText(this.folders.status(userId).received.length, total, titles, language);
+  /** The client's status in their language: files received out of how many are needed, missing ones marked. */
+  clientProgressText(userId: number, language: Language | null, { hint = false }: { hint?: boolean } = {}): string {
+    const { total, titles, missing } = this.#packageSpec(language, userId);
+    return statusText(this.folders.status(userId).received.length, total, titles, language, { missing, hint });
   }
 
-  /** "5/16" for the owner's users list, or null when the client has not sent any file yet. */
+  /** "5/14" for the owner's users list, or null when the client has not sent a file or marked a document yet. */
   #receivedCount(userId: number): string | null {
     if (!this.folders.exists(userId)) return null;
-    const received = this.folders.status(userId).received.length;
-    if (received === 0) return null;
-    return `${received}/${this.#packageSpec("uz").total}`;
+    const status = this.folders.status(userId);
+    if (status.received.length === 0 && status.missing.length === 0) return null;
+    return `${status.received.length}/${this.#packageSpec("uz", userId).total}`;
+  }
+
+  /** The «❌ Menda yo'q» menu for a client, in their language. */
+  missingMenu(userId: number, language: Language | null): { text: string; keyboard: InlineKeyboardMarkup } {
+    const { docs, missing } = this.#packageSpec(language, userId);
+    return { text: MISSING_MENU_WORDS[language ?? "uz"].intro, keyboard: missingKeyboard(docs, missing, language) };
+  }
+
+  /**
+   * A client pressed a document in the «❌ Menda yo'q» menu: it is marked as missing (or unmarked). Returns the
+   * updated menu buttons, or null for an unknown document.
+   */
+  toggleMissing(userId: number, key: string): InlineKeyboardMarkup | null {
+    const language = this.history.lastLanguage(DIRECT_HISTORY_ID, userId);
+    if (!this.#packageSpec(language).docs.some((doc) => doc.key === key)) return null;
+    this.folders.toggleMissing(userId, key);
+    return this.missingMenu(userId, language).keyboard;
+  }
+
+  /**
+   * A client pressed «✅ Tayyor» in the menu: the choice is written to the conversation, the client gets their
+   * status, and the package goes to the owner if the files they have sent now cover every document they have.
+   */
+  async finishMissing(api: Api, userId: number): Promise<void> {
+    this.#api = api;
+    const language = this.history.lastLanguage(DIRECT_HISTORY_ID, userId);
+    const { total, docs, missing } = this.#packageSpec(language, userId);
+    const chat: ChatContext = {
+      target: { kind: "direct" },
+      historyId: DIRECT_HISTORY_ID,
+      chatId: userId,
+      chatKey: HistoryStore.key(DIRECT_HISTORY_ID, userId),
+      chatName: this.personTitle(userId),
+      incoming: "[button] ✅ Tayyor",
+      language,
+    };
+    const marked = docs.flatMap((doc, i) => (missing.has(i) ? [`${i + 1}. ${doc.title}`] : []));
+    this.#remember(DIRECT_HISTORY_ID, userId, {
+      role: "other",
+      name: this.users.list().find((known) => known.id === userId)?.name ?? `ID ${userId}`,
+      text: `[button] Menda yo'q hujjatlar: ${marked.length > 0 ? marked.join("; ") : "hech biri belgilanmadi"}`,
+      lang: language,
+    });
+    log(`Chat ${chat.chatName} (${userId}): ${missing.size} document(s) marked as missing, ${total} file(s) needed.`);
+    await this.#deliver(api, chat, this.clientProgressText(userId, language, { hint: false }), CLIENT_KEYBOARD);
+    await this.#locks.run(`files:${userId}`, async () => {
+      const before = this.folders.status(userId).received.length;
+      await this.#sendPackageIfComplete(api, userId, before);
+    });
   }
 
   /** Downloads a client's file into their inbox and (re)starts the batch timer. */
@@ -991,6 +1115,64 @@ export class Assistant {
     return run;
   }
 
+  /**
+   * Collects everything of the last 24 hours (new clients, messages, files, packages) into one text file and sends
+   * it to the admin. When nothing happened, the admin gets a short "no changes" message instead.
+   */
+  async sendDailyReport(api: Api): Promise<void> {
+    const now = this.#clock();
+    const since = now - REPORT_WINDOW_SECONDS;
+    const inWindow = (ts: number): boolean => ts > since && ts <= now;
+    const clients: ReportClient[] = this.users.list().map((user) => {
+      const status = this.folders.exists(user.id) ? this.folders.status(user.id) : null;
+      return {
+        title: this.personTitle(user.id),
+        id: user.id,
+        isNew: inWindow(user.firstSeen),
+        messages: this.transcripts
+          .forChat(user.id)
+          .filter((item) => inWindow(item.ts))
+          .map((item) => ({ ts: item.ts, who: item.role === "other" ? item.name : this.settings.companyName, text: item.text })),
+        files: (status?.received ?? []).filter((f) => inWindow(f.ts)).map((f) => ({ ts: f.ts, name: f.name })),
+        progress: this.#receivedCount(user.id),
+        packageSent: status?.packageSentAt != null && inWindow(status.packageSentAt),
+      };
+    });
+    const report = buildDailyReport(clients, since, now, this.settings.companyName);
+    if (report.hasChanges) {
+      const name = `hisobot-${tashkentDate(now)}.txt`;
+      await api.sendDocument(this.settings.ownerId, new InputFile(Buffer.from(report.text, "utf8"), name), {
+        caption: `📋 Kunlik hisobot: ${tashkentDate(now)}`,
+      });
+    } else {
+      await api.sendMessage(this.settings.ownerId, `📋 Kunlik hisobot (${tashkentDate(now)}): oxirgi 24 soatda hech qanday o'zgarish yo'q.`);
+    }
+    log(`Daily report sent to the admin (${report.hasChanges ? "with changes" : "no changes"}).`);
+  }
+
+  /**
+   * Sends the daily report once a day, at DAILY_REPORT_HOUR Tashkent time (or at the first check after it, e.g.
+   * after a restart). The date of the last report is kept in state.json, so a restart never sends it twice.
+   */
+  startDailyReport(api: Api): NodeJS.Timeout {
+    const check = async (): Promise<void> => {
+      const now = this.#clock();
+      const today = tashkentDate(now);
+      if (this.state.lastReportDate === today || tashkentHour(now) < this.settings.dailyReportHour) return;
+      this.state.lastReportDate = today; // before sending, so a slow send is not started twice
+      try {
+        await this.sendDailyReport(api);
+      } catch (err) {
+        this.state.lastReportDate = "";
+        logError(`The daily report could not be sent (will retry): ${errorMessage(err)}`);
+      }
+    };
+    void check();
+    const timer = setInterval(() => void check(), 60_000);
+    timer.unref();
+    return timer;
+  }
+
   /** Handles waiting files now instead of after the batch delay, and waits until every batch is done (tests, /resume). */
   async flushFiles(api?: Api): Promise<void> {
     if (api) this.#api = api;
@@ -1009,7 +1191,7 @@ export class Assistant {
   }
 
   /**
-   * Moves every file of a client's inbox to received/, tells the client how many of the 16 have arrived, and
+   * Moves every file of a client's inbox to received/, tells the client how many of the 14 have arrived, and
    * passes the package to the owner once it is complete. Files are not checked.
    */
   async #fileBatch(userId: number): Promise<void> {
@@ -1047,9 +1229,10 @@ export class Assistant {
     }
     if (added.length === 0) return;
 
-    const { total } = this.#packageSpec(lang);
+    const { total } = this.#packageSpec(lang, userId);
     const received = before + added.length;
-    const summary = `${RECEIVED_WORDS[lang](added.map((f) => f.name))}\n\n${this.clientProgressText(userId, lang)}`;
+    const hint = chat.target.kind === "direct";
+    const summary = `${RECEIVED_WORDS[lang](added.map((f) => f.name))}\n\n${this.clientProgressText(userId, lang, { hint })}`;
     // While the owner is answering this client, the summary waits in the logs (previews) instead.
     const ownerActive = this.#blocked(chat.chatKey) === Outcome.owner_active;
     const sent =
@@ -1060,25 +1243,29 @@ export class Assistant {
       `Chat ${chat.chatName} (${userId}): ${added.length} file(s) received, ${received}/${total} in all` +
         `${sent ? "" : " (summary not sent)"}.`,
     );
-    await this.#sendPackageIfComplete(api, userId, total, before);
+    await this.#sendPackageIfComplete(api, userId, before);
   }
 
   /**
-   * The owner hears about a client's files only once the package is complete: 16 files received. Then the whole
-   * package goes to them at once: one 🎉 message, then every file in albums of up to 10. Files that come after that
-   * are passed on one by one as extras. Nothing is sent before, however long the client takes.
+   * The owner hears about a client's files only once the package is complete: one file per required document the
+   * client has (14, less the ones marked «❌ Menda yo'q»). Then the whole package goes to them at once: one 🎉
+   * message (with the missing documents), then every file in albums of up to 10. Files that come after that are
+   * passed on one by one as extras. Nothing is sent before, however long the client takes.
    */
-  async #sendPackageIfComplete(api: Api, userId: number, total: number, before: number): Promise<void> {
+  async #sendPackageIfComplete(api: Api, userId: number, before: number): Promise<void> {
+    const { total, docs, missing } = this.#packageSpec("uz", userId);
     const files = this.folders.receivedFiles(userId);
     const count = this.folders.status(userId).received.length;
-    if (count < total) return;
+    if (count < total || count === 0) return;
     const who = this.personTitle(userId);
     try {
       if (this.folders.markPackageSent(userId)) {
+        const absent = docs.flatMap((doc, i) => (missing.has(i) ? [`• ${i + 1}. ${doc.title}`] : []));
         await api.sendMessage(
           this.settings.ownerId,
           `🎉 Yangi to'liq paket: ${who}\nMijoz ${count} ta fayl yubordi (kerak: ${total} ta). Fayllar quyida. ` +
-            "Bot fayllarni tekshirmagan.",
+            "Bot fayllarni tekshirmagan." +
+            (absent.length > 0 ? `\n\n❌ Mijozda yo'q hujjatlar (${absent.length} ta):\n${absent.join("\n")}` : ""),
           { reply_markup: folderKeyboard(userId) },
         );
         await this.#sendAlbumsToOwner(api, files, total, `👤 ${who}`);
@@ -1099,12 +1286,12 @@ export class Assistant {
     const files = this.folders.receivedFiles(userId);
     if (files.length === 0) return 0;
     await api.sendMessage(this.settings.ownerId, this.clientProgressText(userId, "uz"));
-    await this.#sendAlbumsToOwner(api, files, this.#packageSpec("uz").total, "");
+    await this.#sendAlbumsToOwner(api, files, this.#packageSpec("uz", userId).total, "");
     return files.length;
   }
 
   /**
-   * Sends files to the owner as albums of up to 10 (a Telegram limit), each captioned "📄 3/16 — name". Files go by
+   * Sends files to the owner as albums of up to 10 (a Telegram limit), each captioned "📄 3/14 — name". Files go by
    * their Telegram file_id when known (no re-upload, any size). If an album cannot be sent, its files are sent one
    * by one instead.
    */
@@ -1434,14 +1621,16 @@ export class Assistant {
       "",
       "Siz (admin) uchun:",
       "• Mijozlarning xabarlari sizga yuborilmaydi. Faqat 🚨 muhim murojaatlar va to'liq hujjat paketlari keladi.",
-      "• Mijozdan 16 ta hujjat so'raladi (ustav, YeGRPO, ruxsatnoma, litsenziya, 133-son kelishuv, UTER, TIA, " +
-        "tog' ajratmasi, 5-GR, ZVOS, ZEP, PDV, limitlar, EPB, yer ajratmasi, imzolangan anketa+NDA), har biri " +
-        "alohida fayl. Bot fayllarni TEKSHIRMAYDI: faqat saqlaydi, sanaydi va mijozga «N/16» deb yozadi " +
-        "(bir yo'la 10–50 ta ham, 20 MB dan kattasi ham qabul qilinadi).",
-      "• Mijoz 16 ta fayl yuborganda sizga bitta 🎉 xabar va butun paket (albumlarda, 10 tadan) bir yo'la keladi. " +
-        "Mijoz fayllarni qancha vaqt davomida yuborsa ham, undan oldin hech narsa yuborilmaydi. Keyin kelgan " +
-        "fayllar «🔄 Qo'shimcha fayl» bo'lib alohida keladi. Holatni «users» orqali istalgan vaqtda ko'rasiz.",
-      "• «users» tugmasi mijozlar ro'yxatini (📊 nechta fayl yuborgani bilan, masalan 5/16) ko'rsatadi. Mijozni bossangiz, u bilan " +
+      "• Mijozdan 14 ta hujjat so'raladi (ustav, YeGRPO, ruxsatnoma/litsenziya, 133-son kelishuv, UTER, TIA, " +
+        "tog' ajratmasi, 5-GR, ZVOS, ZEP, PDV, limitlar, EPB, yer ajratmasi), har biri alohida fayl. Bot fayllarni " +
+        "TEKSHIRMAYDI: faqat saqlaydi, sanaydi va mijozga «N/14» deb yozadi (bir yo'la 10–50 ta ham, 20 MB dan " +
+        "kattasi ham qabul qilinadi). Anketa (NDA bilan) faqat taklif qilinadi, 14 taga kirmaydi.",
+      "• Mijozda biror hujjat bo'lmasa, u «❌ Menda yo'q hujjatlar» tugmasi bilan belgilaydi: kerakli fayllar soni " +
+        "shuncha kamayadi (masalan, 2 tasi yo'q bo'lsa — 12 ta).",
+      "• Mijoz kerakli hamma faylni yuborganda sizga bitta 🎉 xabar (yo'q hujjatlar ro'yxati bilan) va butun paket " +
+        "(albumlarda, 10 tadan) bir yo'la keladi. Undan oldin hech narsa yuborilmaydi. Keyin kelgan fayllar " +
+        "«🔄 Qo'shimcha fayl» bo'lib alohida keladi. Holatni «users» orqali istalgan vaqtda ko'rasiz.",
+      "• «users» tugmasi mijozlar ro'yxatini (📊 nechta fayl yuborgani bilan, masalan 5/14) ko'rsatadi. Mijozni bossangiz, u bilan " +
         "butun yozishma va hujjatlar holati ochiladi; ostida «📄 chat.txt», «📎 Qabul qilingan fayllar» va " +
         "«🗑 Chatni o'chirish» tugmalari bor.",
       "• Mijozga javob berish: yozishma ostidagi «✍️ Javob yozish» ni bosing va javobni yuboring — matn, rasm, " +
@@ -1456,7 +1645,7 @@ export class Assistant {
       "/status — holat",
       "",
       "Bilib qo'ying:",
-      "• Bot mijozni anketani to'ldirish, NDA ni imzolash va hujjatlarni topshirishga olib boradi. Aniq narx, " +
+      "• Bot mijozni 14 ta hujjatni topshirishga olib boradi va anketani (NDA bilan) taklif qiladi. Aniq narx, " +
         "muddat, ruxsatnoma yoki ekspertiza natijasi bo'yicha va'da bermaydi — bunday savollarni mas'ul xodimga " +
         "yo'naltiradi.",
       "• Favqulodda holat, shikoyat yoki rasmiy so'rovlar 🚨 belgisi bilan keladi.",
@@ -1526,8 +1715,11 @@ function languageOf(message: Message): Language | null {
   const words = message.text ?? message.caption;
   if (!words) return null;
   // One-word requests ("holat", "статус", "status") are too short for detectLanguage.
-  if (message.text !== undefined && quickRequest(message.text) !== null) {
+  const quick = message.text !== undefined ? quickRequest(message.text) : null;
+  if (quick !== null) {
     if (/[ўқғҳ]/i.test(words)) return "uz";
+    // The «❌ Menda yo'q hujjatlar» button is Uzbek for everyone: the chat's earlier language decides.
+    if (quick === "missing" && !/\p{Script=Cyrillic}/u.test(words)) return null;
     if (/\p{Script=Cyrillic}/u.test(words)) return "ru";
     if (/holat|hujjat|anketa|shablon/i.test(words)) return "uz";
     return null;
@@ -1575,27 +1767,24 @@ const RECEIVED_WORDS: Record<Language, (names: string[]) => string> = {
 
 const TEMPLATE_CAPTION: Record<Language, string> = {
   uz:
-    "Quyidagi 16 ta hujjatni shu chatga fayl qilib yuboring: 1) korxona ustavi; 2) YeGRPO dan ko'chirma; " +
-    "3) yer qa'ridan foydalanish uchun elektron ruxsatnoma; 4) elektron litsenziya; 5) VMQ 133-son bo'yicha " +
-    "litsenziya kelishuvi (shartnoma); 6) UTER; 7) TIA; 8) tog' ajratmasi loyihasi; 9) 5-GR topshirilganini " +
-    "tasdiqlovchi hujjat; 10) ZVOS; 11) ZEP; 12) PDV; 13) limitlar; 14) OPO bo'yicha EPB dalolatnomalari; " +
-    "15) yer ajratmasi to'g'risidagi qarorlar; 16) ushbu anketa — to'ldirilgan va Maxfiylik kelishuvi (NDA) " +
-    "imzolangan holda. Har bir hujjatni alohida fayl qilib yuboring. 16 ta fayl kelgach, hammasi " +
-    "mutaxassisimizga yuboriladi.",
+    "Quyidagi 14 ta hujjatni shu chatga yuboring, har birini alohida fayl qilib: 1) korxona ustavi; " +
+    "2) YeGRPO dan ko'chirma; 3) yer qa'ridan foydalanish uchun elektron ruxsatnoma / litsenziya; 4) VMQ 133-son " +
+    "bo'yicha litsenziya kelishuvi (shartnoma); 5) UTER; 6) TIA; 7) tog' ajratmasi loyihasi; 8) 5-GR " +
+    "topshirilganini tasdiqlovchi hujjat; 9) ZVOS; 10) ZEP; 11) PDV; 12) limitlar; 13) OPO bo'yicha EPB " +
+    "dalolatnomalari; 14) yer ajratmasi to'g'risidagi qarorlar. Sizda bo'lmagan hujjatlarni «❌ Menda yo'q " +
+    "hujjatlar» tugmasi orqali belgilang. Hamma fayl kelgach, paket mutaxassisimizga yuboriladi.",
   ru:
-    "Отправьте файлами в этот чат 16 документов: 1) устав предприятия; 2) выписка из ЕГРПО; 3) электронное " +
-    "разрешение на пользование недрами; 4) электронная лицензия; 5) лицензионное соглашение (шартнома) по ПКМ " +
-    "№ 133; 6) УТЭР; 7) ТЭО; 8) проект горного отвода; 9) подтверждение сдачи формы 5-ГР; 10) ЗВОС; 11) ЗЭП; " +
-    "12) ПДВ; 13) лимиты; 14) акты ЭПБ по ОПО; 15) решения на земельный отвод; 16) эта анкета — заполненная, с " +
-    "подписанным соглашением о конфиденциальности (NDA). Каждый документ отправьте отдельным файлом. Когда " +
-    "придут все 16 файлов, они будут переданы нашему специалисту.",
+    "Отправьте в этот чат 14 документов, каждый отдельным файлом: 1) устав предприятия; 2) выписка из ЕГРПО; " +
+    "3) электронное разрешение / лицензия на пользование недрами; 4) лицензионное соглашение (шартнома) по ПКМ " +
+    "№ 133; 5) УТЭР; 6) ТЭО; 7) проект горного отвода; 8) подтверждение сдачи формы 5-ГР; 9) ЗВОС; 10) ЗЭП; " +
+    "11) ПДВ; 12) лимиты; 13) акты ЭПБ по ОПО; 14) решения на земельный отвод. Документы, которых у Вас нет, " +
+    "отметьте кнопкой «❌ Menda yo'q hujjatlar». Когда придут все файлы, пакет будет передан нашему специалисту.",
   en:
-    "Please send these 16 documents as files in this chat: 1) company charter; 2) EGRPO register extract; " +
-    "3) electronic subsoil use permit; 4) electronic licence; 5) licence agreement under resolution No. 133; " +
-    "6) UTER; 7) feasibility study (TEO); 8) mining allotment project; 9) proof of form 5-GR; 10) ZVOS; 11) ZEP; " +
-    "12) PDV; 13) limits; 14) industrial safety (EPB) reports; 15) land allotment decisions; 16) this " +
-    "questionnaire (Russian version), filled in, with the signed non-disclosure agreement (NDA). Please send each " +
-    "document as a separate file. Once all 16 files have arrived, they are passed to our specialist.",
+    "Please send these 14 documents to this chat, each as a separate file: 1) company charter; 2) EGRPO register " +
+    "extract; 3) electronic subsoil use permit / licence; 4) licence agreement under resolution No. 133; 5) UTER; " +
+    "6) feasibility study (TEO); 7) mining allotment project; 8) proof of form 5-GR; 9) ZVOS; 10) ZEP; 11) PDV; " +
+    "12) limits; 13) industrial safety (EPB) reports; 14) land allotment decisions. Mark the documents you do not " +
+    "have with the «❌ Menda yo'q hujjatlar» button. Once all files have arrived, the package goes to our specialist.",
 };
 
 const TOO_LARGE_REASON: Record<Language, (mb: number) => string> = {

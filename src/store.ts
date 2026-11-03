@@ -205,6 +205,8 @@ export class SeenMessages {
 interface StateData {
   paused: boolean;
   limitUntil: number;
+  /** Tashkent date (YYYY-MM-DD) of the last daily report sent to the admin. */
+  lastReportDate: string;
 }
 
 /** Pause flag and usage-limit deadline, kept across restarts. */
@@ -213,11 +215,12 @@ export class RuntimeState {
   #data: StateData;
 
   constructor(file: string) {
-    this.#file = new JsonFile<StateData>(file, () => ({ paused: false, limitUntil: 0 }), (value) => {
+    this.#file = new JsonFile<StateData>(file, () => ({ paused: false, limitUntil: 0, lastReportDate: "" }), (value) => {
       if (!isRecord(value)) return null;
       return {
         paused: value.paused === true,
         limitUntil: typeof value.limitUntil === "number" ? value.limitUntil : 0,
+        lastReportDate: typeof value.lastReportDate === "string" ? value.lastReportDate : "",
       };
     });
     this.#data = this.#file.read();
@@ -238,6 +241,15 @@ export class RuntimeState {
 
   set limitUntil(value: number) {
     this.#data = { ...this.#data, limitUntil: value };
+    this.#file.write(this.#data);
+  }
+
+  get lastReportDate(): string {
+    return this.#data.lastReportDate;
+  }
+
+  set lastReportDate(value: string) {
+    this.#data = { ...this.#data, lastReportDate: value };
     this.#file.write(this.#data);
   }
 }

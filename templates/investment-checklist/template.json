@@ -63,46 +63,21 @@
     {
       "key": "ruxsatnoma",
       "title": {
-        "uz": "Yer qa'ridan foydalanish uchun elektron ruxsatnoma",
-        "ru": "Электронное разрешение на пользование недрами",
-        "en": "Electronic subsoil use permit"
+        "uz": "Yer qa'ridan foydalanish uchun elektron ruxsatnoma / litsenziya",
+        "ru": "Электронное разрешение / лицензия на пользование недрами",
+        "en": "Electronic subsoil use permit / licence"
       },
-      "description": "The electronic permit for the right to use a subsoil plot (рухсатнома / разрешение), issued by the Subsoil Use Centre under the law ZRU-987.",
+      "description": "The electronic permit (рухсатнома / разрешение, issued under the law ZRU-987) or the electronic licence (лицензия, e.g. issued before ZRU-987 or through license.gov.uz) for the right to use the subsoil plot. Either one is accepted.",
       "parts": [
         {
           "key": "ruxsatnoma",
           "title": {
-            "uz": "Yer qa'ridan foydalanish uchun elektron ruxsatnoma",
-            "ru": "Электронное разрешение на пользование недрами",
-            "en": "Electronic subsoil use permit"
+            "uz": "Yer qa'ridan foydalanish uchun elektron ruxsatnoma / litsenziya",
+            "ru": "Электронное разрешение / лицензия на пользование недрами",
+            "en": "Electronic subsoil use permit / licence"
           },
           "checks": [
-            "It is a subsoil use permit (рухсатнома / разрешение на право пользования участком недр), usually with a QR code, not a licence or another document.",
-            "It has a number, an issue date and the holder; the holder matches the client's company, if known.",
-            "It is not expired today (if a validity date is shown)."
-          ],
-          "naItems": []
-        }
-      ]
-    },
-    {
-      "key": "litsenziya",
-      "title": {
-        "uz": "Yer qa'ridan foydalanish uchun elektron litsenziya",
-        "ru": "Электронная лицензия на пользование недрами",
-        "en": "Electronic subsoil use licence"
-      },
-      "description": "The electronic licence for subsoil use (лицензия), for example one issued before the law ZRU-987 or through license.gov.uz.",
-      "parts": [
-        {
-          "key": "litsenziya",
-          "title": {
-            "uz": "Yer qa'ridan foydalanish uchun elektron litsenziya",
-            "ru": "Электронная лицензия на пользование недрами",
-            "en": "Electronic subsoil use licence"
-          },
-          "checks": [
-            "It is a subsoil use licence (лицензия / литсензия на пользование недрами), usually with a QR code or a license.gov.uz number.",
+            "It is a subsoil use permit (рухсатнома / разрешение на право пользования участком недр) or a subsoil use licence (лицензия), usually with a QR code or a license.gov.uz number.",
             "It has a number, an issue date and the holder; the holder matches the client's company, if known.",
             "It is not expired and not revoked today (if a validity date or status is shown)."
           ],
@@ -392,7 +367,7 @@
         "ru": "Соглашение о конфиденциальности (NDA) — подписанная анкета",
         "en": "Non-disclosure agreement (NDA) — the signed questionnaire"
       },
-      "description": "The express questionnaire itself (Uzbek or Russian version), filled in, with its non-disclosure agreement (NDA / owner's consent block) signed by the owner. It also gives the company name.",
+      "description": "The express questionnaire itself (Uzbek or Russian version), filled in, with its non-disclosure agreement (NDA / owner's consent block) signed by the owner. It also gives the company name. Not counted in the package: the bot asks for the 14 documents above; the questionnaire is only offered.",
       "parts": [
         {
           "key": "anketa",
@@ -409,7 +384,8 @@
           ],
           "naItems": []
         }
-      ]
+      ],
+      "required": false
     }
   ]
 }
