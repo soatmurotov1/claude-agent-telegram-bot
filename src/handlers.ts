@@ -13,6 +13,8 @@ import {
   FILES_CALLBACK_PREFIX,
   FOLDER_CALLBACK_PREFIX,
   folderKeyboard,
+  MISSING_CALLBACK_PREFIX,
+  MISSING_DONE_CALLBACK,
   REPLY_CALLBACK_PREFIX,
   REPLY_DONE_CALLBACK,
   REPLY_DONE_KEYBOARD,
@@ -35,10 +37,11 @@ export const OWNER_KEYBOARD: ReplyKeyboardMarkup = {
 export function welcomeText(companyName: string): string {
   return (
     `Assalomu alaykum! Bu «${companyName}» korxonasining rasmiy yordamchi boti. ` +
-    `Savolingizni shu yerga yozing yoki hujjatlaringizni fayl qilib yuboring: bot har bir hujjatni shablon ` +
-    `bo'yicha tekshiradi va paketingiz necha foiz tayyorligini ko'rsatadi.\n\n` +
-    `«📄 Anketa shabloni» — to'ldirish uchun anketa (NDA bilan).\n` +
-    `«📊 Hujjatlar holati» — qaysi hujjatlar qabul qilingani va qaysilari yetishmayotgani.\n\n` +
+    `Savolingizni shu yerga yozing yoki 14 ta hujjatingizni shu chatga yuboring — har bir hujjatni alohida ` +
+    `fayl qilib. Bot nechta fayl kelganini ko'rsatib boradi; hammasi kelgach, paket mutaxassisimizga yuboriladi.\n\n` +
+    `«📊 Hujjatlar holati» — nechta fayl qabul qilingani va kerakli hujjatlar ro'yxati.\n` +
+    `«❌ Menda yo'q hujjatlar» — sizda bo'lmagan hujjatlarni belgilash (ular so'ralmaydi).\n` +
+    `«📄 Anketa shabloni» — ekspress-anketa (NDA bilan).\n\n` +
     `Bu avtomatik yordamchi ekanini inobatga oling.`
   );
 }
@@ -136,14 +139,14 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
     });
   });
 
-  // 📎 The files of this client that passed the template check.
+  // 📎 Every file this client sent.
   composer.callbackQuery(new RegExp(`^${FILES_CALLBACK_PREFIX}(\\d+)$`), async (ctx) => {
     await ctx.answerCallbackQuery();
     if (ctx.from.id !== settings.ownerId) return;
     const userId = Number(ctx.match[1]);
     const sent = await assistant.sendAcceptedFilesToOwner(ctx.api, userId);
     if (sent === 0) {
-      await ctx.api.sendMessage(settings.ownerId, "Bu mijozdan hali birorta hujjat qabul qilinmagan.", {
+      await ctx.api.sendMessage(settings.ownerId, "Bu mijozdan hali birorta fayl kelmagan.", {
         reply_markup: OWNER_KEYBOARD,
       });
     }
@@ -177,6 +180,24 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
     if (ctx.from.id !== settings.ownerId) return;
     await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => undefined);
     await ctx.api.sendMessage(settings.ownerId, "O'chirish bekor qilindi.", { reply_markup: OWNER_KEYBOARD });
+  });
+
+  // «❌ Menda yo'q»: a client marks (or unmarks) a document they do not have; the menu is updated in place.
+  composer.callbackQuery(new RegExp(`^${MISSING_CALLBACK_PREFIX}([a-z0-9_]+)$`), async (ctx) => {
+    if (ctx.from.id === settings.ownerId || ctx.chat?.type !== "private") {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+    const keyboard = assistant.toggleMissing(ctx.from.id, ctx.match[1] ?? "");
+    await ctx.answerCallbackQuery();
+    if (keyboard) await ctx.editMessageReplyMarkup({ reply_markup: keyboard }).catch(() => undefined);
+  });
+
+  composer.callbackQuery(MISSING_DONE_CALLBACK, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    if (ctx.from.id === settings.ownerId || ctx.chat?.type !== "private") return;
+    await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }).catch(() => undefined);
+    await assistant.finishMissing(ctx.api, ctx.from.id);
   });
 
   // ✍️ Javob yozish: the owner's next messages go to that person.

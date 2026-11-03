@@ -20,6 +20,7 @@ export const SETTING_KEYS = [
   "HISTORY_LIMIT",
   "HISTORY_TTL_DAYS",
   "REVIEW_DAILY_LIMIT",
+  "DAILY_REPORT_HOUR",
   "MAX_FILE_MB",
   "TELEGRAM_API_ID",
   "TELEGRAM_API_HASH",
@@ -64,6 +65,8 @@ export interface Settings {
   readonly historyTtlDays: number;
   /** Claude calls for document checks allowed per 24 hours across all clients. */
   readonly reviewDailyLimit: number;
+  /** Hour (0-23, Tashkent) at which the daily report goes to the admin. */
+  readonly dailyReportHour: number;
   /** Largest file a client may send, in MB. Above 20 MB needs telegramApiId and telegramApiHash. */
   readonly maxFileMb: number;
   /** my.telegram.org app credentials for downloading files over 20 MB (0 and "" when not set). */
@@ -218,6 +221,7 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
     historyLimit: int("HISTORY_LIMIT", 50, 1),
     historyTtlDays: int("HISTORY_TTL_DAYS", 30, 1),
     reviewDailyLimit: int("REVIEW_DAILY_LIMIT", 100, 1),
+    dailyReportHour: Math.min(int("DAILY_REPORT_HOUR", 9, 0), 23),
     maxFileMb: Math.min(int("MAX_FILE_MB", 2000, 1), 2000),
     telegramApiId: apiIdValue ? Number(apiIdValue) : 0,
     dataDir: path.resolve(baseDir, get("DATA_DIR") || "data"),

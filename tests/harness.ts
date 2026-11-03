@@ -36,6 +36,8 @@ export class RecordingApi {
   readonly calls: ApiCall[] = [];
   connection: BusinessConnection | null = null;
   #nextMessageId = 5000;
+  /** Makes sendMediaGroup fail, to test the one-by-one fallback. */
+  failMediaGroup = false;
 
   install(bot: Bot): void {
     const transformer: Transformer = async (_prev, method, payload) => {
@@ -51,6 +53,18 @@ export class RecordingApi {
         return { ok: true, result: structuredClone(this.connection) };
       }
       return { ok: false, error_code: 400, description: "Bad Request: business connection not found" };
+    }
+    if (method === "sendMediaGroup") {
+      if (this.failMediaGroup) return { ok: false, error_code: 400, description: "Bad Request: album failed" };
+      const media = Array.isArray(payload.media) ? payload.media : [];
+      return {
+        ok: true,
+        result: media.map(() => ({
+          message_id: this.#nextMessageId++,
+          date: 1_800_000_000,
+          chat: { id: Number(payload.chat_id), type: "private", first_name: "Chat" },
+        })),
+      };
     }
     if (method === "sendMessage" || method === "sendDocument") {
       return {
@@ -80,11 +94,11 @@ export class RecordingApi {
   }
 }
 
-type Step = string | Error | ((system: string, user: string, dir?: string) => string | Promise<string>);
+type Step = string | Error | ((system: string, user: string) => string | Promise<string>);
 
-/** Scripted generator: `generate` and `review` take the next step (or the per-file answer). */
+/** Scripted generator: `generate` takes the next step. */
 export class FakeGenerator implements ReplyGenerator {
-  readonly calls: { system: string; user: string; dir?: string; files?: string[] }[] = [];
+  readonly calls: { system: string; user: string }[] = [];
   readonly steps: Step[] = [];
   fallback: Step = "Murojaatingiz qabul qilindi.";
 
@@ -93,20 +107,15 @@ export class FakeGenerator implements ReplyGenerator {
     return this;
   }
 
-  async #next(system: string, user: string, dir?: string): Promise<string> {
+  async #next(system: string, user: string): Promise<string> {
     const step = this.steps.shift() ?? this.fallback;
     if (step instanceof Error) throw step;
-    return typeof step === "function" ? step(system, user, dir) : step;
+    return typeof step === "function" ? step(system, user) : step;
   }
 
   async generate(system: string, user: string): Promise<string> {
     this.calls.push({ system, user });
     return this.#next(system, user);
-  }
-
-  async review(system: string, user: string, dir: string): Promise<string> {
-    this.calls.push({ system, user, dir, files: fs.readdirSync(dir) });
-    return this.#next(system, user, dir);
   }
 }
 
@@ -116,22 +125,6 @@ export class Clock {
   advance(seconds: number): void {
     this.t += seconds;
   }
-}
-
-/** A review answer as Claude would write it. No `parts` means the file holds every part of the document. */
-export function verdict(
-  doc: string | null,
-  accepted: boolean,
-  opts: { parts?: string[]; reasons?: string[]; applicant?: Record<string, unknown> } = {},
-): string {
-  return JSON.stringify({
-    doc,
-    parts: opts.parts ?? [],
-    verdict: accepted ? "accepted" : "rejected",
-    reasons: opts.reasons ?? [],
-    summary: doc ?? "file",
-    applicant: opts.applicant ?? null,
-  });
 }
 
 let updateId = 1;
@@ -216,7 +209,7 @@ export class Harness {
 
   /** Runs waiting review batches now. */
   async flush(): Promise<void> {
-    await this.assistant.flushReviews(this.bot.api);
+    await this.assistant.flushFiles(this.bot.api);
   }
 
   setConnection(): void {
