@@ -99,7 +99,22 @@ export const CLIENT_STATUS_BUTTON = "📊 Hujjatlar holati";
 export const CLIENT_TEMPLATE_BUTTON = "📄 Anketa shabloni";
 export const CLIENT_MISSING_BUTTON = "❌ Menda yo'q hujjatlar";
 
-/** Persistent keyboard for clients in the bot's own chat. */
+/**
+ * Persistent keyboard for clients in the bot's own chat. Once the package is complete (every file received and
+ * sent to the admin) the «❌ Menda yo'q hujjatlar» button is left out: there is nothing more to mark.
+ */
+export function clientKeyboard(complete: boolean): ReplyKeyboardMarkup {
+  return {
+    keyboard: [
+      [{ text: CLIENT_STATUS_BUTTON }, { text: CLIENT_TEMPLATE_BUTTON }],
+      ...(complete ? [] : [[{ text: CLIENT_MISSING_BUTTON }]]),
+    ],
+    resize_keyboard: true,
+    is_persistent: true,
+  };
+}
+
+/** The keyboard with all three buttons (a client whose package is not complete yet). */
 export const CLIENT_KEYBOARD: ReplyKeyboardMarkup = {
   keyboard: [[{ text: CLIENT_STATUS_BUTTON }, { text: CLIENT_TEMPLATE_BUTTON }], [{ text: CLIENT_MISSING_BUTTON }]],
   resize_keyboard: true,
@@ -576,6 +591,11 @@ export class Assistant {
     if (quick === "missing") {
       // The menu needs inline buttons in the bot's own chat; in business chats Claude answers instead.
       if (chat.target.kind !== "direct") return null;
+      if (this.packageComplete(chat.chatId)) {
+        // Nothing more to mark: show the status (the button itself is gone from the keyboard).
+        await this.#deliver(api, chat, this.clientProgressText(chat.chatId, chat.language), this.clientKeyboardFor(chat.chatId));
+        return Outcome.status_shown;
+      }
       const menu = this.missingMenu(chat.chatId, chat.language);
       await this.#deliver(api, chat, menu.text, menu.keyboard);
       return Outcome.missing_menu;
@@ -984,6 +1004,18 @@ export class Assistant {
     return `${status.received.length}/${this.#packageSpec("uz", userId).total}`;
   }
 
+  /** True once the client's package is complete: the files cover every document they have, or it was sent already. */
+  packageComplete(userId: number): boolean {
+    if (!this.folders.exists(userId)) return false;
+    const count = this.folders.status(userId).received.length;
+    return this.folders.status(userId).packageSentAt !== null || (count > 0 && count >= this.#packageSpec(null, userId).total);
+  }
+
+  /** The client's persistent keyboard: without «❌ Menda yo'q hujjatlar» once the package is complete. */
+  clientKeyboardFor(userId: number): ReplyKeyboardMarkup {
+    return clientKeyboard(this.packageComplete(userId));
+  }
+
   /** The «❌ Menda yo'q» menu for a client, in their language. */
   missingMenu(userId: number, language: Language | null): { text: string; keyboard: InlineKeyboardMarkup } {
     const { docs, missing } = this.#packageSpec(language, userId);
@@ -997,6 +1029,7 @@ export class Assistant {
   toggleMissing(userId: number, key: string): InlineKeyboardMarkup | null {
     const language = this.history.lastLanguage(DIRECT_HISTORY_ID, userId);
     if (!this.#packageSpec(language).docs.some((doc) => doc.key === key)) return null;
+    if (this.packageComplete(userId)) return null;
     this.folders.toggleMissing(userId, key);
     return this.missingMenu(userId, language).keyboard;
   }
@@ -1026,7 +1059,7 @@ export class Assistant {
       lang: language,
     });
     log(`Chat ${chat.chatName} (${userId}): ${missing.size} document(s) marked as missing, ${total} file(s) needed.`);
-    await this.#deliver(api, chat, this.clientProgressText(userId, language, { hint: false }), CLIENT_KEYBOARD);
+    await this.#deliver(api, chat, this.clientProgressText(userId, language, { hint: false }), this.clientKeyboardFor(userId));
     await this.#locks.run(`files:${userId}`, async () => {
       const before = this.folders.status(userId).received.length;
       await this.#sendPackageIfComplete(api, userId, before);
@@ -1237,7 +1270,7 @@ export class Assistant {
     const ownerActive = this.#blocked(chat.chatKey) === Outcome.owner_active;
     const sent =
       !ownerActive &&
-      (await this.#deliver(api, chat, summary, chat.target.kind === "direct" ? CLIENT_KEYBOARD : undefined));
+      (await this.#deliver(api, chat, summary, chat.target.kind === "direct" ? this.clientKeyboardFor(userId) : undefined));
     if (!sent && ownerActive) this.#showPreview({ ...this.#previewOf(chat, summary), note: "not sent: the owner is answering" });
     log(
       `Chat ${chat.chatName} (${userId}): ${added.length} file(s) received, ${received}/${total} in all` +

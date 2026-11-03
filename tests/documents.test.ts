@@ -505,6 +505,30 @@ describe("documents the client does not have", () => {
     expect(toOwner(h)).toHaveLength(0);
   });
 
+  it("hides the «Menda yo'q» button once the package is complete", async () => {
+    const h = makeHarness();
+    const buttons = (call: { payload: Record<string, unknown> } | undefined) =>
+      ((call?.payload.reply_markup as { keyboard?: { text: string }[][] } | undefined)?.keyboard ?? []).flat().map((b) => b.text);
+    for (const name of names(1, 13)) await h.send(h.directMessage(null, { file: pdf(name) }));
+    await h.flush();
+    expect(buttons(h.api.sentTo(CLIENT_ID).at(-1))).toContain("❌ Menda yo'q hujjatlar");
+
+    h.api.clear();
+    await h.send(h.directMessage(null, { file: pdf("f14.pdf") }));
+    await h.flush();
+    // The summary that reports 14/14 already comes without the button.
+    expect(buttons(h.api.sentTo(CLIENT_ID).at(-1))).toEqual(["📊 Hujjatlar holati", "📄 Anketa shabloni"]);
+
+    // /start, the button itself and the menu presses no longer offer it either.
+    h.api.clear();
+    await h.send(h.directMessage("/start"));
+    expect(buttons(h.api.sentTo(CLIENT_ID)[0])).toEqual(["📊 Hujjatlar holati", "📄 Anketa shabloni"]);
+    await h.send(h.directMessage("❌ Menda yo'q hujjatlar"));
+    expect(String(h.api.sentTo(CLIENT_ID).at(-1)?.payload.text)).toContain("Qabul qilingan fayllar: 14/14");
+    await h.send(h.callback("miss:zep", CLIENT_ID));
+    expect(h.assistant.folders.status(CLIENT_ID).missing).toEqual([]);
+  });
+
   it("leaves the request to Claude in a business chat, where the menu cannot be shown", async () => {
     const h = makeHarness();
     h.setConnection();

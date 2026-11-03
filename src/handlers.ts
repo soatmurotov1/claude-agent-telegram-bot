@@ -4,7 +4,6 @@ import type { Settings } from "./config.js";
 import {
   type Assistant,
   CHAT_TXT_CALLBACK_PREFIX,
-  CLIENT_KEYBOARD,
   DELETE_CALLBACK_PREFIX,
   DELETE_CANCEL_CALLBACK,
   DELETE_CONFIRM_CALLBACK_PREFIX,
@@ -64,7 +63,7 @@ export function buildComposer(assistant: Assistant, settings: Settings): Compose
     if (ctx.from.id === settings.ownerId) {
       await ctx.reply(assistant.startText(), { reply_markup: OWNER_KEYBOARD });
     } else {
-      await ctx.reply(welcomeText(settings.companyName), { reply_markup: CLIENT_KEYBOARD });
+      await ctx.reply(welcomeText(settings.companyName), { reply_markup: assistant.clientKeyboardFor(ctx.from.id) });
     }
   });
 
