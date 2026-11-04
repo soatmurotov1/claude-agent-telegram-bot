@@ -188,6 +188,13 @@ Everything is stored in `data/` (on Railway: the volume at `/app/data`), directo
 | `clients/<id>/status.json` | The received files in order and whether the package went to the admin |
 | `clients/<id>/inbox/` | Files waiting for the batch |
 
+**Backup.** Right after the daily report the admin gets `zaxira-<date>.zip`: the whole data directory without
+`mtproto.session`. State, users, conversations, `status.json` and `chat.txt` always go in; client documents are added,
+newest first, while they fit in 30 MB (Telegram allows 50 MB per upload). Documents that did not fit are listed in
+`FAYLLAR-RO'YXATI.txt` inside the zip. Nothing is sent before the first person has written to the bot. To restore:
+unpack the zip into `/app/data` and restart the bot. The zip contains personal data and client documents; keep it as
+private as the data itself (`src/backup.ts`).
+
 History and previews older than `HISTORY_TTL_DAYS` are deleted. Client folders are kept until the owner deletes
 the chat with 🗑; the client's documents (licences, charters …) are confidential under the questionnaire's NDA. Messages from the people who write to the company
 **are sent to Claude (Anthropic)** to generate replies and are stored on the Railway server. Agree on this with the

@@ -6,6 +6,7 @@ import { pipeline } from "node:stream/promises";
 import { GrammyError, HttpError, InputFile, InputMediaBuilder, type Api } from "grammy";
 import type { BusinessConnection, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup } from "grammy/types";
 import { ClaudeCLI, ClaudeError, ClaudeLimitError } from "./claudeCli.js";
+import { buildBackup } from "./backup.js";
 import { buildDailyReport, type ReportClient, REPORT_WINDOW_SECONDS, tashkentDate, tashkentHour } from "./dailyReport.js";
 import { ClientFolders, type PackageFile, statusText } from "./clientFolder.js";
 import type { Settings } from "./config.js";
@@ -1221,6 +1222,26 @@ export class Assistant {
   }
 
   /**
+   * Sends a zip of the data directory to the admin (see backup.ts), so that a lost volume can be restored.
+   * Nothing is sent while nobody has written to the bot yet.
+   */
+  async sendBackup(api: Api): Promise<void> {
+    const dir = this.settings.dataDir;
+    if (this.users.list().length === 0) return;
+    const backup = await buildBackup(dir);
+    if (backup.buffer.length > 49 * 1024 * 1024) {
+      logError(`The backup is ${Math.round(backup.buffer.length / 1024 / 1024)} MB, over Telegram's 50 MB limit; it was not sent.`);
+      return;
+    }
+    const date = tashkentDate(this.#clock());
+    const note = backup.skipped > 0 ? `\n${backup.skipped} ta hujjat hajm chegarasi tufayli kirmadi (ro'yxati arxiv ichida).` : "";
+    await api.sendDocument(this.settings.ownerId, new InputFile(backup.buffer, `zaxira-${date}.zip`), {
+      caption: `💾 Zaxira nusxa: ${date}\n${backup.included} ta fayl, ${(backup.buffer.length / 1024 / 1024).toFixed(1)} MB.${note}\nTiklash: arxivni botning data papkasiga (Railway'da /app/data) joylang.`,
+    });
+    log(`Backup sent to the admin (${backup.included} files, ${backup.skipped} left out).`);
+  }
+
+  /**
    * Sends the daily report once a day, at DAILY_REPORT_HOUR Tashkent time (or at the first check after it, e.g.
    * after a restart). The date of the last report is kept in state.json, so a restart never sends it twice.
    */
@@ -1235,6 +1256,12 @@ export class Assistant {
       } catch (err) {
         this.state.lastReportDate = "";
         logError(`The daily report could not be sent (will retry): ${errorMessage(err)}`);
+        return;
+      }
+      try {
+        await this.sendBackup(api);
+      } catch (err) {
+        logError(`The backup could not be sent: ${errorMessage(err)}`);
       }
     };
     void check();

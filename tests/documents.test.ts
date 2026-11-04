@@ -2,6 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import JSZip from "jszip";
+import { buildBackup } from "../src/backup.js";
 import { ClientFolders, safeFileName, statusText } from "../src/clientFolder.js";
 import { decodeFileId, encodeFileId, FileIdError } from "../src/largeFiles.js";
 import { splitTemplate } from "../src/prompts.js";
@@ -644,5 +646,52 @@ describe("weak spots", () => {
         fs.rmSync(dir, { recursive: true, force: true });
       }
     });
+  });
+});
+
+describe("daily backup", () => {
+  const toOwner = (h: ReturnType<typeof makeHarness>) => h.api.calls.filter((c) => Number(c.payload.chat_id) === OWNER_ID);
+
+  it("sends nothing while the bot has no data", async () => {
+    const h = makeHarness();
+    await h.assistant.sendBackup(h.bot.api);
+    expect(toOwner(h)).toHaveLength(0);
+  });
+
+  it("sends a zip of the data to the admin once there is data", async () => {
+    const h = makeHarness();
+    h.generator.push("Assalomu alaykum!");
+    await h.send(h.directMessage("Salom, litsenziya kerak"));
+    await h.send(h.directMessage(null, { file: pdf("ustav.pdf") }));
+    await h.flush();
+    h.api.clear();
+    await h.assistant.sendBackup(h.bot.api);
+    const sent = toOwner(h);
+    expect(sent.map((c) => c.method)).toEqual(["sendDocument"]);
+    expect(String(sent[0]?.payload.caption)).toContain("Zaxira nusxa");
+  });
+
+  it("keeps the small data files and lists documents that do not fit the budget", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "backup-"));
+    try {
+      fs.mkdirSync(path.join(dir, "clients", "7", "received"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "users.json"), "{}");
+      fs.writeFileSync(path.join(dir, "mtproto.session"), "secret");
+      fs.writeFileSync(path.join(dir, "clients", "7", "status.json"), "{}");
+      fs.writeFileSync(path.join(dir, "clients", "7", "received", "small.pdf"), Buffer.alloc(100));
+      fs.writeFileSync(path.join(dir, "clients", "7", "received", "big.pdf"), Buffer.alloc(5000));
+      const result = await buildBackup(dir, 1000);
+      const zip = await JSZip.loadAsync(result.buffer);
+      const names = Object.keys(zip.files);
+      expect(names).toContain("users.json");
+      expect(names).toContain("clients/7/status.json");
+      expect(names).toContain("clients/7/received/small.pdf");
+      expect(names).not.toContain("clients/7/received/big.pdf");
+      expect(names).not.toContain("mtproto.session");
+      expect(result.skipped).toBe(1);
+      expect(await zip.file("FAYLLAR-RO'YXATI.txt")?.async("string")).toContain("big.pdf");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
