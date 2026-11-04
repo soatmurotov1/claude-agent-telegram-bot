@@ -695,3 +695,11 @@ describe("daily backup", () => {
     }
   });
 });
+
+describe("file size limit", () => {
+  it("is 100 MB by default and cannot be raised above it", () => {
+    expect(makeHarness().settings.maxFileMb).toBe(100);
+    expect(makeHarness({ MAX_FILE_MB: "2000" }).settings.maxFileMb).toBe(100);
+    expect(makeHarness({ MAX_FILE_MB: "30" }).settings.maxFileMb).toBe(30);
+  });
+});

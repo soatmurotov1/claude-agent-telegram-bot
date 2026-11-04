@@ -60,7 +60,7 @@ Common to both:
 | The last needed file arrives (however long it takes) | The admin gets one 🎉 message (with the documents the client does not have), then every file in albums of up to 10 (by `file_id`, so any size), each captioned `📄 3/14 — name` |
 | Client presses «❌ Menda yo'q hujjatlar» | A menu of the 14 documents: each press marks ❌ / unmarks one; «✅ Tayyor» shows the status (e.g. `0/12`) and sends the package if the files already cover the rest. Bot chat only; in business chats Claude answers |
 | A file comes after the package was sent | Passed to the admin at once as `🔄 Qo'shimcha fayl` |
-| A file is larger than 20 MB | Downloaded over MTProto when `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` are set (up to `MAX_FILE_MB`, default and maximum 2000); otherwise the client is asked to compress or split it |
+| A file is larger than 20 MB | Downloaded over MTProto when `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` are set (up to `MAX_FILE_MB`, default and maximum 100); otherwise the client is asked to compress or split it |
 | Client writes "holat" / "статус" / presses 📊 | Their document status, without Claude |
 | Client writes "anketa" / "анкета" / presses 📄, or Claude adds `[SEND_TEMPLATE]` | The blank questionnaire is sent (Russian for Russian and English speakers) |
 | Admin writes after pressing ✍️ | Text, photo, file or voice goes to that person; the bot is silent there for `OWNER_TAKEOVER_MINUTES` |

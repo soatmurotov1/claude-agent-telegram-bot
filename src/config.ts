@@ -222,7 +222,7 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
     historyTtlDays: int("HISTORY_TTL_DAYS", 30, 1),
     reviewDailyLimit: int("REVIEW_DAILY_LIMIT", 100, 1),
     dailyReportHour: Math.min(int("DAILY_REPORT_HOUR", 9, 0), 23),
-    maxFileMb: Math.min(int("MAX_FILE_MB", 2000, 1), 2000),
+    maxFileMb: Math.min(int("MAX_FILE_MB", 100, 1), 100),
     telegramApiId: apiIdValue ? Number(apiIdValue) : 0,
     dataDir: path.resolve(baseDir, get("DATA_DIR") || "data"),
     profilePath: path.resolve(baseDir, get("PROFILE_PATH") || "company.md"),
