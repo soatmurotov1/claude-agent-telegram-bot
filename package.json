@@ -2,7 +2,7 @@
   "name": "sanoatgeokontexxizmat-assistant",
   "version": "1.0.0",
   "private": true,
-  "description": "Telegram Business assistant bot for Sanoatgeokontexxizmat, answering through the Claude Code CLI",
+  "description": "Telegram assistant bot for Sanoatgeokontexxizmat: AI orchestrator (Claude API, Gemini backup), PostgreSQL long-term memory and an Admin AI assistant",
   "type": "module",
   "engines": {
     "node": ">=22"
@@ -11,19 +11,25 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:db": "vitest run tests/acceptance.test.ts",
     "start": "node dist/bot.js",
-    "check-claude": "tsx src/bot.ts --check-claude",
+    "check-ai": "tsx src/bot.ts --check-ai",
     "try": "tsx src/bot.ts --try"
   },
   "dependencies": {
     "@grammyjs/runner": "^2.0.3",
     "dotenv": "^16.4.7",
+    "exceljs": "^4.4.0",
     "grammy": "^1.30.0",
     "jszip": "^3.10.1",
+    "pdfkit": "^0.20.2",
+    "pg": "^8.23.1",
     "telegram": "^2.26.22"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/pdfkit": "^0.17.7",
+    "@types/pg": "^8.23.1",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3",
     "vitest": "^2.1.8"

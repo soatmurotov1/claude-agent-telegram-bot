@@ -5,15 +5,25 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { GrammyError, HttpError, InputFile, InputMediaBuilder, type Api } from "grammy";
 import type { BusinessConnection, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup } from "grammy/types";
-import { ClaudeCLI, ClaudeError, ClaudeLimitError } from "./claudeCli.js";
+import { AdminAssistant } from "./admin/adminAssistant.js";
+import { ClaudeProvider } from "./ai/claudeProvider.js";
+import { GeminiProvider } from "./ai/geminiProvider.js";
+import { AIProviderManager, type SwitchEvent } from "./ai/providerManager.js";
+import { AllProvidersDownError, type Embedder } from "./ai/types.js";
 import { buildBackup } from "./backup.js";
+import type { Database } from "./db/database.js";
+import { messageKey } from "./db/importJson.js";
+import { loadPriceList, type PriceList } from "./knowledge/prices.js";
+import { MemoryManager } from "./memory.js";
+import { type BrainResult, type CustomerBrain, Orchestrator, type ReplyGenerator, SimpleBrain } from "./orchestrator/orchestrator.js";
+import { confidenceLevel } from "./orchestrator/decisionTree.js";
 import { buildDailyReport, type ReportClient, REPORT_WINDOW_SECONDS, tashkentDate, tashkentHour } from "./dailyReport.js";
 import { ClientFolders, type PackageFile, statusText } from "./clientFolder.js";
 import type { Settings } from "./config.js";
 import { Inbox, type InboxFile, type ReviewChat } from "./documentReview.js";
 import { detectLanguage, type Language } from "./language.js";
 import { BOT_API_DOWNLOAD_LIMIT, MtprotoDownloader } from "./largeFiles.js";
-import { buildSystemPrompt, buildUserPrompt, SKIP_TOKEN, splitEscalation, splitTemplate } from "./prompts.js";
+import { DOCUMENTS_UZ, SKIP_TOKEN, splitEscalation, splitTemplate } from "./prompts.js";
 import { blankFor, loadTemplate, type Template } from "./templates.js";
 import {
   appendJsonl,
@@ -47,6 +57,12 @@ export const Outcome = {
   status_shown: "status_shown",
   template_sent: "template_sent",
   missing_menu: "missing_menu",
+  /** Every AI provider was down: the message waits in the queue and is answered later. */
+  queued: "queued",
+  /** A newer message from the same person arrived while this reply was written; the newer one is answered. */
+  superseded: "superseded",
+  /** A reply to this exact message was already sent (idempotency). */
+  already_answered: "already_answered",
   error: "error",
 } as const;
 export type Outcome = (typeof Outcome)[keyof typeof Outcome];
@@ -62,15 +78,12 @@ export interface Preview {
   note: string;
 }
 
-/** Writes replies (Claude). Client files are not sent to it. */
-export interface ReplyGenerator {
-  generate(system: string, user: string): Promise<string>;
-}
+export type { ReplyGenerator } from "./orchestrator/orchestrator.js";
 
 const MAX_MESSAGE_LENGTH = 4000;
 const OWNER_ALERT_INTERVAL_SECONDS = 600;
-/** Messages kept per chat for the owner's user folders. */
-const TRANSCRIPT_LIMIT = 5000;
+/** Messages kept per chat for the admins' user folders: all of them (nothing is deleted by age or count). */
+const TRANSCRIPT_LIMIT = Number.MAX_SAFE_INTEGER;
 /** Users per "users" list message; Telegram allows at most 100 inline buttons per message. */
 const USERS_PER_PAGE = 40;
 /** A user folder longer than this many Telegram messages is sent as a .txt file instead. */
@@ -81,8 +94,6 @@ export const FOLDER_CALLBACK_PREFIX = "folder:";
 export const REPLY_CALLBACK_PREFIX = "reply:";
 /** callback_data of the button that ends reply mode. */
 export const REPLY_DONE_CALLBACK = "reply-done";
-/** How long the owner's reply mode stays open after the last message sent in it. */
-export const REPLY_MODE_MINUTES = 15;
 /** callback_data prefixes of the buttons under a client's folder. */
 export const CHAT_TXT_CALLBACK_PREFIX = "chattxt:";
 export const FILES_CALLBACK_PREFIX = "files:";
@@ -398,6 +409,12 @@ export class KeyedMutex {
 
 export interface AssistantOptions {
   clock?: Clock;
+  /** PostgreSQL (long-term memory, analytics, idempotency); null runs on the JSON files only. */
+  db?: Database | null;
+  /** Claude + Gemini; null in the offline tests that use a scripted generator. */
+  ai?: AIProviderManager | null;
+  memory?: MemoryManager | null;
+  admin?: AdminAssistant | null;
   previewSink?: (preview: Preview) => void;
   downloadFile?: FileDownloader;
   /** Downloads files over 20 MB (MTProto); null turns large files off. Built from TELEGRAM_API_ID/HASH by default. */
@@ -416,6 +433,8 @@ interface ChatContext {
   chatKey: string;
   chatName: string;
   incoming: string;
+  /** "<history id>:<chat id>:<message id>": one reply per incoming message. */
+  incomingKey?: string;
   language: Language | null;
   /** Topic the person wrote in, when the bot has topics (BotFather "Threaded Mode") enabled. */
   threadId?: number;
@@ -432,8 +451,10 @@ export type OwnerReplyResult = "sent" | "no_target" | "failed" | "unsupported";
 
 /** History namespace for people who write to the bot directly. */
 export const DIRECT_HISTORY_ID = "direct";
-/** Claude calls allowed per person per hour in direct chats (protects the subscription limit). */
+/** AI calls allowed per person per hour in direct chats (protects against flooding and API costs). */
 export const DIRECT_HOURLY_LIMIT = 20;
+/** How often the queue of messages that waited for an AI provider is retried. */
+export const PENDING_RETRY_SECONDS = 60;
 
 export class Assistant {
   readonly history: HistoryStore;
@@ -449,12 +470,18 @@ export class Assistant {
   readonly outcomes: Outcome[] = [];
   readonly previewsFile: string;
   readonly #connections = new Map<string, BusinessConnection>();
-  readonly #takeoverUntil = new Map<string, number>();
   readonly #locks = new KeyedMutex();
   readonly #ownerAlerts = new Map<string, number>();
   readonly #directCalls = new Map<string, number[]>();
-  /** The person the owner is writing to after pressing ✍️, until `until`. */
-  #replyTo: { userId: number; until: number } | null = null;
+  readonly db: Database | null;
+  readonly ai: AIProviderManager | null;
+  readonly memory: MemoryManager | null;
+  readonly admin: AdminAssistant | null;
+  readonly #admins: Set<number>;
+  /** Database writes run one after another in this chain, so the order of messages is kept. */
+  #dbChain: Promise<void> = Promise.resolve();
+  /** Messages waiting for an AI provider when there is no database (lost on restart). */
+  readonly #pendingMemory = new Map<string, ChatContext>();
   readonly #clock: Clock;
   readonly #previewSink: (preview: Preview) => void;
   readonly #downloadFile: FileDownloader;
@@ -471,10 +498,25 @@ export class Assistant {
 
   constructor(
     readonly settings: Settings,
-    private readonly generator: ReplyGenerator,
-    { clock = () => Date.now() / 1000, previewSink = printPreview, downloadFile, downloadLargeFile, reviewDelayMs }: AssistantOptions = {},
+    readonly brain: CustomerBrain,
+    {
+      clock = () => Date.now() / 1000,
+      previewSink = printPreview,
+      downloadFile,
+      downloadLargeFile,
+      reviewDelayMs,
+      db = null,
+      ai = null,
+      memory = null,
+      admin = null,
+    }: AssistantOptions = {},
   ) {
     this.#clock = clock;
+    this.db = db;
+    this.ai = ai;
+    this.memory = memory;
+    this.admin = admin;
+    this.#admins = new Set(settings.adminIds.length > 0 ? settings.adminIds : [settings.ownerId]);
     this.#previewSink = previewSink;
     const download = downloadFile ?? ((api, fileId, target) => telegramDownload(api, settings.botToken, fileId, target));
     this.#downloadFile = (api, fileId, target) => this.#downloadSlots.run(() => download(api, fileId, target));
@@ -498,7 +540,7 @@ export class Assistant {
     this.history = new HistoryStore(
       path.join(dir, "history.json"),
       settings.historyLimit,
-      settings.historyTtlDays,
+      0,
       clock,
     );
     const transcriptsFile = path.join(dir, "transcripts.json");
@@ -510,15 +552,46 @@ export class Assistant {
     this.transcripts = new HistoryStore(
       transcriptsFile,
       TRANSCRIPT_LIMIT,
-      settings.historyTtlDays,
+      0,
       clock,
     );
     this.seen = new SeenMessages(path.join(dir, "seen.json"));
     this.state = new RuntimeState(path.join(dir, "state.json"));
-    this.users = new UserDirectory(path.join(dir, "users.json"), settings.historyTtlDays, clock);
+    this.users = new UserDirectory(path.join(dir, "users.json"), 0, clock);
     this.folders = new ClientFolders(path.join(dir, "clients"), clock);
     this.inbox = new Inbox(this.folders);
     this.previewsFile = path.join(dir, "previews.jsonl");
+  }
+
+  /** True for every admin (OWNER_ID and ADMIN_IDS); all admins are equal. */
+  isAdmin(userId: number | undefined): boolean {
+    return userId !== undefined && this.#admins.has(userId);
+  }
+
+  get adminIds(): number[] {
+    return [...this.#admins];
+  }
+
+  /** Runs a database write after the previous ones; a failure is logged and never stops the bot. */
+  #dbWrite(label: string, fn: (db: Database) => Promise<unknown>): void {
+    const db = this.db;
+    if (!db) return;
+    this.#dbChain = this.#dbChain.then(
+      () =>
+        fn(db).then(
+          () => undefined,
+          (err: unknown) => logError(`Database (${label}) failed: ${errorMessage(err)}`),
+        ),
+    );
+  }
+
+  /** Waits until every queued database write is done (before reading, and in tests). */
+  async dbIdle(): Promise<void> {
+    let chain: Promise<void>;
+    do {
+      chain = this.#dbChain;
+      await chain;
+    } while (chain !== this.#dbChain);
   }
 
   #record(outcome: Outcome): Outcome {
@@ -540,10 +613,10 @@ export class Assistant {
 
   onBusinessConnection(connection: BusinessConnection): void {
     this.#connections.set(connection.id, connection);
-    if (connection.user.id !== this.settings.ownerId) {
+    if (!this.isAdmin(connection.user.id)) {
       logError(
-        `WARNING: business connection ${connection.id} belongs to user ${connection.user.id}, not OWNER_ID ` +
-          `${this.settings.ownerId}. Its messages will be ignored.`,
+        `WARNING: business connection ${connection.id} belongs to user ${connection.user.id}, which is not in ` +
+          `ADMIN_IDS/OWNER_ID. Its messages will be ignored.`,
       );
       return;
     }
@@ -558,26 +631,28 @@ export class Assistant {
     const connectionId = message.business_connection_id;
     if (!connectionId) return Outcome.no_connection;
     const chatId = message.chat.id;
-    if (!this.seen.firstTime(`${connectionId}:${chatId}:${message.message_id}`)) return Outcome.duplicate;
+    const updateKey = `${connectionId}:${chatId}:${message.message_id}`;
+    if (!this.seen.firstTime(updateKey)) return Outcome.duplicate;
+    if (this.db && !(await this.#firstTimeInDb(updateKey))) return Outcome.duplicate;
     if (message.sender_business_bot || message.from?.is_bot) return Outcome.ignored_bot;
 
     const connection = this.#connections.get(connectionId) ?? (await this.#lookupConnection(api, connectionId));
     if (!connection) return Outcome.no_connection;
-    if (connection.user.id !== this.settings.ownerId) return Outcome.foreign_connection;
+    if (!this.isAdmin(connection.user.id)) return Outcome.foreign_connection;
     if (!connection.is_enabled) return Outcome.connection_disabled;
 
     const text = describe(message);
     if (text === null) return Outcome.unsupported;
 
     const chatKey = HistoryStore.key(connectionId, chatId);
-    if (message.from?.id === this.settings.ownerId) {
-      this.#remember(connectionId, chatId, {
-        role: "owner",
-        name: this.settings.companyName,
-        text,
-        lang: detectLanguage(text),
-      });
-      this.#startTakeover(chatKey);
+    if (message.from?.id === connection.user.id) {
+      // An employee wrote from the company account: it is part of the conversation, the bot does not answer it.
+      this.#remember(
+        connectionId,
+        chatId,
+        { role: "owner", name: this.settings.companyName, text, lang: detectLanguage(text) },
+        "admin",
+      );
       return Outcome.owner_message;
     }
 
@@ -592,6 +667,7 @@ export class Assistant {
       chatKey,
       chatName: chatTitle(message),
       incoming: text,
+      incomingKey: `${connectionId}:${chatId}:${message.message_id}`,
       language,
     };
     const handled = await this.#handleFileOrQuick(api, message, chat);
@@ -638,7 +714,10 @@ export class Assistant {
     // Everything up to the duplicate check must stay synchronous (no await before it).
     const chatId = message.chat.id;
     if (message.chat.type !== "private") return Outcome.unsupported;
-    if (!this.seen.firstTime(`${DIRECT_HISTORY_ID}:${chatId}:${message.message_id}`)) return Outcome.duplicate;
+    const updateKey = `${DIRECT_HISTORY_ID}:${chatId}:${message.message_id}`;
+    if (!this.seen.firstTime(updateKey)) return Outcome.duplicate;
+    // seen.json is the fast check; the database also catches a repeat after a lost volume.
+    if (this.db && !(await this.#firstTimeInDb(updateKey))) return Outcome.duplicate;
     if (message.from?.is_bot) return Outcome.ignored_bot;
     const text = describe(message);
     if (text === null) return Outcome.unsupported;
@@ -655,6 +734,7 @@ export class Assistant {
       chatKey,
       chatName: chatTitle(message),
       incoming: text,
+      incomingKey: `${DIRECT_HISTORY_ID}:${chatId}:${message.message_id}`,
       language,
       threadId: message.is_topic_message ? message.message_thread_id : undefined,
     };
@@ -674,38 +754,41 @@ export class Assistant {
     return result.outcome;
   }
 
-  /** The owner pressed ✍️ under a person: the owner's next messages go to that person. Returns their name. */
-  startReply(userId: number): string {
-    this.#replyTo = { userId, until: this.#clock() + REPLY_MODE_MINUTES * 60 };
-    return this.personTitle(userId);
-  }
-
-  /** Ends reply mode. Returns the name of the person it was open for, or null. */
   /**
-   * Ends reply mode (also after it timed out) and lets the bot answer that person again right away.
-   * Returns their name, or null when the owner was not answering anyone.
+   * An admin pressed ✍️ under a person: that admin's next messages go to that person, and the bot is silent for the
+   * person until the admin presses «✖️ Tugatish» (no timer). Kept in state.json across restarts. Returns their name.
    */
-  endReply(): string | null {
-    const userId = this.#replyTo?.userId ?? null;
-    this.#replyTo = null;
-    if (userId === null) return null;
-    for (const key of [...this.#takeoverUntil.keys()]) {
-      if (key.endsWith(`:${userId}`)) this.#takeoverUntil.delete(key);
-    }
+  startReply(adminId: number, userId: number): string {
+    this.state.setReplyMode(adminId, userId);
+    this.#dbWrite("admin action", (db) => db.adminAction(adminId, "reply_mode_start", String(userId)));
     return this.personTitle(userId);
   }
 
-  #replyTarget(): number | null {
-    if (this.#replyTo && this.#replyTo.until <= this.#clock()) this.#replyTo = null;
-    return this.#replyTo?.userId ?? null;
+  /** Ends the admin's reply mode; the bot answers that person again at once. Returns their name, or null. */
+  endReply(adminId: number): string | null {
+    const userId = this.state.replyModes[String(adminId)] ?? null;
+    if (userId === null) return null;
+    this.state.setReplyMode(adminId, null);
+    this.#dbWrite("admin action", (db) => db.adminAction(adminId, "reply_mode_end", String(userId)));
+    return this.personTitle(userId);
+  }
+
+  /** The person this admin is answering with ✍️, or null. */
+  replyTarget(adminId: number): number | null {
+    return this.state.replyModes[String(adminId)] ?? null;
+  }
+
+  /** True while any admin has ✍️ open for this person. */
+  #adminAnswering(userId: number): boolean {
+    return Object.values(this.state.replyModes).includes(userId);
   }
 
   /**
-   * A message from the owner while reply mode is open: deliver it (text, photo, file, voice...) to that person
-   * and keep the bot quiet in that chat for OWNER_TAKEOVER_MINUTES.
+   * A message from an admin while their reply mode is open: deliver it (text, photo, file, voice...) to that person.
    */
   async sendOwnerReply(api: Api, message: Message): Promise<{ result: OwnerReplyResult; to: string }> {
-    const userId = this.#replyTarget();
+    const adminId = message.from?.id ?? 0;
+    const userId = this.replyTarget(adminId);
     if (userId === null) return { result: "no_target", to: "" };
     const to = this.personTitle(userId);
     // Answer where the person last wrote: the bot's own chat or the business account.
@@ -718,7 +801,7 @@ export class Assistant {
         if (message.text === undefined) return { result: "unsupported", to };
         const reason = await this.#connectionProblem(api, via);
         if (reason) {
-          logError(`Not sending the owner's reply to chat ${userId}: ${reason}.`);
+          logError(`Not sending the admin's reply to chat ${userId}: ${reason}.`);
           return { result: "failed", to };
         }
         for (const chunk of splitMessage(message.text)) {
@@ -726,14 +809,13 @@ export class Assistant {
         }
       }
     } catch (err) {
-      logError(`Could not deliver the owner's reply to chat ${userId}: ${errorMessage(err)}`);
+      logError(`Could not deliver the admin's reply to chat ${userId}: ${errorMessage(err)}`);
       return { result: "failed", to };
     }
     const text = describe(message) ?? "[message]";
-    this.#remember(via, userId, { role: "owner", name: this.settings.companyName, text, lang: detectLanguage(text) });
-    this.#startTakeover(HistoryStore.key(via, userId));
-    this.#replyTo = { userId, until: this.#clock() + REPLY_MODE_MINUTES * 60 };
-    log(`Delivered the owner's reply to chat ${userId}.`);
+    this.#remember(via, userId, { role: "owner", name: this.settings.companyName, text, lang: detectLanguage(text) }, "admin");
+    this.#dbWrite("admin action", (db) => db.adminAction(adminId, "reply", String(userId), { text: text.slice(0, 500) }));
+    log(`Delivered admin ${adminId}'s reply to chat ${userId}.`);
     return { result: "sent", to };
   }
 
@@ -742,12 +824,6 @@ export class Assistant {
     const user = this.users.list().find((known) => known.id === userId);
     if (!user) return `ID ${userId}`;
     return user.username ? `${user.name} @${user.username}` : user.name;
-  }
-
-  #startTakeover(chatKey: string): void {
-    if (this.settings.ownerTakeoverMinutes > 0) {
-      this.#takeoverUntil.set(chatKey, this.#clock() + this.settings.ownerTakeoverMinutes * 60);
-    }
   }
 
   #allowDirectCall(chatKey: string): boolean {
@@ -760,6 +836,15 @@ export class Assistant {
     recent.push(now);
     this.#directCalls.set(chatKey, recent);
     return true;
+  }
+
+  async #firstTimeInDb(key: string): Promise<boolean> {
+    try {
+      return await this.db!.firstTime(key);
+    } catch (err) {
+      logError(`Database duplicate check failed (handled as new): ${errorMessage(err)}`);
+      return true;
+    }
   }
 
   async #lookupConnection(api: Api, connectionId: string): Promise<BusinessConnection | null> {
@@ -777,11 +862,8 @@ export class Assistant {
     const now = this.#clock();
     if (this.state.paused) return Outcome.paused;
     if (this.state.limitUntil > now) return Outcome.limited;
-    const takeover = this.#takeoverUntil.get(chatKey);
-    if (takeover !== undefined) {
-      if (takeover > now) return Outcome.owner_active;
-      this.#takeoverUntil.delete(chatKey);
-    }
+    const chatId = Number(chatKey.slice(chatKey.lastIndexOf(":") + 1));
+    if (this.#adminAnswering(chatId)) return Outcome.owner_active;
     return null;
   }
 
@@ -796,28 +878,56 @@ export class Assistant {
     const blocked = this.#blocked(chat.chatKey);
     if (blocked) return result(blocked);
 
-    const system = buildSystemPrompt(
-      this.settings.companyName,
-      readProfile(this.settings.profilePath),
-      new Date(this.#clock() * 1000),
-    );
-    const user = buildUserPrompt(this.#memory(chat), chat.language);
+    // Idempotency: never a second reply to the same incoming message (e.g. a retried queue entry).
+    if (chat.incomingKey && this.db) {
+      await this.dbIdle();
+      const exists = await this.db.replyExists(chat.incomingKey).catch(() => false);
+      if (exists) return result(Outcome.already_answered);
+    }
 
-    let raw: string;
+    const before = this.#customerMessageCount(chat.chatId);
+    await this.dbIdle();
+    let brainResult: BrainResult;
     try {
-      raw = await this.generator.generate(system, user);
+      brainResult = await this.brain.reply({
+        customerId: chat.chatId,
+        chatName: chat.chatName,
+        language: chat.language,
+        recent: this.#memory(chat),
+        incoming: chat.incoming,
+        incomingKey: chat.incomingKey ?? "",
+        companyName: this.settings.companyName,
+        profileText: readProfile(this.settings.profilePath),
+        now: new Date(this.#clock() * 1000),
+      });
     } catch (err) {
       const failure = await this.#onGenerateError(api, chat, err);
       return result(failure.outcome, "", false, failure.note);
     }
+    for (const note of brainResult.notes) log(`Chat ${chat.chatName} (${chat.chatId}): ${note}`);
 
-    const { escalate, text: withMarkers } = splitEscalation(raw);
-    const { sendTemplate, text: reply } = splitTemplate(withMarkers);
+    // The person wrote again while this reply was written: the newer message is answered with all of them in view,
+    // so one reply covers both and nothing is said twice.
+    if (this.#customerMessageCount(chat.chatId) > before) {
+      this.#saveRequest(chat, brainResult, "superseded", null);
+      log(`Chat ${chat.chatName} (${chat.chatId}): a newer message arrived; this reply is dropped in favour of it.`);
+      return result(Outcome.superseded);
+    }
+
+    const raw = brainResult.raw;
+    const marked = splitEscalation(raw);
+    const { sendTemplate, text: reply } = splitTemplate(marked.text);
+    const analysis = brainResult.analysis;
+    const escalate =
+      marked.escalate || (analysis.fromAi && ["complaint", "emergency", "official_request"].includes(analysis.requestType));
     if (!reply || reply.startsWith(SKIP_TOKEN)) {
       log(`Chat ${chat.chatName} (${chat.chatId}): no reply needed ([SKIP]).`);
+      this.#saveRequest(chat, brainResult, "skipped", null);
+      if (escalate) await this.#alertEscalation(api, chat);
       return result(Outcome.skipped, "", escalate);
     }
     if (escalate) await this.#alertEscalation(api, chat);
+    if (analysis.fromAi && analysis.requestType === "price_request") await this.#alertPriceLead(api, chat, brainResult);
 
     const preview: Preview = {
       connectionId: chat.target.kind === "business" ? chat.target.connectionId : DIRECT_HISTORY_ID,
@@ -832,6 +942,8 @@ export class Assistant {
 
     if (!this.settings.autoSend) {
       this.#showPreview(preview);
+      this.#saveRequest(chat, brainResult, "previewed", reply);
+      this.#afterReply(chat.chatId);
       return result(Outcome.previewed, reply, escalate);
     }
 
@@ -874,9 +986,78 @@ export class Assistant {
       text: reply,
       lang: chat.language,
     });
-    log(`Sent a reply to chat ${chat.chatName} (${chat.chatId})${escalate ? " [ESCALATED]" : ""}.`);
+    const incomingKey = chat.incomingKey;
+    if (incomingKey) {
+      this.#dbWrite("reply", (db) => db.recordReply(incomingKey, chat.chatId, reply, brainResult.provider));
+    }
+    this.#saveRequest(chat, brainResult, "sent", reply);
+    log(
+      `Sent a reply to chat ${chat.chatName} (${chat.chatId})${escalate ? " [ESCALATED]" : ""}` +
+        `${brainResult.provider ? ` via ${brainResult.provider}` : ""} [${brainResult.workflow}].`,
+    );
     if (sendTemplate) await this.#sendTemplate(api, chat, false);
+    this.#afterReply(chat.chatId);
     return result(Outcome.sent, reply, escalate);
+  }
+
+  /** Customer messages of this person in the transcripts (to notice a newer one while a reply is written). */
+  #customerMessageCount(chatId: number): number {
+    return this.transcripts.forChat(chatId).filter((item) => item.role === "other").length;
+  }
+
+  /** Step 7 of the decision tree: the request, its type, workflow, confidence and result go to ai_requests. */
+  #saveRequest(chat: ChatContext, brain: BrainResult, status: string, finalResult: string | null, error: string | null = null): void {
+    const analysis = brain.analysis;
+    this.#dbWrite("ai request", (db) =>
+      db.saveAiRequest({
+        requestId: brain.requestId,
+        chatId: chat.chatId,
+        customerId: chat.chatId,
+        adminId: null,
+        incomingKey: chat.incomingKey ?? null,
+        requestType: analysis.requestType,
+        complexity: analysis.complexity,
+        contextCompleteness: analysis.contextCompleteness,
+        selectedWorkflow: brain.workflow,
+        workflowPath: brain.path,
+        confidenceScore: analysis.confidence,
+        confidenceLevel: confidenceLevel(analysis.confidence),
+        requiredPermissions: brain.workflow === "escalate" ? ["customer_reply", "admin_notify"] : brain.workflow === "price_answer" ? ["customer_reply", "price_list_read", "admin_notify"] : ["customer_reply"],
+        executionStatus: status,
+        finalResult,
+        provider: brain.provider,
+        model: brain.model,
+        topic: analysis.topic || null,
+        service: analysis.services[0] ?? null,
+        error,
+      }),
+    );
+  }
+
+  /** Background work after a reply: the conversation summary is refreshed every few messages. */
+  #afterReply(chatId: number): void {
+    const memory = this.memory;
+    if (!memory) return;
+    this.#track(this.dbIdle().then(() => memory.maybeSummarize(chatId)));
+  }
+
+  readonly #background = new Set<Promise<unknown>>();
+
+  /** Keeps a background task so tests (and shutdown) can wait for it; its errors are only logged. */
+  #track(task: Promise<unknown>): void {
+    const tracked = task.catch((err: unknown) => logError(`Background task failed: ${errorMessage(err)}`));
+    this.#background.add(tracked);
+    void tracked.finally(() => this.#background.delete(tracked));
+  }
+
+  /** Waits for database writes and background tasks (summaries, embeddings). */
+  async idle(): Promise<void> {
+    for (let i = 0; i < 5; i++) {
+      await this.dbIdle();
+      if (this.#background.size === 0) return;
+      await Promise.all([...this.#background]);
+    }
+    await this.dbIdle();
   }
 
   /** Telegram send options for a chat: business connection and topic. */
@@ -1024,6 +1205,48 @@ export class Assistant {
   clientProgressText(userId: number, language: Language | null, { hint = false }: { hint?: boolean } = {}): string {
     const { total, titles, missing } = this.#packageSpec(language, userId);
     return statusText(this.folders.status(userId).received.length, total, titles, language, { missing, hint });
+  }
+
+  /** The client's document status for the Admin AI ("Qabul qilingan fayllar: 5/14" and the list), or null. */
+  documentStatus(userId: number): string | null {
+    if (!this.folders.exists(userId)) return null;
+    return this.clientProgressText(userId, "uz");
+  }
+
+  /**
+   * An admin wrote free text: the Admin AI answers from the database. Long answers are split; report files follow.
+   */
+  async adminChat(api: Api, adminId: number, text: string): Promise<void> {
+    if (!this.admin) {
+      await api.sendMessage(
+        adminId,
+        this.db
+          ? "⚠️ Admin AI uchun AI provayder sozlanmagan (ANTHROPIC_API_KEY yoki GEMINI_API_KEY)."
+          : "⚠️ Admin AI ishlashi uchun PostgreSQL ulanmagan (DATABASE_URL). Mijoz bilan ishlash uchun «users» tugmasidan foydalaning.",
+      );
+      return;
+    }
+    await api.sendChatAction(adminId, "typing").catch(() => undefined);
+    const typing = setInterval(() => void api.sendChatAction(adminId, "typing").catch(() => undefined), 4500);
+    typing.unref();
+    try {
+      await this.dbIdle();
+      const answer = await this.admin.handle(adminId, text);
+      for (const chunk of splitMessage(answer.text)) await api.sendMessage(adminId, chunk, { link_preview_options: { is_disabled: true } });
+      for (const file of answer.files) {
+        await api.sendDocument(adminId, new InputFile(file.buffer, file.name), { caption: truncate(file.caption, 1000) });
+      }
+      this.#dbWrite("admin action", (db) => db.adminAction(adminId, "ai_question", null, { text: text.slice(0, 500), provider: answer.provider }));
+    } catch (err) {
+      logError(`Admin AI failed for ${adminId}: ${errorMessage(err)}`);
+      const reason =
+        err instanceof AllProvidersDownError
+          ? "Claude ham, Gemini ham hozir javob bermayapti. Birozdan keyin qayta so'rang."
+          : `Xato: ${truncate(errorMessage(err), 300)}`;
+      await api.sendMessage(adminId, `⚠️ So'rovni bajarib bo'lmadi. ${reason}`).catch(() => undefined);
+    } finally {
+      clearInterval(typing);
+    }
   }
 
   /** "5/14" for the owner's users list, or null when the client has not sent a file or marked a document yet. */
@@ -1211,14 +1434,47 @@ export class Assistant {
     });
     const report = buildDailyReport(clients, since, now, this.settings.companyName);
     if (report.hasChanges) {
+      const insights = await this.#dailyInsights(report.text);
       const name = `hisobot-${tashkentDate(now)}.txt`;
-      await api.sendDocument(this.settings.ownerId, new InputFile(Buffer.from(report.text, "utf8"), name), {
-        caption: `📋 Kunlik hisobot: ${tashkentDate(now)}`,
+      const text = insights ? `${report.text}\n\n=== AI xulosasi va tavsiyalar ===\n${insights}\n` : report.text;
+      await this.#toAdmins("the daily report", async (adminId) => {
+        await api.sendDocument(adminId, new InputFile(Buffer.from(text, "utf8"), name), {
+          caption: `📋 Kunlik hisobot: ${tashkentDate(now)}`,
+        });
+        if (insights) {
+          for (const chunk of splitMessage(`🧠 Kunlik tahlil (${tashkentDate(now)})\n\n${insights}`)) await api.sendMessage(adminId, chunk);
+        }
       });
     } else {
-      await api.sendMessage(this.settings.ownerId, `📋 Kunlik hisobot (${tashkentDate(now)}): oxirgi 24 soatda hech qanday o'zgarish yo'q.`);
+      await this.#toAdmins("the daily report", (adminId) =>
+        api.sendMessage(adminId, `📋 Kunlik hisobot (${tashkentDate(now)}): oxirgi 24 soatda hech qanday o'zgarish yo'q.`),
+      );
     }
-    log(`Daily report sent to the admin (${report.hasChanges ? "with changes" : "no changes"}).`);
+    this.#dbWrite("task", (db) => db.markTaskRun("daily_report", report.hasChanges ? "sent" : "no_changes"));
+    log(`Daily report sent to the admins (${report.hasChanges ? "with changes" : "no changes"}).`);
+  }
+
+  /** The AI's conclusions and recommendations on the day (empty when no provider is available). */
+  async #dailyInsights(reportText: string): Promise<string> {
+    if (!this.ai) return "";
+    try {
+      const response = await this.ai.chat({
+        purpose: "daily-report",
+        tier: "main",
+        maxTokens: 1500,
+        system:
+          `You analyse the daily activity report of «${this.settings.companyName}»'s customer Telegram bot for its admins. ` +
+          "Write in Uzbek (Latin script), Telegram plain text, no Markdown. Structure: Qisqacha xulosa; Asosiy ko'rsatkichlar; " +
+          "Savdo imkoniyatlari (which customers are closest to a deal and why); Muammolar (complaints, unanswered questions, " +
+          "stuck document packages); Tavsiyalar (concrete next actions, with customer names). Use only facts from the report; " +
+          "do not invent numbers. At most 2500 characters.",
+        messages: [{ role: "user", content: reportText.slice(0, 60_000) }],
+      });
+      return response.text.trim();
+    } catch (err) {
+      logError(`The daily AI analysis failed (the plain report is sent): ${errorMessage(err)}`);
+      return "";
+    }
   }
 
   /**
@@ -1235,9 +1491,11 @@ export class Assistant {
     }
     const date = tashkentDate(this.#clock());
     const note = backup.skipped > 0 ? `\n${backup.skipped} ta hujjat hajm chegarasi tufayli kirmadi (ro'yxati arxiv ichida).` : "";
-    await api.sendDocument(this.settings.ownerId, new InputFile(backup.buffer, `zaxira-${date}.zip`), {
-      caption: `💾 Zaxira nusxa: ${date}\n${backup.included} ta fayl, ${(backup.buffer.length / 1024 / 1024).toFixed(1)} MB.${note}\nTiklash: arxivni botning data papkasiga (Railway'da /app/data) joylang.`,
-    });
+    await this.#toAdmins("the backup", (adminId) =>
+      api.sendDocument(adminId, new InputFile(backup.buffer, `zaxira-${date}.zip`), {
+        caption: `💾 Zaxira nusxa: ${date}\n${backup.included} ta fayl, ${(backup.buffer.length / 1024 / 1024).toFixed(1)} MB.${note}\nTiklash: arxivni botning data papkasiga (Railway'da /app/data) joylang. Suhbatlar PostgreSQL'da ham saqlanadi.`,
+      }),
+    );
     log(`Backup sent to the admin (${backup.included} files, ${backup.skipped} left out).`);
   }
 
@@ -1358,20 +1616,25 @@ export class Assistant {
     try {
       if (this.folders.markPackageSent(userId)) {
         const absent = docs.flatMap((doc, i) => (missing.has(i) ? [`• ${i + 1}. ${doc.title}`] : []));
-        await api.sendMessage(
-          this.settings.ownerId,
-          `🎉 Yangi to'liq paket: ${who}\nMijoz ${count} ta fayl yubordi (kerak: ${total} ta). Fayllar quyida. ` +
-            "Bot fayllarni tekshirmagan." +
-            (absent.length > 0 ? `\n\n❌ Mijozda yo'q hujjatlar (${absent.length} ta):\n${absent.join("\n")}` : ""),
-          { reply_markup: folderKeyboard(userId) },
-        );
-        await this.#sendAlbumsToOwner(api, files, total, `👤 ${who}`);
+        this.#dbWrite("pipeline", (db) => db.updatePipeline(userId, { stage: "documents_sent" }));
+        await this.#toAdmins("the package", async (adminId) => {
+          await api.sendMessage(
+            adminId,
+            `🎉 Yangi to'liq paket: ${who}\nMijoz ${count} ta fayl yubordi (kerak: ${total} ta). Fayllar quyida. ` +
+              "Bot fayllarni tekshirmagan." +
+              (absent.length > 0 ? `\n\n❌ Mijozda yo'q hujjatlar (${absent.length} ta):\n${absent.join("\n")}` : ""),
+            { reply_markup: folderKeyboard(userId) },
+          );
+          await this.#sendAlbumsToOwner(api, adminId, files, total, `👤 ${who}`);
+        });
         log(`Chat ${userId}: the package is complete; ${files.length} file(s) sent to the owner.`);
         return;
       }
       // The package already went to the owner: this batch's files are extras.
       for (const file of files.filter((f) => f.number > before)) {
-        await this.#sendFileToOwner(api, file, `🔄 Qo'shimcha fayl (${file.number}-fayl): ${file.name}\n👤 ${who}`);
+        await this.#toAdmins("an extra file", (adminId) =>
+          this.#sendFileToOwner(api, adminId, file, `🔄 Qo'shimcha fayl (${file.number}-fayl): ${file.name}\n👤 ${who}`),
+        );
       }
     } catch (err) {
       logError(`Could not send the package of chat ${userId} to the owner: ${errorMessage(err)}`);
@@ -1379,11 +1642,11 @@ export class Assistant {
   }
 
   /** The owner's 📎 button: the client's status and every file they sent. Returns how many files were sent. */
-  async sendAcceptedFilesToOwner(api: Api, userId: number): Promise<number> {
+  async sendAcceptedFilesToOwner(api: Api, userId: number, adminId: number = this.settings.ownerId): Promise<number> {
     const files = this.folders.receivedFiles(userId);
     if (files.length === 0) return 0;
-    await api.sendMessage(this.settings.ownerId, this.clientProgressText(userId, "uz"));
-    await this.#sendAlbumsToOwner(api, files, this.#packageSpec("uz", userId).total, "");
+    await api.sendMessage(adminId, this.clientProgressText(userId, "uz"));
+    await this.#sendAlbumsToOwner(api, adminId, files, this.#packageSpec("uz", userId).total, "");
     return files.length;
   }
 
@@ -1392,7 +1655,7 @@ export class Assistant {
    * their Telegram file_id when known (no re-upload, any size). If an album cannot be sent, its files are sent one
    * by one instead.
    */
-  async #sendAlbumsToOwner(api: Api, files: PackageFile[], total: number, footer: string): Promise<void> {
+  async #sendAlbumsToOwner(api: Api, adminId: number, files: PackageFile[], total: number, footer: string): Promise<void> {
     const captionOf = (file: PackageFile): string =>
       truncate([`📄 ${file.number}/${total} — ${file.name}`, ...(footer ? [footer] : [])].join("\n"), 1000);
     for (let i = 0; i < files.length; i += ALBUM_SIZE) {
@@ -1400,7 +1663,7 @@ export class Assistant {
       if (chunk.length >= 2) {
         try {
           await api.sendMediaGroup(
-            this.settings.ownerId,
+            adminId,
             chunk.map((file) =>
               InputMediaBuilder.document(file.fileId ?? new InputFile(file.file, file.name), { caption: captionOf(file) }),
             ),
@@ -1410,7 +1673,7 @@ export class Assistant {
           logError(`Sending an album of ${chunk.length} file(s) failed (${errorMessage(err)}); sending them one by one.`);
         }
       }
-      for (const file of chunk) await this.#sendFileToOwner(api, file, captionOf(file));
+      for (const file of chunk) await this.#sendFileToOwner(api, adminId, file, captionOf(file));
     }
   }
 
@@ -1418,17 +1681,17 @@ export class Assistant {
    * Sends a saved file to the owner by its Telegram file_id when known (no re-upload, works for any size),
    * otherwise uploads the saved copy (Bot API uploads are limited to 50 MB).
    */
-  async #sendFileToOwner(api: Api, file: Pick<PackageFile, "file" | "name" | "fileId">, caption: string): Promise<void> {
+  async #sendFileToOwner(api: Api, adminId: number, file: Pick<PackageFile, "file" | "name" | "fileId">, caption: string): Promise<void> {
     const options = { caption: truncate(caption, 1000) };
     if (file.fileId) {
       try {
-        await api.sendDocument(this.settings.ownerId, file.fileId, options);
+        await api.sendDocument(adminId, file.fileId, options);
         return;
       } catch (err) {
         logError(`Sending ${file.name} by file_id failed (${errorMessage(err)}); uploading the saved copy.`);
       }
     }
-    await api.sendDocument(this.settings.ownerId, new InputFile(file.file, file.name), options);
+    await api.sendDocument(adminId, new InputFile(file.file, file.name), options);
   }
 
 
@@ -1436,7 +1699,7 @@ export class Assistant {
     try {
       const fresh = await api.getBusinessConnection(connectionId);
       this.#connections.set(connectionId, fresh);
-      if (fresh.user.id !== this.settings.ownerId) return "the connection belongs to another account";
+      if (!this.isAdmin(fresh.user.id)) return "the connection belongs to another account";
       if (!fresh.is_enabled) return "the connection is disabled";
       if (!canReply(fresh)) return "the bot has no permission to reply in this account";
       return "";
@@ -1446,44 +1709,108 @@ export class Assistant {
   }
 
   async #onGenerateError(api: Api, chat: ChatContext, err: unknown): Promise<{ outcome: Outcome; note: string }> {
-    const alertOwner = this.settings.autoSend;
-    if (err instanceof ClaudeLimitError) {
-      const now = this.#clock();
-      const until =
-        err.resetsAt !== null && err.resetsAt > now ? err.resetsAt : now + this.settings.limitCooldownMinutes * 60;
-      this.state.limitUntil = until;
-      const untilText = new Date(until * 1000).toISOString();
-      logError(`${err.message}. No replies will be generated until ${untilText}. CLI said: ${err.detail}`);
-      if (alertOwner) {
-        await this.#notifyOwner(
-          api,
-          "limit",
-          `⚠️ Claude obunasining foydalanish limiti tugadi. Bot ${tashkentTime(until)} gacha (Toshkent vaqti) ` +
-            `murojaatlarga javob bermaydi. Bu vaqtda kelgan xabarlarga o'zingiz javob bering. ` +
-            `Limit oldinroq tiklansa, /resume yuboring.`,
-        );
+    if (err instanceof AllProvidersDownError) {
+      // Nothing is lost: the message waits in the queue and is answered (once) when a provider is back.
+      const key = chat.incomingKey ?? `${chat.chatKey}:${Math.round(this.#clock())}`;
+      const stored = { ...chat, incomingKey: key };
+      if (this.db) {
+        const db = this.db;
+        this.#dbWrite("pending reply", () => db.enqueuePending(key, chat.chatId, stored as unknown as Record<string, unknown>, err.message));
+      } else {
+        this.#pendingMemory.set(key, stored);
       }
-      return { outcome: Outcome.limited, note: `Claude limiti ${tashkentTime(until)} gacha` };
+      logError(`Chat ${chat.chatName} (${chat.chatId}): ${err.message}. The message is queued.`);
+      return { outcome: Outcome.queued, note: "AI providerlar ishlamayapti, xabar navbatda" };
     }
-    if (err instanceof ClaudeError) {
-      logError(`Claude failed for chat ${chat.chatName}: ${errorMessage(err)}`);
-      if (alertOwner) {
-        await this.#notifyOwner(
-          api,
-          "error",
-          `⚠️ Bot "${chat.chatName}" chatidagi murojaatga javob tayyorlay olmadi, murojaatchiga hech narsa yuborilmadi. ` +
-            `Iltimos, o'zingiz javob bering.\n\nSabab: ${truncate(err.message, 500)}`,
-        );
+    logError(`Generating a reply for chat ${chat.chatName} failed: ${errorMessage(err)}`);
+    if (this.settings.autoSend) {
+      await this.#notifyAdmins(
+        api,
+        "error",
+        `⚠️ Bot "${chat.chatName}" chatidagi xabarga javob tayyorlay olmadi, mijozga hech narsa yuborilmadi.\n\n` +
+          `Sabab: ${truncate(errorMessage(err), 500)}`,
+        replyKeyboard(chat.chatId),
+      );
+    }
+    return { outcome: Outcome.error, note: truncate(errorMessage(err), 300) };
+  }
+
+  /**
+   * Retries the messages that waited while every AI provider was down. Each is answered at most once (the reply
+   * check in #respond); a message the person followed up on is covered by the reply to the newer one.
+   */
+  async processPending(api: Api): Promise<number> {
+    this.#api = api;
+    let entries: { key: string; chat: ChatContext }[];
+    if (this.db) {
+      await this.dbIdle();
+      entries = (await this.db.pendingReplies(20)).map((p) => ({ key: p.incomingKey, chat: p.chat as unknown as ChatContext }));
+    } else {
+      entries = [...this.#pendingMemory].map(([key, chat]) => ({ key, chat }));
+    }
+    let answered = 0;
+    for (const { key, chat } of entries) {
+      if (!chat || typeof chat.chatId !== "number" || !this.users.list().some((u) => u.id === chat.chatId)) {
+        await this.#finishPending(key);
+        continue;
       }
-      return { outcome: Outcome.error, note: truncate(err.message, 300) };
+      // The conversation went on and was answered meanwhile (by the bot or an admin): no late reply out of order.
+      if (this.transcripts.forChat(chat.chatId).at(-1)?.role === "owner") {
+        await this.#finishPending(key);
+        continue;
+      }
+      const outcome = (await this.#locks.run(chat.chatKey, () => this.#respond(api, { ...chat, incomingKey: key }))).outcome;
+      if (outcome === Outcome.queued) break; // still down: try again later, in order
+      if (outcome === Outcome.owner_active || outcome === Outcome.paused) continue;
+      await this.#finishPending(key);
+      answered++;
     }
-    logError(`Unexpected error while generating a reply for chat ${chat.chatName}: ${errorMessage(err)}`);
-    return { outcome: Outcome.error, note: "kutilmagan xato" };
+    if (answered > 0) log(`Answered ${answered} queued message(s).`);
+    return answered;
+  }
+
+  async #finishPending(key: string): Promise<void> {
+    this.#pendingMemory.delete(key);
+    if (this.db) {
+      const db = this.db;
+      this.#dbWrite("pending done", () => db.finishPending(key));
+      await this.dbIdle();
+    }
+  }
+
+  startPendingWorker(api: Api): NodeJS.Timeout {
+    this.#api = api;
+    const timer = setInterval(() => {
+      void this.processPending(api).catch((err: unknown) => logError(`Processing the queue failed: ${errorMessage(err)}`));
+    }, PENDING_RETRY_SECONDS * 1000);
+    timer.unref();
+    return timer;
+  }
+
+  /** The API to use for notifications that do not come from an update (provider switches, scheduled work). */
+  attachApi(api: Api): void {
+    this.#api = api;
+  }
+
+  /** Tells the admins when Claude stops or comes back, or when no AI provider answers (TZ 16.4). */
+  async notifyProviderSwitch(event: SwitchEvent): Promise<void> {
+    const api = this.#api;
+    const text =
+      event.kind === "primary_down"
+        ? `⚠️ Claude ishlamayapti (${event.failure.kind}). Bot avtomatik Gemini'ga o'tdi; suhbatlar konteksti saqlanadi. ` +
+          `Claude har ${this.settings.aiProbeMinutes} daqiqada qayta tekshiriladi.\nSabab: ${truncate(event.failure.message, 300)}`
+        : event.kind === "primary_restored"
+          ? "✅ Claude tiklandi. Bot yana Claude orqali ishlayapti."
+          : `🚨 Claude ham, Gemini ham javob bermayapti. Mijozlarning xabarlari navbatda saqlanadi va provayder tiklanishi ` +
+            `bilan bir martadan javob beriladi.\n${event.failures.map((f) => `• ${f.provider}: ${f.kind} — ${truncate(f.message, 200)}`).join("\n")}`;
+    log(`AI provider event: ${event.kind}`);
+    this.#dbWrite("audit", (db) => db.audit("system", `ai_${event.kind}`, { text }));
+    if (api) await this.#notifyAdmins(api, `provider:${event.kind}`, text);
   }
 
   async #alertEscalation(api: Api, chat: ChatContext): Promise<void> {
-    log(`Chat ${chat.chatName}: the message was escalated to the owner.`);
-    await this.#notifyOwner(
+    log(`Chat ${chat.chatName}: the message was escalated to the admins.`);
+    await this.#notifyAdmins(
       api,
       `escalate:${chat.chatKey}`,
       `🚨 Muhim murojaat: "${chat.chatName}" chati\n\nMurojaatchi xabari:\n${truncate(chat.incoming, 500)}\n\n` +
@@ -1492,37 +1819,52 @@ export class Assistant {
     );
   }
 
-  /** Sends a private message from the bot to the owner, at most once per 10 minutes per key. */
-  async #notifyOwner(api: Api, key: string, text: string, keyboard?: InlineKeyboardMarkup): Promise<void> {
+  /** A customer asked the price: a lead for the admins (internal notification, TZ 19.4). */
+  async #alertPriceLead(api: Api, chat: ChatContext, brain: BrainResult): Promise<void> {
+    const services = brain.analysis.services.length > 0 ? brain.analysis.services.join(", ") : "aniqlanmagan";
+    await this.#notifyAdmins(
+      api,
+      `price:${chat.chatKey}`,
+      `💰 Narx so'radi: ${this.personTitle(chat.chatId)}\nXizmat: ${services}\nXabar: ${truncate(chat.incoming, 400)}\n\n` +
+        "Bot mijozga price-list'dagi taxminiy narxni va kontaktlarni berdi.",
+      replyKeyboard(chat.chatId),
+    );
+  }
+
+  /** Runs a send for every admin; one admin's failure (blocked bot) does not stop the others. */
+  async #toAdmins(label: string, send: (adminId: number) => Promise<unknown>): Promise<void> {
+    for (const adminId of this.#admins) {
+      try {
+        await send(adminId);
+      } catch (err) {
+        logError(`Could not send ${label} to admin ${adminId}: ${errorMessage(err)}`);
+      }
+    }
+  }
+
+  /** Sends a private message from the bot to every admin, at most once per 10 minutes per key. */
+  async #notifyAdmins(api: Api, key: string, text: string, keyboard?: InlineKeyboardMarkup): Promise<void> {
     const now = this.#clock();
     const last = this.#ownerAlerts.get(key);
     if (last !== undefined && now - last < OWNER_ALERT_INTERVAL_SECONDS) return;
     this.#ownerAlerts.set(key, now);
-    try {
-      await api.sendMessage(this.settings.ownerId, text, keyboard ? { reply_markup: keyboard } : {});
-    } catch (err) {
-      logError(`Could not notify the owner: ${errorMessage(err)}`);
-    }
+    await this.#toAdmins("a notification", (adminId) => api.sendMessage(adminId, text, keyboard ? { reply_markup: keyboard } : {}));
   }
 
-  /** Passes a message someone sent to the bot on to the owner, with a ✍️ reply button. */
+  /** Passes a message someone sent to the bot on to the admins, with a ✍️ reply button. */
   async #passToOwner(api: Api, message: Message, chat: ChatContext, ownerActive: boolean): Promise<void> {
     const who = this.personTitle(chat.chatId);
-    const quiet = ownerActive ? "\n(Siz javob berayotganingiz uchun bot jim turibdi. Tugatsangiz, «✖️ Tugatish» ni bosing.)" : "";
-    try {
+    const quiet = ownerActive ? "\n(Admin javob berayotgani uchun bot jim turibdi. Tugatilsa, «✖️ Tugatish» ni bosing.)" : "";
+    await this.#toAdmins("a message", async (adminId) => {
       if (message.text !== undefined) {
-        await api.sendMessage(this.settings.ownerId, `💬 ${who}:\n${truncate(message.text, 3500)}${quiet}`, {
+        await api.sendMessage(adminId, `💬 ${who}:\n${truncate(message.text, 3500)}${quiet}`, {
           reply_markup: replyKeyboard(chat.chatId),
         });
         return;
       }
-      await api.forwardMessage(this.settings.ownerId, chat.chatId, message.message_id);
-      await api.sendMessage(this.settings.ownerId, `📎 ${who} fayl yubordi.${quiet}`, {
-        reply_markup: replyKeyboard(chat.chatId),
-      });
-    } catch (err) {
-      logError(`Could not pass the message from chat ${chat.chatId} to the owner: ${errorMessage(err)}`);
-    }
+      await api.forwardMessage(adminId, chat.chatId, message.message_id);
+      await api.sendMessage(adminId, `📎 ${who} fayl yubordi.${quiet}`, { reply_markup: replyKeyboard(chat.chatId) });
+    });
   }
 
   #showPreview(preview: Preview): void {
@@ -1545,10 +1887,15 @@ export class Assistant {
     return items.slice(-this.settings.historyLimit);
   }
 
-  #remember(historyId: string, chatId: number, item: Omit<HistoryItem, "ts">): void {
-    this.history.add(historyId, chatId, item);
+  /**
+   * Stores one message everywhere: the short history, the transcripts (JSON), chat.txt and PostgreSQL (with its
+   * embedding for semantic search). `author` tells bot replies from admin replies in the database.
+   */
+  #remember(historyId: string, chatId: number, item: Omit<HistoryItem, "ts">, author: "bot" | "admin" = "bot"): void {
+    const ts = this.#clock();
+    this.history.add(historyId, chatId, item, ts);
     try {
-      this.transcripts.add(historyId, chatId, item);
+      this.transcripts.add(historyId, chatId, item, ts);
     } catch (err) {
       logError(`Could not update the transcripts: ${errorMessage(err)}`);
     }
@@ -1557,13 +1904,30 @@ export class Assistant {
     } catch (err) {
       logError(`Could not update chat.txt of chat ${chatId}: ${errorMessage(err)}`);
     }
+    const fromCustomer = item.role === "other";
+    this.#dbWrite("message", async (db) => {
+      if (fromCustomer) await db.touchCustomer(chatId, item.name, "", item.lang, ts);
+      const id = await db.addMessage({
+        customerId: chatId,
+        source: historyId,
+        role: fromCustomer ? "customer" : author,
+        author: item.name,
+        text: item.text,
+        language: item.lang,
+        ts,
+        importKey: messageKey(historyId, chatId, ts, fromCustomer, item.text),
+      });
+      // Embeddings are made in the background: a slow Gemini call never delays a reply.
+      const memory = this.memory;
+      if (id !== null && memory) this.#track(memory.index({ id, customerId: chatId, text: item.text }));
+    });
   }
 
   /**
    * The owner's 🗑: forgets everything about this client — history, transcripts, the users list entry and the whole
    * client folder (chat.txt, received files, files waiting in the inbox). Returns their name.
    */
-  deleteChat(userId: number): string {
+  deleteChat(userId: number, adminId: number | null = null): string {
     const name = this.personTitle(userId);
     const timer = this.#batchTimers.get(userId);
     if (timer) clearTimeout(timer);
@@ -1572,22 +1936,30 @@ export class Assistant {
     this.history.removeChat(userId);
     this.users.remove(userId);
     this.folders.delete(userId);
-    for (const key of [...this.#takeoverUntil.keys()]) {
-      if (key.endsWith(`:${userId}`)) this.#takeoverUntil.delete(key);
+    for (const [admin, target] of Object.entries(this.state.replyModes)) {
+      if (target === userId) this.state.setReplyMode(Number(admin), null);
     }
-    if (this.#replyTo?.userId === userId) this.#replyTo = null;
-    log(`The owner deleted the chat and folder of ${userId}.`);
+    this.#pendingMemory.forEach((chat, key) => {
+      if (chat.chatId === userId) this.#pendingMemory.delete(key);
+    });
+    this.#dbWrite("delete customer", (db) => db.deleteCustomer(userId));
+    if (adminId !== null) this.#dbWrite("admin action", (db) => db.adminAction(adminId, "delete_chat", String(userId)));
+    log(`An admin deleted the chat and folder of ${userId}.`);
     return name;
   }
 
   #rememberUser(message: Message): void {
     const from = message.from;
-    if (!from || from.id === this.settings.ownerId) return;
+    if (!from || this.isAdmin(from.id)) return;
     try {
       this.users.touch(from.id, senderName(message), from.username ?? "");
     } catch (err) {
       logError(`Could not update the users list: ${errorMessage(err)}`);
     }
+    const name = senderName(message);
+    const username = from.username ?? "";
+    const ts = this.#clock();
+    this.#dbWrite("customer", (db) => db.touchCustomer(from.id, name, username, null, ts));
   }
 
   /**
@@ -1597,10 +1969,10 @@ export class Assistant {
   usersListMessages(): UsersListPage[] {
     const users = this.users.list();
     if (users.length === 0) {
-      return [{ text: `👥 Hozircha botga hech kim yozmagan (oxirgi ${this.settings.historyTtlDays} kun).`, buttons: [] }];
+      return [{ text: "👥 Hozircha botga hech kim yozmagan.", buttons: [] }];
     }
     const header =
-      `👥 Mijozlar: ${users.length} ta (oxirgi ${this.settings.historyTtlDays} kun, yangilari tepada)\n` +
+      `👥 Mijozlar: ${users.length} ta (yangilari tepada)\n` +
       "📁 Yozishmani ko'rish uchun mijoz tugmasini bosing.\n";
     const pages: UsersListPage[] = [];
     let current: UsersListPage = { text: header, buttons: [] };
@@ -1671,7 +2043,6 @@ export class Assistant {
   resume(): void {
     this.state.paused = false;
     this.state.limitUntil = 0;
-    this.#takeoverUntil.clear();
     // Files that waited while the bot was paused or limited.
     if (this.#api) this.resumePendingFiles(this.#api);
   }
@@ -1681,81 +2052,79 @@ export class Assistant {
   }
 
   statusText(): string {
-    const now = this.#clock();
     const mode = this.settings.autoSend
-      ? "AUTO-SEND (replies are sent to the people who wrote)"
-      : "PREVIEW (replies are only shown in the logs)";
-    const limit =
-      this.state.limitUntil > now
-        ? `reached, replies resume at ${new Date(this.state.limitUntil * 1000).toISOString()}`
-        : "not reached";
+      ? "AUTO-SEND (javoblar mijozlarga yuboriladi)"
+      : "PREVIEW (javoblar faqat logda, mijozga yuborilmaydi)";
+    const ai = this.ai?.status();
+    const provider = !ai
+      ? "sozlanmagan"
+      : ai.active === null
+        ? "hech biri sozlanmagan (ANTHROPIC_API_KEY / GEMINI_API_KEY)"
+        : `${ai.active}${ai.circuitOpen ? ` (Claude ishlamayapti, keyingi tekshiruv ${ai.nextProbeAt ? tashkentTime(ai.nextProbeAt / 1000) : "—"})` : ""}`;
+    const answering = Object.entries(this.state.replyModes).map(([admin, user]) => `${admin} → ${this.personTitle(user)}`);
     return [
-      `Company: ${this.settings.companyName}`,
-      `Mode: ${mode}`,
-      `State: ${this.state.paused ? "paused" : "running"}`,
-      `Claude usage limit: ${limit}`,
-      `Chats in history: ${this.history.chatCount()}`,
-      `Data directory: ${this.settings.dataDir}`,
-      `History is kept for ${this.settings.historyTtlDays} days`,
+      `Korxona: ${this.settings.companyName}`,
+      `Rejim: ${mode}`,
+      `Holat: ${this.state.paused ? "pauzada" : "ishlayapti"}`,
+      `AI: ${provider}`,
+      `Baza: ${this.db ? `PostgreSQL (${this.db.vectorMode === "pgvector" ? "pgvector" : "vektorlar real[]"})` : "ulanmagan — faqat JSON fayllar, Admin AI ishlamaydi"}`,
+      `Adminlar: ${this.adminIds.join(", ")}`,
+      `✍️ javob rejimida: ${answering.length > 0 ? answering.join("; ") : "hech kim"}`,
+      `Mijozlar: ${this.users.list().length}`,
+      `Data papka: ${this.settings.dataDir}`,
+      "Ma'lumotlar muddatsiz saqlanadi; faqat admin 🗑 bilan o'chiradi.",
     ].join("\n");
   }
 
   startText(): string {
     const s = this.settings;
     const mode = s.autoSend
-      ? "AUTO-SEND — javoblar murojaatchilarga avtomatik yuboriladi"
-      : "PREVIEW — javoblar murojaatchilarga yuborilmaydi, faqat sizga qoralama sifatida keladi";
+      ? "AUTO-SEND — javoblar mijozlarga avtomatik yuboriladi"
+      : "PREVIEW — javoblar mijozlarga yuborilmaydi, faqat logda ko'rinadi";
     const state = this.state.paused ? "pauzada (/resume bilan yoqing)" : "ishlayapti";
     const lines = [
       "Assalomu alaykum!",
       "",
-      `Bu bot «${s.companyName}» korxonasining Telegram yordamchisi. Botga yozgan har bir odamga u company.md ` +
-        `dagi ma'lumotlar asosida korxona nomidan rasmiy va xushmuomala javob tayyorlaydi.`,
+      `Bu bot «${s.companyName}» korxonasining raqamli yordamchisi. Botga yozgan har bir mijozga u AI (Claude, zaxirada ` +
+        "Gemini) orqali company.md, narxlar ro'yxati va mijozning butun oldingi yozishmasi asosida o'zi javob beradi.",
       "",
       "Hozirgi holat:",
       `• Rejim: ${mode}`,
       `• Holat: ${state}`,
       "",
       "Siz (admin) uchun:",
-      "• Mijozlarning xabarlari sizga yuborilmaydi. Faqat 🚨 muhim murojaatlar va to'liq hujjat paketlari keladi.",
-      "• Mijozdan 14 ta hujjat so'raladi (ustav, YeGRPO, ruxsatnoma/litsenziya, 133-son kelishuv, UTER, TIA, " +
-        "tog' ajratmasi, 5-GR, ZVOS, ZEP, PDV, limitlar, EPB, yer ajratmasi), har biri alohida fayl. Bot fayllarni " +
-        "TEKSHIRMAYDI: faqat saqlaydi, sanaydi va mijozga «N/14» deb yozadi (bir yo'la 10–50 ta ham, 20 MB dan " +
-        "kattasi ham qabul qilinadi). Anketa (NDA bilan) faqat taklif qilinadi, 14 taga kirmaydi.",
-      "• Mijozda biror hujjat bo'lmasa, u «❌ Menda yo'q hujjatlar» tugmasi bilan belgilaydi: kerakli fayllar soni " +
-        "shuncha kamayadi (masalan, 2 tasi yo'q bo'lsa — 12 ta).",
-      "• Mijoz kerakli hamma faylni yuborganda sizga bitta 🎉 xabar (yo'q hujjatlar ro'yxati bilan) va butun paket " +
-        "(albumlarda, 10 tadan) bir yo'la keladi. Undan oldin hech narsa yuborilmaydi. Keyin kelgan fayllar " +
-        "«🔄 Qo'shimcha fayl» bo'lib alohida keladi. Holatni «users» orqali istalgan vaqtda ko'rasiz.",
-      "• «users» tugmasi mijozlar ro'yxatini (📊 nechta fayl yuborgani bilan, masalan 5/14) ko'rsatadi. Mijozni bossangiz, u bilan " +
-        "butun yozishma va hujjatlar holati ochiladi; ostida «📄 chat.txt», «📎 Qabul qilingan fayllar» va " +
-        "«🗑 Chatni o'chirish» tugmalari bor.",
-      "• Mijozga javob berish: yozishma ostidagi «✍️ Javob yozish» ni bosing va javobni yuboring — matn, rasm, " +
-        "fayl yoki ovozli xabar bo'lishi mumkin. Tugatgach «✖️ Tugatish» ni bosing.",
-      `• Siz javob bergan chatda bot ${s.ownerTakeoverMinutes} daqiqa jim turadi, shu vaqtda mijozning xabarlari ` +
-        "sizga keladi. «✖️ Tugatish» ni bossangiz, bot darhol yana o'zi javob beradi.",
-      "• Sinab ko'rish uchun botga boshqa akkauntdan yozing: sizning o'z xabarlaringizga bot javob bermaydi.",
+      "• Shu chatga oddiy o'zbek tilida yozing — bu Admin AI yordamchisi. Masalan: «Bugun nechta mijoz bilan " +
+        "gaplashildi?», «Eng ko'p yozishgan 20 ta mijozni ko'rsat», «Birinchi mijoz haqida batafsil», «U oxirgi marta " +
+        "nimani so'ragan?», «Narx so'ragan mijozlar», «Oxirgi 30 kunlik hisobotni PDF qilib ber». Javoblar haqiqiy " +
+        "bazadan olinadi, xulosa va tavsiyalar bilan.",
+      "• Mijozlarning oddiy xabarlari sizga yuborilmaydi. Faqat 🚨 muhim murojaatlar, 💰 narx so'rovlari, fayllar va " +
+        "to'liq hujjat paketlari keladi.",
+      "• Mijozdan 14 ta hujjat so'raladi: " + DOCUMENTS_UZ.map((d, i) => `${i + 1}. ${d}`).join("; ") + ". Bot fayllarni " +
+        "TEKSHIRMAYDI: saqlaydi, sanaydi va mijozga «N/14» deb yozadi. Mijozda yo'q hujjatlar «❌ Menda yo'q hujjatlar» " +
+        "bilan belgilanadi. Hammasi kelganda sizga 🎉 xabar va butun paket keladi.",
+      "• «users» — mijozlar ro'yxati; mijozni bossangiz yozishma, hujjatlar holati va «✍️ Javob yozish», «📄 chat.txt», " +
+        "«📎 Qabul qilingan fayllar», «🗑 Chatni o'chirish» tugmalari chiqadi.",
+      "• «✍️ Javob yozish» bosilgach, yozganlaringiz shu mijozga boradi va bot u bilan jim turadi — «✖️ Tugatish» " +
+        "bosilguncha (taymer yo'q). Shu vaqtda mijoz yozsa, xabari sizga keladi.",
       "",
       "Buyruqlar:",
       "/pause — botni to'xtatish",
-      "/resume — qayta yoqish (pauza va limitni tozalaydi)",
-      "/status — holat",
+      "/resume — qayta yoqish",
+      "/status — holat (AI provayder, baza, adminlar)",
+      "/cancel — javob rejimini yopish",
+      "/new — Admin AI bilan yangi mavzu (oldingi kontekstni unutadi)",
       "",
       "Bilib qo'ying:",
-      "• Bot mijozni 14 ta hujjatni topshirishga olib boradi va anketani (NDA bilan) taklif qiladi. Aniq narx, " +
-        "muddat, ruxsatnoma yoki ekspertiza natijasi bo'yicha va'da bermaydi — bunday savollarni mas'ul xodimga " +
-        "yo'naltiradi.",
-      "• Favqulodda holat, shikoyat yoki rasmiy so'rovlar 🚨 belgisi bilan keladi.",
-      `• Bir odamdan soatiga ${DIRECT_HOURLY_LIMIT} tadan ko'p xabarga bot javob bermaydi (obuna limitini tejash uchun).`,
-      `• Suhbat tarixi ${s.historyTtlDays} kun saqlanadi. Mijoz papkalari (chat.txt va hujjatlar) siz «🗑» bilan ` +
-        "o'chirmaguningizcha saqlanadi.",
-      "• Korxona haqidagi ma'lumotlar company.md faylida turadi.",
-      "• Telegram Premium bo'lsa, botni Settings → Telegram Business → Chatbots orqali korxona akkauntiga ham ulash mumkin.",
+      "• Narx so'ralsa, bot faqat price-list'dagi summa va muddatni aytadi, ogohlantirish matni va kontaktlar bilan. " +
+        "Ro'yxatda yo'q xizmatga narx aytmaydi.",
+      "• Bot «mas'ul xodim javob beradi» demaydi: o'zi javob beradi, tasdiqlay olmagan narsani ochiq aytadi.",
+      "• Claude ishlamasa, bot avtomatik Gemini'ga o'tadi va Claude'ni har " +
+        `${s.aiProbeMinutes} daqiqada qayta tekshiradi. Ikkalasi ham ishlamasa, xabarlar navbatda kutadi.`,
+      "• Ma'lumotlar muddatsiz saqlanadi. Faqat siz «🗑» bilan o'chirsangiz o'chadi.",
+      "• Korxona haqidagi ma'lumotlar company.md, narxlar knowledge/prices.json faylida.",
     ];
     if (!s.autoSend) {
-      lines.push(
-        "• Hozir PREVIEW rejimi: javoblarni tekshirib bo'lgach, avtomatik yuborish uchun AUTO_SEND=true qiling.",
-      );
+      lines.push("• Hozir PREVIEW rejimi: javoblarni tekshirib bo'lgach, avtomatik yuborish uchun AUTO_SEND=true qiling.");
     }
     return lines.join("\n");
   }
@@ -1786,22 +2155,96 @@ function tashkentTime(epochSeconds: number): string {
   }).format(new Date(epochSeconds * 1000));
 }
 
-export function makeClaudeCli(settings: Settings): ClaudeCLI {
-  return new ClaudeCLI(settings.claudeBin, {
-    workdir: path.join(settings.dataDir, "claude-run"),
-    model: settings.claudeModel || undefined,
-    effort: settings.claudeEffort,
-    timeoutSeconds: settings.claudeTimeoutSeconds,
-    oauthToken: settings.claudeOauthToken || undefined,
-    authLabel: settings.claudeAuthMode,
-  });
+/** Claude (primary) and Gemini (backup) from the settings; null when neither key is set. */
+export function makeProviderManager(
+  settings: Settings,
+  hooks: { onLog?: ConstructorParameters<typeof AIProviderManager>[0]["onLog"]; onSwitch?: (event: SwitchEvent) => void } = {},
+): { ai: AIProviderManager | null; gemini: GeminiProvider | null } {
+  const claude = settings.anthropicApiKey
+    ? new ClaudeProvider({ apiKey: settings.anthropicApiKey, mainModel: settings.claudeModel, fastModel: settings.claudeModelFast })
+    : null;
+  const gemini = settings.geminiApiKey
+    ? new GeminiProvider({
+        apiKey: settings.geminiApiKey,
+        mainModel: settings.geminiModel,
+        fastModel: settings.geminiModelFast,
+        embeddingModel: settings.geminiEmbeddingModel,
+      })
+    : null;
+  if (!claude && !gemini) return { ai: null, gemini: null };
+  return {
+    ai: new AIProviderManager({
+      primary: claude,
+      backup: gemini,
+      timeoutMs: settings.aiTimeoutSeconds * 1000,
+      probeIntervalMs: settings.aiProbeMinutes * 60_000,
+      ...(hooks.onLog ? { onLog: hooks.onLog } : {}),
+      ...(hooks.onSwitch ? { onSwitch: hooks.onSwitch } : {}),
+    }),
+    gemini,
+  };
 }
 
-export function buildAssistant(
-  settings: Settings,
-  opts: AssistantOptions & { generator?: ReplyGenerator } = {},
-): Assistant {
-  return new Assistant(settings, opts.generator ?? makeClaudeCli(settings), opts);
+export interface BuildOptions extends AssistantOptions {
+  /** Offline tests: a scripted generator instead of Claude/Gemini. */
+  generator?: ReplyGenerator;
+  brain?: CustomerBrain;
+  embedder?: Embedder | null;
+}
+
+/**
+ * Wires the modules together: AI Provider Manager -> Memory Manager -> Orchestrator (customer replies) and Admin AI
+ * Assistant. With a scripted generator (tests) only the simple reply path is used.
+ */
+export function buildAssistant(settings: Settings, opts: BuildOptions = {}): Assistant {
+  const db = opts.db ?? null;
+  let assistant: Assistant | null = null;
+  let ai = opts.ai ?? null;
+  let embedder: Embedder | null = opts.embedder ?? null;
+  if (!ai && !opts.generator && !opts.brain) {
+    const built = makeProviderManager(settings, {
+      onLog: (entry) => {
+        if (!entry.ok) logError(`AI ${entry.provider}/${entry.model} ${entry.purpose} failed (${entry.failure}, attempt ${entry.attempt}): ${entry.error}`);
+        if (db) void db.logProvider(entry).catch(() => undefined);
+      },
+    });
+    ai = built.ai;
+    if (opts.embedder === undefined) embedder = built.gemini;
+  }
+  let priceCache: { at: number; list: PriceList | null } = { at: 0, list: null };
+  const priceList = (): PriceList | null => {
+    // Read again at most once a minute, so a changed price list is used without a restart.
+    if (Date.now() - priceCache.at > 60_000) priceCache = { at: Date.now(), list: loadPriceList(settings.pricesPath) };
+    return priceCache.list;
+  };
+  const memory = opts.memory ?? (db ? new MemoryManager(db, ai, embedder, log) : null);
+  const brain =
+    opts.brain ??
+    (opts.generator
+      ? new SimpleBrain(opts.generator)
+      : ai
+        ? new Orchestrator({ ai, db, memory, priceList, log })
+        : new SimpleBrain({
+            generate: () => Promise.reject(new AllProvidersDownError([])),
+          }));
+  const admin =
+    opts.admin ??
+    (db && ai
+      ? new AdminAssistant({
+          db,
+          ai,
+          companyName: settings.companyName,
+          priceList,
+          documentStatus: (id) => assistant?.documentStatus(id) ?? null,
+          reportFontPath: settings.reportFontPath,
+          log,
+          ...(opts.clock ? { now: opts.clock } : {}),
+        })
+      : null);
+  assistant = new Assistant(settings, brain, { ...opts, db, ai, memory, admin });
+  const built = assistant;
+  ai?.subscribe((event) => void built.notifyProviderSwitch(event));
+  return assistant;
 }
 
 /**
@@ -1874,26 +2317,53 @@ const RECEIVED_WORDS: Record<Language, (names: string[]) => string> = {
   en: (names) => `📥 ${names.length} file(s) received:\n${names.map((n) => `• ${n}`).join("\n")}`,
 };
 
+const DOCUMENTS_RU = [
+  "Устав предприятия",
+  "Выписка из ЕГРПО",
+  "Электронное разрешение/лицензия на пользование недрами",
+  "Лицензионное соглашение (шартнома) по ПКМ № 133",
+  "УТЭР",
+  "ТЭО (технико-экономическое обоснование)",
+  "Проект горного отвода",
+  "Документ, подтверждающий сдачу формы 5-ГР",
+  "Экологический пакет: ЗВОС",
+  "Экологический пакет: ЗЭП",
+  "Экологический пакет: ПДВ",
+  "Экологический пакет: лимиты",
+  "Акты экспертизы промышленной безопасности (ЭПБ) по ОПО",
+  "Решения о земельном отводе",
+];
+const DOCUMENTS_EN = [
+  "Company charter",
+  "Extract from the EGRPO register",
+  "Electronic subsoil use permit/licence",
+  "Licence agreement (shartnoma) under resolution No. 133",
+  "UTER",
+  "Feasibility study (TEO)",
+  "Mining allotment project",
+  "Document confirming that form 5-GR was submitted",
+  "Environmental package: ZVOS",
+  "Environmental package: ZEP",
+  "Environmental package: PDV",
+  "Environmental package: limits",
+  "Industrial safety expert review (EPB) reports for hazardous facilities (OPO)",
+  "Land allotment decisions",
+];
+const numbered = (items: readonly string[]): string => items.map((d, i) => `${i + 1}. ${d}`).join("\n");
+
 const TEMPLATE_CAPTION: Record<Language, string> = {
   uz:
-    "Quyidagi 14 ta hujjatni shu chatga yuboring, har birini alohida fayl qilib: 1) korxona ustavi; " +
-    "2) YeGRPO dan ko'chirma; 3) yer qa'ridan foydalanish uchun elektron ruxsatnoma / litsenziya; 4) VMQ 133-son " +
-    "bo'yicha litsenziya kelishuvi (shartnoma); 5) UTER; 6) TIA; 7) tog' ajratmasi loyihasi; 8) 5-GR " +
-    "topshirilganini tasdiqlovchi hujjat; 9) ZVOS; 10) ZEP; 11) PDV; 12) limitlar; 13) OPO bo'yicha EPB " +
-    "dalolatnomalari; 14) yer ajratmasi to'g'risidagi qarorlar. Sizda bo'lmagan hujjatlarni «❌ Menda yo'q " +
-    "hujjatlar» tugmasi orqali belgilang. Hamma fayl kelgach, paket mutaxassisimizga yuboriladi.",
+    `Quyidagi 14 ta hujjatni shu chatga yuboring, har birini alohida fayl qilib:\n${numbered(DOCUMENTS_UZ)}\n\n` +
+    "Sizda bo'lmagan hujjatlarni «❌ Menda yo'q hujjatlar» tugmasi orqali belgilang. Hamma fayl kelgach, paket ko'rib " +
+    "chiqish uchun qabul qilinadi.",
   ru:
-    "Отправьте в этот чат 14 документов, каждый отдельным файлом: 1) устав предприятия; 2) выписка из ЕГРПО; " +
-    "3) электронное разрешение / лицензия на пользование недрами; 4) лицензионное соглашение (шартнома) по ПКМ " +
-    "№ 133; 5) УТЭР; 6) ТЭО; 7) проект горного отвода; 8) подтверждение сдачи формы 5-ГР; 9) ЗВОС; 10) ЗЭП; " +
-    "11) ПДВ; 12) лимиты; 13) акты ЭПБ по ОПО; 14) решения на земельный отвод. Документы, которых у Вас нет, " +
-    "отметьте кнопкой «❌ Menda yo'q hujjatlar». Когда придут все файлы, пакет будет передан нашему специалисту.",
+    `Отправьте в этот чат 14 документов, каждый отдельным файлом:\n${numbered(DOCUMENTS_RU)}\n\n` +
+    "Документы, которых у Вас нет, отметьте кнопкой «❌ Menda yo'q hujjatlar». Когда придут все файлы, пакет будет " +
+    "принят на рассмотрение.",
   en:
-    "Please send these 14 documents to this chat, each as a separate file: 1) company charter; 2) EGRPO register " +
-    "extract; 3) electronic subsoil use permit / licence; 4) licence agreement under resolution No. 133; 5) UTER; " +
-    "6) feasibility study (TEO); 7) mining allotment project; 8) proof of form 5-GR; 9) ZVOS; 10) ZEP; 11) PDV; " +
-    "12) limits; 13) industrial safety (EPB) reports; 14) land allotment decisions. Mark the documents you do not " +
-    "have with the «❌ Menda yo'q hujjatlar» button. Once all files have arrived, the package goes to our specialist.",
+    `Please send these 14 documents to this chat, each as a separate file:\n${numbered(DOCUMENTS_EN)}\n\n` +
+    "Mark the documents you do not have with the «❌ Menda yo'q hujjatlar» button. Once all files have arrived, the " +
+    "package is accepted for review.",
 };
 
 const TOO_LARGE_REASON: Record<Language, (mb: number) => string> = {

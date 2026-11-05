@@ -6,7 +6,7 @@ import { Bot, type Transformer } from "grammy";
 import type { BusinessConnection, Update, UserFromGetMe } from "grammy/types";
 import { loadSettings, type Settings } from "../src/config.js";
 import { buildComposer } from "../src/handlers.js";
-import { type Assistant, buildAssistant, type Preview, type ReplyGenerator } from "../src/service.js";
+import { type Assistant, buildAssistant, type BuildOptions, type Preview, type ReplyGenerator } from "../src/service.js";
 
 export const OWNER_ID = 1000;
 export const CLIENT_ID = 2000;
@@ -146,8 +146,15 @@ export class Harness {
   assistant!: Assistant;
   bot!: Bot;
 
-  constructor(overrides: Record<string, string> = {}, { largeFiles = true }: { largeFiles?: boolean } = {}) {
+  /** Extra modules (database, AI providers); with `ai` set the real orchestrator runs instead of the generator. */
+  readonly #extra: Partial<BuildOptions>;
+
+  constructor(
+    overrides: Record<string, string> = {},
+    { largeFiles = true, extra = {} }: { largeFiles?: boolean; extra?: Partial<BuildOptions> } = {},
+  ) {
     this.#largeFiles = largeFiles;
+    this.#extra = extra;
     this.root = fs.mkdtempSync(path.join(os.tmpdir(), "sgk-docs-test-"));
     this.dataDir = path.join(this.root, "data");
     const envFile = path.join(this.root, ".env");
@@ -160,6 +167,7 @@ export class Harness {
         PROFILE_PATH: profile,
         TEMPLATES_DIR: path.join(PROJECT_DIR, "templates"),
         LAWS_DIR: path.join(PROJECT_DIR, "laws"),
+        PRICES_PATH: path.join(PROJECT_DIR, "knowledge", "prices.json"),
         ...overrides,
       },
     });
@@ -167,8 +175,10 @@ export class Harness {
   }
 
   #build(): void {
+    const useAi = this.#extra.ai !== undefined || this.#extra.brain !== undefined;
     this.assistant = buildAssistant(this.settings, {
-      generator: this.generator,
+      ...this.#extra,
+      ...(useAi ? {} : { generator: this.generator }),
       clock: this.clock.now,
       previewSink: (preview) => this.previews.push(preview),
       reviewDelayMs: 60_000,
@@ -304,7 +314,10 @@ export class Harness {
 
 const harnesses: Harness[] = [];
 
-export function makeHarness(overrides: Record<string, string> = {}, opts: { largeFiles?: boolean } = {}): Harness {
+export function makeHarness(
+  overrides: Record<string, string> = {},
+  opts: { largeFiles?: boolean; extra?: Partial<BuildOptions> } = {},
+): Harness {
   const harness = new Harness(overrides, opts);
   harnesses.push(harness);
   return harness;

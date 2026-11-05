@@ -4,7 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
 import util from "node:util";
-import type { Effort } from "./config.js";
+/** Kept from the CLI version (this module is no longer used by the bot). */
+type Effort = "low" | "medium" | "high" | "xhigh" | "max";
 import { ensurePrivateDir, isRecord } from "./store.js";
 
 /**

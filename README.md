@@ -1,61 +1,59 @@
-# Sanoatgeokontexxizmat — Telegram Business assistant
+# Sanoatgeokontexxizmat — Telegram AI assistant
 
-A Telegram Business bot for the **company account** of «Sanoatgeokontexxizmat». When a citizen, customer or
-partner organisation writes to that account, the bot prepares a formal, polite reply on behalf of the company.
-Everything the bot knows about the company comes from [`company.md`](company.md).
+A Telegram bot for «Sanoatgeokontexxizmat». Customers write to the bot; an **AI orchestrator** understands each
+message, remembers the whole earlier conversation, answers on behalf of the company and collects the 14 investment
+documents. Admins talk to an **Admin AI assistant** in plain Uzbek in the same bot and get statistics, analyses and
+PDF/Excel/CSV reports from the real database. The Uzbek design notes are in [`docs/AI-TIZIM.md`](docs/AI-TIZIM.md).
 
-Replies are written by the **Claude Code CLI** (`claude -p`) installed next to the bot, using a Claude
-**subscription** token from `claude setup-token`. An Anthropic API key is never used.
+- **AI**: Claude through the **Anthropic API** (`ANTHROPIC_API_KEY`) is the primary provider; **Google Gemini**
+  (`GEMINI_API_KEY`) is the automatic backup. When Claude fails (key, billing, rate limit, outage) the bot switches to
+  Gemini in the same request, keeps the full context, probes Claude every `AI_PROBE_MINUTES` and switches back. If
+  both fail, messages are queued and answered once later. The Claude Code CLI and subscription token are no longer used.
+- **Memory**: PostgreSQL (`DATABASE_URL`) with pgvector when available: every message, a customer profile (company
+  name, STIR, location, mineral type, licence, services …), an auto-updated conversation summary, and semantic search
+  over the customer's earlier messages (Gemini embeddings; keyword search otherwise). The bot never asks again for a
+  fact the customer already gave, and does not repeat its own earlier replies.
+- **Decision tree**: every customer message gets an analysis (type, complexity, context completeness, confidence,
+  missing facts), a workflow (answer, sales, price, documents, clarify, escalate …), a self-check of the reply
+  (forbidden "an employee will answer" phrases, prices not in the price list, repeats, re-asked facts) and a row in
+  `ai_requests`.
+- **Prices**: only from [`knowledge/prices.json`](knowledge/prices.json) (the price list of 30.10.2026), exactly as
+  written, with the company's disclaimer and contacts. Services not in the list get no amount.
+- **Nothing is deleted by age.** Data goes away only when an admin presses 🗑 for a chat.
 
 ## What it does
 
-The bot works in two ways at the same time:
-
-- **Direct chats (no Telegram Premium needed).** Anyone who writes to the bot itself gets a reply prepared from
-  `company.md`. The admin (`OWNER_ID`) is **not** sent every message: only 🚨 important requests and the files,
-  photos and voice messages people send (forwarded, as `company.md` promises them). The admin reads a conversation
-  and answers it from the `users` button (see below); the bot then stays silent in that chat for
-  `OWNER_TAKEOVER_MINUTES`. At most 20 Claude calls per person per hour, to protect the subscription limit.
-- **Telegram Business (optional, needs Premium).** The bot can also be connected to the company's account through
-  Telegram Business → **Chatbots** and then answers the chats of that account.
-
-Common to both:
-
-- **Preview mode is the default** (`AUTO_SEND=false`): replies are not sent to anyone. They are printed to the log
-  as `PREVIEW, not sent` blocks, stored in `data/previews.jsonl`, and for direct chats shown to the admin as a
-  draft. Set `AUTO_SEND=true` to let the bot answer people.
-- There is no allowlist in the code: anyone may write to the bot; for Business, Telegram's Chatbots setting
-  decides which chats the bot sees.
-- **It works towards a deal.** It answers from `company.md` and moves the person to the next step: it asks for the
-  14 documents (each as a separate file) and offers the express questionnaire (anketa with NDA, Uzbek or Russian),
-  which is not one of the 14. "A responsible employee will answer" is kept for serious cases only (exact prices, the
-  company's own deadlines, guarantees, complaints, emergencies, official requests). It still makes no promises
-  about prices, deadlines, permits, expert reviews or inspection results.
-- **It collects documents.** Files clients send are saved per client and counted, **not checked**; once a client
-  has sent one file per document they have (14, less the ones marked «❌ Menda yo'q»), the whole package goes to the
-  admin (see [Documents](#documents)). Files never go to Claude.
-- **Escalation**: for emergencies (accident, gas leak, fire, injury, collapse), complaints, official requests,
-  or mentions of courts, prosecutors or media, Claude starts its answer with `[ESCALATE]`. The bot then sends the
-  owner a private alert (in Uzbek) in the bot chat — also in preview mode — at most once per 10 minutes per chat.
+- **Direct chats.** Anyone who writes to the bot gets an answer from the orchestrator. Admins (`ADMIN_IDS`, all equal)
+  are **not** sent every message: only 🚨 important requests, 💰 price requests, files and complete document packages.
+- **Telegram Business (optional, needs Premium)** still works as before; employees' own messages there are recorded,
+  never answered.
+- **Preview mode is the default** (`AUTO_SEND=false`): replies are only logged and stored in `data/previews.jsonl`.
+- **It works towards a deal**: it asks for the 14 documents (numbered, in the company's exact wording) and offers the
+  express questionnaire. It never says that a responsible employee will answer; what it cannot confirm it says
+  honestly, with the company's contacts.
+- **It collects documents**: files are saved and counted, **not checked**; the complete package goes to the admins.
+- **Escalation**: emergencies, complaints, official requests → alert to every admin with a ✍️ button.
 
 ## Behaviour
 
 | Situation | What happens |
 | --- | --- |
-| Connection of another Telegram account (not `OWNER_ID`) | Ignored, warning in the log, Claude is not called |
+| Business connection of an account that is not an admin | Ignored, warning in the log, the AI is not called |
 | Which chats | Whatever is selected in Telegram Business → Chatbots; every chat Telegram delivers is handled |
-| An employee writes from the company account | Stored in history, never answered; the bot stays silent in that chat for `OWNER_TAKEOVER_MINUTES` |
+| An employee writes from the company account | Stored in history (as an admin message), never answered |
 | Messages from bots / sent by this bot | Ignored (`sender_business_bot`, `is_bot`) |
-| Same message delivered twice | Handled once (kept in `data/seen.json`, survives restarts) |
+| Same message delivered twice | Handled once (`data/seen.json` and `processed_updates` in PostgreSQL); at most one reply per message (`outgoing_replies`) |
 | Service messages (title changes, pins …) | Ignored; stickers, voice, photos, documents are described as `[sticker] 😀`, `[voice message]` … |
 | `/pause` | No replies are generated until `/resume` (kept across restarts) |
-| Subscription usage limit | No Claude calls until the reset time (or `LIMIT_COOLDOWN_MINUTES`); kept across restarts; owner is told in auto-send mode |
-| Timeout or login error | Nothing is sent to the chat; owner is told in auto-send mode (at most every 10 minutes) |
-| Claude answers `[SKIP]` | Nothing is shown or sent ("thanks", "ok", stickers) |
-| Claude answers `[ESCALATE] …` | Owner gets an alert with a ✍️ reply button; the reply itself follows the normal preview/auto-send path |
-| Before an auto-send | Pause/limit/takeover are checked again, and the connection is re-read from Telegram (owner, enabled, reply right) |
-| History retention | Messages and previews older than `HISTORY_TTL_DAYS` (default 30) are deleted |
-| Someone writes to the bot directly | Claude answers from `company.md` (sent only with `AUTO_SEND=true`); the admin gets no copy |
+| Claude fails (auth, billing, rate limit, 5xx, timeout) | Transient errors are retried twice; then Gemini answers the same request with the same context; admins are told once; Claude is probed every `AI_PROBE_MINUTES` and used again when it answers |
+| Claude and Gemini both fail | The message is queued (`pending_replies`), admins are told once, and it is answered (once) when a provider is back |
+| The person writes again while a reply is being written | The older reply is dropped; the newer message is answered with both in view |
+| The AI answers `[SKIP]` | Nothing is shown or sent ("thanks", "ok", stickers) |
+| `[ESCALATE]`, or the analysis says complaint / emergency / official request | Every admin gets an alert with a ✍️ reply button |
+| A customer asks a price | Price and days only from the price list, with the disclaimer and contacts; every admin gets a 💰 lead |
+| Before an auto-send | Pause and ✍️ reply mode are checked again, and the business connection is re-read from Telegram |
+| History retention | Nothing is deleted by age; only an admin's 🗑 deletes a chat (JSON files, folder and database rows) |
+| Someone writes to the bot directly | The orchestrator answers (sent only with `AUTO_SEND=true`); the admins get no copy |
 | A client sends files or photos (also 10-50 at once, any format) | Collected for `REVIEW_BATCH_SECONDS` (15 s) after the last one, then saved and counted (not checked); one summary goes to the client: `📥 N ta fayl qabul qilindi` and `Qabul qilingan fayllar: X/14`. The admin gets nothing until the package is complete |
 | The last needed file arrives (however long it takes) | The admin gets one 🎉 message (with the documents the client does not have), then every file in albums of up to 10 (by `file_id`, so any size), each captioned `📄 3/14 — name` |
 | Client presses «❌ Menda yo'q hujjatlar» | A menu of the 14 documents: each press marks ❌ / unmarks one; «✅ Tayyor» shows the status (e.g. `0/12`) and sends the package if the files already cover the rest. Bot chat only; in business chats Claude answers |
@@ -63,28 +61,27 @@ Common to both:
 | A file is larger than 20 MB | Downloaded over MTProto when `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` are set (up to `MAX_FILE_MB`, default and maximum 100); otherwise the client is asked to compress or split it |
 | Client writes "holat" / "статус" / presses 📊 | Their document status, without Claude |
 | Client writes "anketa" / "анкета" / presses 📄, or Claude adds `[SEND_TEMPLATE]` | The blank questionnaire is sent (Russian for Russian and English speakers) |
-| Admin writes after pressing ✍️ | Text, photo, file or voice goes to that person; the bot is silent there for `OWNER_TAKEOVER_MINUTES` |
+| Admin writes after pressing ✍️ | Text, photo, file or voice goes to that person; the bot is silent for that person until «✖️ Tugatish» (no timer, kept across restarts) |
 | The person writes while the bot is silent | The message is passed to the admin with a ✍️ button, so nothing is missed |
 | Admin presses ✖️ Tugatish | The silence ends at once: the bot answers that person again |
-| More than 20 messages per hour from one person | Claude is not called |
-| Admin writes without pressing ✍️ | Short hint; Claude is never called for the admin's own messages |
+| More than 20 messages per hour from one person | The AI is not called |
+| Admin writes without pressing ✍️ | The Admin AI assistant answers from the database (statistics, analyses, reports) |
 | Groups, channels, other people's `/pause` `/status` | Ignored |
 
-### Owner commands (private chat with the bot, from the `OWNER_ID` account)
+### Admin commands (private chat with the bot, from an `ADMIN_IDS` account)
 
-- `/start` — guide in Uzbek: what the bot does, current mode and state, how to connect it, commands.
-- `/pause`, `/resume` (also clears the limit and takeover timers), `/status`.
-- **`users` button** (persistent keyboard, owner only; also `/users`): lists everyone who wrote to the bot in the
-  last `HISTORY_TTL_DAYS` days, newest first, with @username, ID, message count and last message time. Under the
-  list is a 📁 button per person (with `📊 N/14` when they have sent files or marked documents): pressing it shows their document
-  status and the whole conversation with them (oldest first; a very long one arrives as a `.txt` file), with
-  **✍️ Javob yozish**, **📄 chat.txt**, **📎 Qabul qilingan fayllar** and **🗑 Chatni o'chirish** under it.
-- **🗑 Chatni o'chirish** asks for confirmation, then deletes the person's history, transcript, users-list entry
-  and the whole `data/clients/<id>/` folder. It cannot be undone. Only the owner can do this.
-- **Answering a person:** press ✍️ (under the conversation, a 🚨 alert or a forwarded file), then send the answer —
-  text, photo, file, voice, anything. Everything sent goes to that person until **✖️ Tugatish** (or `/cancel`) is
-  pressed or `REPLY_MODE_MINUTES` (15) pass without a message. People who wrote through the business account are
-  answered through it, text only.
+- **Free text** — the Admin AI assistant: "Bugun nechta mijoz bilan gaplashildi?", "Eng ko'p gaplashilgan 20 ta chatni
+  chiqar", "Birinchi mijoz haqida batafsil", "U oxirgi marta nimani so'ragan?", "Litsenziyasi tugashiga 30 kun qolgan
+  korxonalar", "Narx so'ragan mijozlar", "Oxirgi 30 kunlik hisobotni PDF qilib ber". It reads the database only through
+  read-only tools (overview, top chats, customer details and messages, customers by criterion, request statistics,
+  unanswered questions, search, conversation analysis, provider status, report files) and keeps each admin's context
+  ("birinchi mijoz", "shu mijoz"). `/new` starts a fresh topic.
+- `/start` — guide in Uzbek. `/pause`, `/resume`, `/status` (AI provider, database, admins, reply modes), `/cancel`.
+- **`users` button** (also `/users`): everyone who wrote to the bot, newest first, with a 📁 button per person:
+  the conversation, document status and **✍️ Javob yozish**, **📄 chat.txt**, **📎 Qabul qilingan fayllar**,
+  **🗑 Chatni o'chirish** (asks first; deletes the JSON history, the client folder and every database row of the person).
+- **Answering a person:** press ✍️, then send anything; it goes to that person until **✖️ Tugatish** (or `/cancel`).
+  The bot is silent for that person meanwhile; their messages are passed to the admins.
 
 Turn **Threaded Mode off** in @BotFather (Bot Settings → Threaded Mode). It is a setting for the whole bot that the
 Bot API cannot change: while it is on, Telegram shows topics ("folders") to the people who write to the bot. The bot
@@ -145,159 +142,131 @@ template cannot be read), less the documents the client marked as missing. Clien
 files were checked, keep their accepted files: they are counted as received (a file that held several documents
 once).
 
-## How Claude is called
+## How the AI is called
 
-One `claude -p` process per reply, started with `spawn` (no shell), in its own process group, in the private
-directory `data/claude-run` (0700):
+`src/ai/` holds one adapter per provider and the manager:
 
-```
-claude -p --safe-mode --settings '{"disableAllHooks":true,"enabledPlugins":{…builtin plugins…:false}}'
-  --tools "" --strict-mcp-config --setting-sources "" --disable-slash-commands --no-session-persistence
-  --system-prompt-file <temp file> --output-format json --effort <CLAUDE_EFFORT> [--model <CLAUDE_MODEL>]
-```
+- `claudeProvider.ts` — Anthropic Messages API (`x-api-key`, tool use). Models: `CLAUDE_MODEL` (default
+  `claude-sonnet-5-5`, replies and admin analysis) and `CLAUDE_MODEL_FAST` (default `claude-haiku-5-5`, analysis,
+  summaries).
+- `geminiProvider.ts` — `generateContent` with the key in the `x-goog-api-key` header (never in a URL), function calling
+  with thought signatures, and `batchEmbedContents` for embeddings. Models: `GEMINI_MODEL` (default `gemini-3.8-flash`),
+  `GEMINI_MODEL_FAST` (default `gemini-3.5-flash-lite`), `GEMINI_EMBEDDING_MODEL` (default `gemini-embedding-001`, 768 dims).
+- `providerManager.ts` — AIProviderManager: retry with backoff for transient errors, timeout (`AI_TIMEOUT_SECONDS`),
+  circuit breaker with a background probe every `AI_PROBE_MINUTES`, the same `ChatResponse` format from both, a log row
+  per call (`ai_provider_logs`) and switch events for the admins.
 
-- The conversation goes **only through stdin**; the system prompt (with `company.md`) goes through a temporary
-  0600 file that is deleted afterwards, so neither appears in `ps`.
-- `--bare` is **not** used: it ignores OAuth logins, so the subscription would not work.
-- The child environment is cleaned: every `ANTHROPIC_*` variable, `TELEGRAM_BOT_TOKEN`, Bedrock/Vertex/Foundry
-  switches, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SIMPLE` and `NODE_OPTIONS` are removed;
-  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` and `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` are added. `CLAUDE_CODE_OAUTH_TOKEN`
-  is set only from the bot's own settings.
-- Token rules: the token is never logged, never put into argv, prompts or JSON output, and is replaced by
-  `[REDACTED]` in CLI output before parsing. If the token is rejected, the error says to run `claude setup-token`
-  again and shows what the CLI said (with the token hidden).
-- `npm run check-claude` sends a tiny request and verifies that no tools, MCP servers, plugins or skills are
-  loaded, that no API key is used, and which authentication was used.
+Keys are never logged: errors are cleaned of the key, settings print `[hidden]`, and in container mode the variables are
+removed from `process.env` after reading. `npm run check-ai` sends a tiny request to each configured provider.
 
 ## Data and privacy
 
-Everything is stored in `data/` (on Railway: the volume at `/app/data`), directories 0700, files 0600:
+**PostgreSQL** (`DATABASE_URL`) is the main store: `customers`, `companies`, `licenses`, `conversations`, `messages`,
+`conversation_summaries`, `customer_memories`, `memory_embeddings`, `company_knowledge`, `customer_services`,
+`sales_pipeline`, `tasks`, `scheduled_tasks`, `ai_requests`, `ai_provider_logs`, `admin_messages`, `admin_state`,
+`admin_actions`, `reports`, `audit_logs`, `processed_updates`, `outgoing_replies`, `pending_replies`
+(see [`src/db/migrations.ts`](src/db/migrations.ts)). Migrations run at start. pgvector is used when the server has it;
+otherwise embeddings are stored as `real[]` and compared in Node. At every start the JSON files are imported (only what
+is missing), so the existing conversations are in the database from the first run.
+
+The volume (`/app/data`) still holds the client files and the JSON files the existing features use:
 
 | File | Content |
 | --- | --- |
-| `history.json` | Last `HISTORY_LIMIT` messages per connection and chat (fallback only) |
-| `transcripts.json` | Every message per chat: the bot's memory (Claude gets the last `HISTORY_LIMIT` messages with the person, earlier conversations included) and the admin's 📁 folders |
-| `previews.jsonl` | Replies prepared in preview mode (or not sent) |
-| `seen.json` | IDs of handled messages (for duplicates) |
-| `state.json` | Pause flag and usage-limit deadline |
-| `users.json` | People who wrote to the bot (name, @username, ID, counts) for the `users` list |
-| `mtproto.session` | The MTProto session (an auth key) for downloading files over 20 MB; keep it private |
-| `clients/<id>/chat.txt` | The whole conversation with this person as plain text |
-| `clients/<id>/received/` | Every file the client sent (not checked) |
-| `clients/<id>/refused.jsonl` | Files that could not be taken (too large, download failed) |
-| `clients/<id>/status.json` | The received files in order and whether the package went to the admin |
-| `clients/<id>/inbox/` | Files waiting for the batch |
+| `transcripts.json` | Every message per chat (no limit, no expiry) |
+| `history.json` | The last `HISTORY_LIMIT` messages per chat (a cache) |
+| `previews.jsonl` | Replies prepared in preview mode |
+| `seen.json` | IDs of handled messages (duplicates) |
+| `state.json` | Pause flag, open ✍️ reply modes, date of the last daily report |
+| `users.json` | People who wrote to the bot, for the `users` list |
+| `mtproto.session` | MTProto session for files over 20 MB; keep it private |
+| `clients/<id>/…` | chat.txt, received files, refused files, status, inbox |
 
-**Backup.** Right after the daily report the admin gets `zaxira-<date>.zip`: the whole data directory without
-`mtproto.session`. State, users, conversations, `status.json` and `chat.txt` always go in; client documents are added,
-newest first, while they fit in 30 MB (Telegram allows 50 MB per upload). Documents that did not fit are listed in
-`FAYLLAR-RO'YXATI.txt` inside the zip. Nothing is sent before the first person has written to the bot. To restore:
-unpack the zip into `/app/data` and restart the bot. The zip contains personal data and client documents; keep it as
-private as the data itself (`src/backup.ts`).
-
-History and previews older than `HISTORY_TTL_DAYS` are deleted. Client folders are kept until the owner deletes
-the chat with 🗑; the client's documents (licences, charters …) are confidential under the questionnaire's NDA. Messages from the people who write to the company
-**are sent to Claude (Anthropic)** to generate replies and are stored on the Railway server. Agree on this with the
-company's management and the person responsible for information security, and align it with the company's
-personal-data requirements, before you connect the bot.
+Nothing is deleted by age. Only an admin's 🗑 deletes a person (JSON entries, folder and, by cascade, every database
+row). Customers' messages are sent to Anthropic and, when Claude is down or for embeddings, to Google. Agree on this
+with the company's management and align it with the company's personal-data requirements before going live.
+Customers never get statistics or other customers' data: the customer flow has no access to the admin tools, and
+every memory query is filtered by the customer's ID.
 
 ## Deploy to Railway
 
-1. **Claude token.** On a computer with a browser run `claude setup-token`, confirm with the subscription account
-   and copy the `sk-ant-oat…` token (valid for 1 year).
-2. **Bot.** In @BotFather: `/newbot`, then *Bot Settings → Business Mode → Turn on*. Get the company account's
-   numeric ID from @userinfobot.
-3. **GitHub.** Push this code to a **private** repository (`company.md` is baked into the Docker image).
-4. **Railway → New Project → Deploy from GitHub repo** → choose the repository. It builds with the `Dockerfile`.
-5. **Service → Variables → Raw Editor**:
+1. **Keys.** Claude: [console.anthropic.com](https://console.anthropic.com) → API keys. Gemini: Google AI Studio →
+   Get API key. Never put them into the code or GitHub.
+2. **PostgreSQL.** In the Railway project: **+ New → Database → PostgreSQL** (or the pgvector template, for vector
+   search in the database). In the bot service's Variables add `DATABASE_URL=${{Postgres.DATABASE_URL}}`.
+3. **Variables** (Service → Variables → Raw Editor):
    ```
    TELEGRAM_BOT_TOKEN=...
-   OWNER_ID=...
-   CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat...
+   ADMIN_IDS=111111111,222222222
+   ANTHROPIC_API_KEY=sk-ant-...
+   GEMINI_API_KEY=...
+   GEMINI_MODEL=gemini-3.8-flash
+   DATABASE_URL=${{Postgres.DATABASE_URL}}
    AUTO_SEND=false
    ```
-   Optional: `COMPANY_NAME`, `CLAUDE_MODEL`, `CLAUDE_EFFORT`, `CLAUDE_TIMEOUT_SECONDS`, `LIMIT_COOLDOWN_MINUTES`,
-   `OWNER_TAKEOVER_MINUTES`, `HISTORY_LIMIT`, `HISTORY_TTL_DAYS`, `REVIEW_DAILY_LIMIT`, `MAX_FILE_MB`. `CLAUDE_BIN`, `DATA_DIR`, `PROFILE_PATH`, `TEMPLATES_DIR` and `LAWS_DIR` are
-   not needed.
+   Remove `CLAUDE_CODE_OAUTH_TOKEN`, `OWNER_TAKEOVER_MINUTES` and `HISTORY_TTL_DAYS` (they are ignored; the log warns).
+   `OWNER_ID` may stay: it is added to the admins.
+4. **Volume** at `/app/data` stays as before (client files).
+5. Logs should show `PostgreSQL connected`, `AI: primary claude …, backup gemini …`, `Price list: …`, `Mode: PREVIEW`.
+6. From an admin account send `/start`, then `/status`. Test from another account. After the previews look right for a
+   week or two, set `AUTO_SEND=true`.
 
-   **Files over 20 MB.** The Bot API gives bots files of at most 20 MB. To accept larger ones, open
-   https://my.telegram.org → *API development tools*, create an app (any name) and add its numbers as
-   `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`. The bot then downloads large files over MTProto with its own
-   token, connecting only for the download. The log says `Files over 20 MB: enabled (MTProto login as @…)`.
-   Keep the api_hash secret like a token. Mind the volume size: received files are kept in `data/clients/`.
-6. **Volume (the bot's memory).** Right-click the canvas (or Cmd+K / Ctrl+K) → *Volume* → choose the service →
-   mount path exactly `/app/data` → *Deploy*. Everything in the table above is written there and survives
-   redeploys. Without a volume, the memory, users, pause and limit state are lost on every deploy; the log then
-   says `WARNING: no Railway volume is attached`. With the volume the log shows
-   `Data directory: /app/data (N chat(s) in memory)`.
-7. **Logs** should show `Bot @… is running`, `Mode: PREVIEW` and
-   `Claude auth: subscription token from environment variables`. Red lines in Railway are just stderr, not errors.
-8. From the admin account (`OWNER_ID`) send `/start` to the bot. Test from **another** account by writing to the
-   bot. In `PREVIEW` mode the drafts are only in the Railway log and `previews.jsonl`, and people get no answer;
-   after the drafts have been checked for a few days, set `AUTO_SEND=true`.
-9. Optional, with Telegram Premium: in **Settings → Telegram Business → Chatbots** of the company account enter the
-   bot's username, choose the chats and allow replying (Business Mode must be on in @BotFather). The log shows
-   `Business connection …: user=<id> enabled=True`.
-
-Notes:
-
-- Run the bot in **one place only**: two pollers with the same bot token disturb each other (do not run
-  `npm start` locally while Railway is running).
-- Every push redeploys. Changing `company.md` also means commit + push.
-- Claude token expired or leaked: run `claude setup-token` again and update the Railway variable. Bot token
-  leaked: `/revoke` in @BotFather and update `TELEGRAM_BOT_TOKEN`.
+Run the bot in one place only (two pollers with the same token disturb each other).
 
 ## Local development
 
-Requires Node.js 22+ and the Claude Code CLI.
+Requires Node.js 22+ (and PostgreSQL for the full features).
 
 ```
 npm install
-cp .env.example .env && chmod 600 .env     # then edit .env with a text editor
-npm run check-claude
-npm run try -- "Salom, ish vaqtingiz qanday?"
+cp .env.example .env && chmod 600 .env     # then fill in the keys
+npm run check-ai
+npm run try -- "Salom, UTER narxi qancha?"
 ```
-
-Without `CLAUDE_CODE_OAUTH_TOKEN` the machine's own `claude` login is used. Locally only `.env` is read; shell
-variables are ignored and nothing is written to `process.env`.
 
 ### Commands
 
 | Command | What it does | Exit codes |
 | --- | --- | --- |
 | `npm start` | Runs the bot with settings from `.env` | 0 stopped, 2 config error or bot token rejected |
-| `node dist/bot.js --settings-from-env` | Container mode (Railway): settings from environment variables, which are then removed from `process.env` | same |
-| `npm run check-claude` | Checks the Claude CLI without Telegram | 0 ok, 1 check failed, 2 config error |
-| `npm run try -- "text"` | Shows the reply to a made-up message (language, escalation, reply) | 0 ok, 1 Claude failed, 2 config error |
-| `npm run typecheck` / `npm test` / `npm run build` | TypeScript check, tests (offline), compile to `dist/` | |
-
-`--check-claude` and `--try` also work with `--settings-from-env` and do not need Telegram settings.
+| `node dist/bot.js --settings-from-env` | Container mode (Railway) | same |
+| `npm run check-ai` | Sends a tiny request to Claude and Gemini | 0 at least one works, 1 none |
+| `npm run try -- "text"` | Analysis, workflow and reply for a made-up message | 0 ok, 1 AI failed, 2 config error |
+| `npm run typecheck` / `npm test` / `npm run build` | TypeScript check, tests, compile to `dist/` | |
 
 ### Tests
 
-`npm test` runs offline: Telegram calls go to a recording transformer (`tests/harness.ts`), file downloads are
-served from memory and Claude is replaced by a scripted generator. `tests/documents.test.ts` covers the template,
-counting files, the package of 14 in albums, documents marked as missing, extras after it, preview mode, large files, the inbox across restarts,
-business chats, chat.txt, the questionnaire, the client status and deleting a chat.
+`npm test` runs offline: Telegram calls go to a recording transformer (`tests/harness.ts`), Claude and Gemini are
+scripted fakes behind the real AIProviderManager (`tests/fakes.ts`).
+
+- `tests/documents.test.ts` — the 14 documents, packages, previews, large files, business chats, deletion.
+- `tests/providers.test.ts` — provider switching, circuit breaker, error classification, the Gemini adapter, price
+  list, forbidden phrases, repeat and re-ask checks, decision tree.
+- `tests/acceptance.test.ts` — the 10 acceptance tests of the specification (TZ 22) plus reports, the queue, deletion
+  and the JSON import. They need PostgreSQL: `TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:5432/postgres npm test`
+  (the user must be allowed to create databases; each test uses its own database). Without it they are skipped.
 
 ### Files
 
 ```
-src/bot.ts         entry point, CLI flags, startup checks, long polling with @grammyjs/runner
-src/config.ts      settings from .env or environment variables
-src/claudeCli.ts   claude -p wrapper, isolation, errors
-src/language.ts    language hint (uz/ru/en)
-src/prompts.ts     system and user prompts, [SKIP]/[ESCALATE]/[SEND_TEMPLATE]
-src/store.ts       history, duplicates, state, previews (atomic JSON files)
-src/templates.ts   loads templates/<id>/template.json
-src/clientFolder.ts  data/clients/<id>/: chat.txt, received files, status, the client status text
-src/documentReview.ts  the inbox of files waiting for the batch (files are not checked any more)
-src/largeFiles.ts  files over 20 MB: Bot API file_id decoding and MTProto download (GramJS)
-src/service.ts     Assistant: message flow, file batches and the package, owner commands
-src/handlers.ts    grammY router
-company.md         company profile (fill in)
-templates/         document templates (blank questionnaire uz/ru + template.json)
-laws/              lex.uz summaries (not used since files are no longer checked)
-tests/             vitest tests
-Dockerfile, railway.json, .dockerignore
+src/bot.ts                 entry point, startup checks, database, scheduler (queue, probes, embedding backfill)
+src/config.ts              settings from .env or environment variables
+src/handlers.ts            grammY router (customers, admins, buttons)
+src/service.ts             Assistant: message flow, idempotency, queue, notifications, files and packages
+src/ai/                    Claude and Gemini adapters, AIProviderManager, JSON helper
+src/orchestrator/          AI orchestrator, decision tree, reply self-check
+src/memory.ts              Memory Manager: profile, summary, semantic search, embeddings
+src/db/                    PostgreSQL access, migrations, JSON import
+src/admin/adminAssistant.ts  Admin AI assistant and its read-only tools
+src/analytics.ts           statistics queries
+src/reports.ts             PDF, Excel and CSV reports
+src/knowledge/prices.ts    the price list (knowledge/prices.json) and amount checks
+src/prompts.ts             customer system prompt, markers
+src/store.ts, clientFolder.ts, documentReview.ts, templates.ts, largeFiles.ts, dailyReport.ts, backup.ts, language.ts
+src/claudeCli.ts           the old Claude Code CLI wrapper (not used any more)
+company.md                 company profile
+knowledge/prices.json      price list (prices and days)
+templates/                 the questionnaire and the 14 documents
+docs/AI-TIZIM.md           design notes in Uzbek
+tests/                     vitest tests
 ```

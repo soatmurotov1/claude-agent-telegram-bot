@@ -12,19 +12,12 @@ RUN npm run build
 # ---- Runtime stage ----
 FROM node:22-bookworm-slim
 
-# Flags and builtin plugins were verified against this Claude Code version.
-ARG CLAUDE_VERSION=2.1.310
+ENV NODE_ENV=production
 
-ENV NODE_ENV=production \
-    DISABLE_AUTOUPDATER=1 \
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-    PATH="/root/.local/bin:${PATH}"
-
+# DejaVu fonts: PDF reports with Uzbek (oʻ, gʻ) and Russian text.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates bash \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL https://claude.ai/install.sh | bash -s "${CLAUDE_VERSION}" \
-    && claude --version
+    && apt-get install -y --no-install-recommends ca-certificates fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -32,6 +25,7 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
 COPY company.md ./
 COPY templates ./templates
+COPY knowledge ./knowledge
 COPY laws ./laws
 
 # Runs as root on purpose: Railway mounts the volume at /app/data owned by root.

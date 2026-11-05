@@ -1,37 +1,22 @@
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { run } from "@grammyjs/runner";
 import { Bot, GrammyError } from "grammy";
-import { ClaudeError } from "./claudeCli.js";
-import {
-  ConfigError,
-  envFileWarning,
-  loadSettings,
-  type Settings,
-  settingsFromProcessEnv,
-} from "./config.js";
+import { ConfigError, envFileWarning, loadSettings, type Settings, settingsFromProcessEnv } from "./config.js";
+import { Database } from "./db/database.js";
+import { importJsonData } from "./db/importJson.js";
 import { ALLOWED_UPDATES, buildComposer } from "./handlers.js";
+import { loadPriceList } from "./knowledge/prices.js";
 import { detectLanguage, LANGUAGE_NAMES } from "./language.js";
 import { loadTemplate } from "./templates.js";
-import { buildSystemPrompt, buildUserPrompt, SKIP_TOKEN, splitEscalation, splitTemplate } from "./prompts.js";
-import {
-  buildAssistant,
-  errorMessage,
-  log,
-  logError,
-  makeClaudeCli,
-  profileIsFilled,
-  readProfile,
-} from "./service.js";
-import { ensurePrivateDir, pruneJsonl } from "./store.js";
+import { SKIP_TOKEN, splitEscalation, splitTemplate } from "./prompts.js";
+import { buildAssistant, errorMessage, log, logError, makeProviderManager, profileIsFilled, readProfile } from "./service.js";
+import { ensurePrivateDir } from "./store.js";
 
 /** Project root: the parent of src/ (tsx) or dist/ (compiled). */
 const PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ENV_FILE = path.join(PROJECT_DIR, ".env");
-
-const FORBIDDEN_KEY_SOURCES = new Set(["ANTHROPIC_API_KEY", "apiKeyHelper", "/login managed key"]);
 
 async function main(): Promise<number> {
   let args;
@@ -39,6 +24,8 @@ async function main(): Promise<number> {
     args = parseArgs({
       options: {
         "settings-from-env": { type: "boolean", default: false },
+        "check-ai": { type: "boolean", default: false },
+        // Old name of --check-ai, kept so existing scripts keep working.
         "check-claude": { type: "boolean", default: false },
         try: { type: "string" },
       },
@@ -47,12 +34,13 @@ async function main(): Promise<number> {
     }).values;
   } catch (err) {
     logError(`Invalid arguments: ${errorMessage(err)}`);
-    logError('Usage: bot.js [--settings-from-env] [--check-claude | --try "message"]');
+    logError('Usage: bot.js [--settings-from-env] [--check-ai | --try "message"]');
     return 2;
   }
 
   const fromEnv = args["settings-from-env"] === true;
-  const needsTelegram = !args["check-claude"] && args.try === undefined;
+  const checkAi = args["check-ai"] === true || args["check-claude"] === true;
+  const needsTelegram = !checkAi && args.try === undefined;
 
   let settings: Settings;
   try {
@@ -71,49 +59,52 @@ async function main(): Promise<number> {
     const warning = envFileWarning(settings.envFile);
     if (warning) logError(`WARNING: ${warning}`);
   }
+  for (const key of settings.obsoleteSettings) {
+    logError(`WARNING: ${key} is no longer used and can be removed (Claude now runs through ANTHROPIC_API_KEY; nothing is deleted by age).`);
+  }
   ensurePrivateDir(settings.dataDir);
-  ensurePrivateDir(path.join(settings.dataDir, "claude-run"));
-  const pruned = pruneJsonl(path.join(settings.dataDir, "previews.jsonl"), settings.historyTtlDays, () => Date.now() / 1000);
-  if (pruned > 0) log(`Removed ${pruned} preview record(s) older than ${settings.historyTtlDays} days.`);
 
-  if (args["check-claude"]) return checkClaude(settings);
+  if (checkAi) return checkProviders(settings);
   if (args.try !== undefined) return tryReply(settings, args.try);
   return runBot(settings);
 }
 
-async function checkClaude(settings: Settings): Promise<number> {
-  const cli = makeClaudeCli(settings);
-  log(`Checking Claude CLI at ${settings.claudeBin} (auth: ${settings.claudeAuthMode})...`);
-  let result;
-  try {
-    result = await cli.inspect();
-  } catch (err) {
-    logError(`Claude check failed: ${err instanceof ClaudeError ? err.message : errorMessage(err)}`);
+/** Sends a tiny request to Claude and to Gemini and says which of them work. */
+async function checkProviders(settings: Settings): Promise<number> {
+  const { ai } = makeProviderManager(settings);
+  if (!ai) {
+    logError("Neither ANTHROPIC_API_KEY nor GEMINI_API_KEY is set.");
     return 1;
   }
-  console.log(JSON.stringify(result, null, 2));
-
-  const problems: string[] = [];
-  const init = result.init;
-  if (!init) {
-    problems.push("the CLI did not report an init event");
-  } else {
-    for (const key of ["tools", "mcp_servers", "plugins", "skills"] as const) {
-      if (init[key].length > 0) problems.push(`${key} must be empty but is: ${init[key].join(", ")}`);
+  let ok = 0;
+  for (const [name, configured] of [
+    ["Claude", settings.anthropicApiKey],
+    ["Gemini", settings.geminiApiKey],
+  ] as const) {
+    if (!configured) {
+      log(`${name}: not configured.`);
+      continue;
     }
-    if (init.apiKeySource !== null && FORBIDDEN_KEY_SOURCES.has(init.apiKeySource)) {
-      problems.push(`the CLI uses an API key (apiKeySource=${init.apiKeySource}), not the subscription`);
-    }
-    if (init.apiProvider !== null && init.apiProvider !== "firstParty") {
-      problems.push(`the CLI uses provider ${init.apiProvider}, expected firstParty`);
+    const { ai: single } = makeProviderManager({
+      ...settings,
+      anthropicApiKey: name === "Claude" ? settings.anthropicApiKey : "",
+      geminiApiKey: name === "Gemini" ? settings.geminiApiKey : "",
+    } as Settings);
+    try {
+      const response = await single!.chat({
+        purpose: "check",
+        tier: "fast",
+        maxTokens: 20,
+        system: "Answer with one word.",
+        messages: [{ role: "user", content: "Say OK." }],
+      });
+      log(`${name}: OK (${response.model}, ${response.latencyMs} ms).`);
+      ok++;
+    } catch (err) {
+      logError(`${name}: FAILED — ${errorMessage(err)}`);
     }
   }
-  if (problems.length > 0) {
-    for (const problem of problems) logError(`Claude check failed: ${problem}`);
-    return 1;
-  }
-  log(`Claude check passed. Auth: ${result.auth}.`);
-  return 0;
+  return ok > 0 ? 0 : 1;
 }
 
 async function tryReply(settings: Settings, text: string): Promise<number> {
@@ -121,37 +112,72 @@ async function tryReply(settings: Settings, text: string): Promise<number> {
     logError('Usage: npm run try -- "message text"');
     return 2;
   }
-  const language = detectLanguage(text);
-  const system = buildSystemPrompt(settings.companyName, readProfile(settings.profilePath), new Date());
-  const user = buildUserPrompt(
-    [{ role: "other", name: "Test user", text, lang: language, ts: Date.now() / 1000 }],
-    language,
-  );
-  let raw: string;
-  try {
-    raw = await makeClaudeCli(settings).generate(system, user);
-  } catch (err) {
-    logError(`Claude failed: ${errorMessage(err)}`);
+  const assistant = buildAssistant(settings);
+  if (!assistant.ai) {
+    logError("Neither ANTHROPIC_API_KEY nor GEMINI_API_KEY is set.");
     return 1;
   }
-  const { escalate, text: withMarkers } = splitEscalation(raw);
+  const language = detectLanguage(text);
+  const brain = assistant.brain;
+  let result;
+  try {
+    result = await brain.reply({
+      customerId: 1,
+      chatName: "Test user",
+      language,
+      recent: [{ role: "other", name: "Test user", text, lang: language, ts: Date.now() / 1000 }],
+      incoming: text,
+      incomingKey: "try",
+      companyName: settings.companyName,
+      profileText: readProfile(settings.profilePath),
+      now: new Date(),
+    });
+  } catch (err) {
+    logError(`AI failed: ${errorMessage(err)}`);
+    return 1;
+  }
+  const { escalate, text: withMarkers } = splitEscalation(result.raw);
   const { sendTemplate, text: reply } = splitTemplate(withMarkers);
   console.log(
     [
-      `Auth:      ${settings.claudeAuthMode}`,
+      `Provider:  ${result.provider ?? "-"} ${result.model ?? ""}`,
       `Language:  ${language ? LANGUAGE_NAMES[language] : "unknown"}`,
       `Message:   ${text}`,
+      `Type:      ${result.analysis.requestType} (${result.analysis.complexity}, context ${result.analysis.contextCompleteness}, confidence ${result.analysis.confidence})`,
+      `Workflow:  ${result.path.join(" -> ")}`,
       `Escalated: ${escalate ? "yes" : "no"}`,
       `Questionnaire: ${sendTemplate ? "sent after the reply" : "no"}`,
       `Reply:     ${reply.startsWith(SKIP_TOKEN) || !reply ? "(no reply: [SKIP])" : reply}`,
+      ...(result.notes.length > 0 ? [`Notes:     ${result.notes.join("; ")}`] : []),
     ].join("\n"),
   );
   return 0;
 }
 
+async function connectDatabase(settings: Settings): Promise<Database | null> {
+  if (!settings.databaseUrl) {
+    logError(
+      "WARNING: DATABASE_URL is not set. The bot runs on the JSON files only: no long-term memory search, no Admin AI " +
+        "and no analytics. Add a PostgreSQL database (Railway: + New -> Database -> PostgreSQL) and set DATABASE_URL.",
+    );
+    return null;
+  }
+  try {
+    const db = await Database.connect(settings.databaseUrl);
+    log(`PostgreSQL connected (embeddings: ${db.vectorMode === "pgvector" ? "pgvector" : "real[] without pgvector"}).`);
+    const imported = await importJsonData(db, settings.dataDir);
+    if (imported.messages > 0) log(`Imported ${imported.messages} message(s) of ${imported.customers} customer(s) from the JSON files.`);
+    return db;
+  } catch (err) {
+    logError(`WARNING: PostgreSQL is not reachable (${errorMessage(err)}). The bot runs on the JSON files only until restart.`);
+    return null;
+  }
+}
+
 async function runBot(settings: Settings): Promise<number> {
   const bot = new Bot(settings.botToken);
-  const assistant = buildAssistant(settings);
+  const db = await connectDatabase(settings);
+  const assistant = buildAssistant(settings, { db });
   bot.use(buildComposer(assistant, settings));
   bot.catch((err) => {
     logError(`Error while handling update ${err.ctx.update.update_id}: ${errorMessage(err.error)}`);
@@ -166,23 +192,35 @@ async function runBot(settings: Settings): Promise<number> {
     }
     throw err;
   }
+  assistant.attachApi(bot.api);
 
   log(`Bot @${bot.botInfo.username} is running`);
   log(`Company: ${settings.companyName}`);
-  if (settings.autoSend) {
-    log("Mode: AUTO-SEND (WARNING: replies are sent to the people who wrote, without review)");
+  log(
+    settings.autoSend
+      ? "Mode: AUTO-SEND (WARNING: replies are sent to the people who wrote, without review)"
+      : "Mode: PREVIEW (replies are only shown in the logs, nothing is sent)",
+  );
+  log(`Admins: ${assistant.adminIds.join(", ")}`);
+  const status = assistant.ai?.status();
+  if (!status) {
+    logError("WARNING: no AI provider is configured (ANTHROPIC_API_KEY / GEMINI_API_KEY). Every message is queued.");
   } else {
-    log("Mode: PREVIEW (replies are only shown in the logs, nothing is sent)");
+    log(
+      `AI: primary ${status.primary ?? "none"} (${settings.claudeModel} / ${settings.claudeModelFast}), backup ${status.backup ?? "none"}` +
+        `${status.backup ? ` (${settings.geminiModel} / ${settings.geminiModelFast})` : ""}`,
+    );
+    if (!status.backup) logError("WARNING: GEMINI_API_KEY is not set: there is no backup when Claude fails, and no semantic search.");
+    if (!status.primary) logError("WARNING: ANTHROPIC_API_KEY is not set: Gemini answers everything.");
   }
-  log(`Direct chats: anyone may write to the bot; the owner (OWNER_ID ${settings.ownerId}) gets only important requests, files and complete packages`);
-  log(`Claude auth: ${settings.claudeAuthMode}`);
-  log(`Claude binary: ${settings.claudeBin}`);
+  const prices = loadPriceList(settings.pricesPath);
+  log(prices ? `Price list: ${settings.pricesPath} (valid on ${prices.validOn})` : `WARNING: price list ${settings.pricesPath} not readable; no prices are named.`);
   log(`Data directory: ${settings.dataDir} (${assistant.history.chatCount()} chat(s) in memory)`);
   // Railway sets RAILWAY_VOLUME_MOUNT_PATH only when a volume is attached to the service.
   if (process.env.RAILWAY_ENVIRONMENT_NAME && !process.env.RAILWAY_VOLUME_MOUNT_PATH) {
     logError(
-      "WARNING: no Railway volume is attached, so the bot's memory (chat history, users, pause state) is lost on " +
-        "every deploy. Add a volume mounted at /app/data to this service.",
+      "WARNING: no Railway volume is attached, so the client files and JSON memory are lost on every deploy. Add a " +
+        "volume mounted at /app/data to this service.",
     );
   } else if (process.env.RAILWAY_VOLUME_MOUNT_PATH && path.resolve(process.env.RAILWAY_VOLUME_MOUNT_PATH) !== settings.dataDir) {
     logError(
@@ -196,7 +234,7 @@ async function runBot(settings: Settings): Promise<number> {
         "messages. Turn it off: @BotFather -> /mybots -> the bot -> Bot Settings -> Threaded Mode.",
     );
   }
-  if (assistant.state.paused) logError("WARNING: the bot is paused. Send /resume to the bot from the owner account.");
+  if (assistant.state.paused) logError("WARNING: the bot is paused. Send /resume to the bot from an admin account.");
   if (!profileIsFilled(readProfile(settings.profilePath))) {
     logError(`WARNING: ${settings.profilePath} is not filled in yet. Replies will contain almost no facts.`);
   }
@@ -207,7 +245,6 @@ async function runBot(settings: Settings): Promise<number> {
     logError(`WARNING: ${errorMessage(err)}. A package is counted as 14 files.`);
   }
   if (assistant.mtproto) {
-    // Checked in the background so a slow or failing MTProto login never delays the bot itself.
     void assistant.mtproto.check().then(
       (who) => log(`Files over 20 MB: enabled (MTProto login as ${who}), up to ${settings.maxFileMb} MB.`),
       (err: unknown) =>
@@ -223,7 +260,18 @@ async function runBot(settings: Settings): Promise<number> {
   if (waiting.length > 0) log(`Resuming the files waiting from ${waiting.length} client(s).`);
   assistant.resumePendingFiles(bot.api);
   assistant.startDailyReport(bot.api);
-  log(`Daily report to the admin: every day at ${String(settings.dailyReportHour).padStart(2, "0")}:00 (Tashkent time).`);
+  log(`Daily report to the admins: every day at ${String(settings.dailyReportHour).padStart(2, "0")}:00 (Tashkent time).`);
+
+  // Task Scheduler: queued replies, Claude probes, embedding backfill.
+  assistant.startPendingWorker(bot.api);
+  assistant.ai?.startProbes();
+  if (assistant.memory) {
+    const memory = assistant.memory;
+    const backfill = setInterval(() => {
+      void memory.backfill(40).catch((err: unknown) => logError(`Embedding backfill failed: ${errorMessage(err)}`));
+    }, 5 * 60_000);
+    backfill.unref();
+  }
 
   const runner = run(bot, { runner: { fetch: { allowed_updates: ALLOWED_UPDATES } } });
   let stopping = false;
@@ -231,10 +279,14 @@ async function runBot(settings: Settings): Promise<number> {
     if (stopping) return;
     stopping = true;
     log(`Received ${signal}, stopping...`);
-    void runner.stop().finally(() => {
-      log("Stopped.");
-      process.exit(0);
-    });
+    void runner
+      .stop()
+      .then(() => assistant.idle())
+      .then(() => db?.close())
+      .finally(() => {
+        log("Stopped.");
+        process.exit(0);
+      });
   };
   process.once("SIGTERM", () => stop("SIGTERM"));
   process.once("SIGINT", () => stop("SIGINT"));

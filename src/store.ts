@@ -66,7 +66,7 @@ function toHistoryItem(value: unknown): HistoryItem | null {
   return { role, name, text, lang: language, ts };
 }
 
-/** Conversation history per business connection and chat, trimmed by count and age. */
+/** Conversation history per business connection and chat, trimmed by count (and by age when ttlDays > 0). */
 export class HistoryStore {
   readonly #file: JsonFile<Record<string, HistoryItem[]>>;
   readonly #data: Record<string, HistoryItem[]>;
@@ -99,10 +99,10 @@ export class HistoryStore {
     return [...(this.#data[HistoryStore.key(connectionId, chatId)] ?? [])];
   }
 
-  add(connectionId: string, chatId: number, item: Omit<HistoryItem, "ts">): void {
+  add(connectionId: string, chatId: number, item: Omit<HistoryItem, "ts">, ts: number = this.clock()): void {
     const key = HistoryStore.key(connectionId, chatId);
     const items = this.#data[key] ?? [];
-    items.push({ ...item, ts: this.clock() });
+    items.push({ ...item, ts });
     this.#data[key] = items;
     this.#prune();
     this.#file.write(this.#data);
@@ -157,9 +157,9 @@ export class HistoryStore {
     return removed;
   }
 
-  /** Drops expired and overflowing items and empty chats. Returns true when something changed. */
+  /** Drops expired (ttlDays > 0 only) and overflowing items and empty chats. Returns true when something changed. */
   #prune(): boolean {
-    const cutoff = this.clock() - this.ttlDays * 86400;
+    const cutoff = this.ttlDays > 0 ? this.clock() - this.ttlDays * 86400 : -Infinity;
     let changed = false;
     for (const [key, items] of Object.entries(this.#data)) {
       let kept = items.filter((item) => item.ts >= cutoff);
@@ -207,6 +207,8 @@ interface StateData {
   limitUntil: number;
   /** Tashkent date (YYYY-MM-DD) of the last daily report sent to the admin. */
   lastReportDate: string;
+  /** Admin ID -> the customer that admin is answering with ✍️ (the bot is silent for that customer meanwhile). */
+  replyModes: Record<string, number>;
 }
 
 /** Pause flag and usage-limit deadline, kept across restarts. */
@@ -215,14 +217,23 @@ export class RuntimeState {
   #data: StateData;
 
   constructor(file: string) {
-    this.#file = new JsonFile<StateData>(file, () => ({ paused: false, limitUntil: 0, lastReportDate: "" }), (value) => {
-      if (!isRecord(value)) return null;
-      return {
-        paused: value.paused === true,
-        limitUntil: typeof value.limitUntil === "number" ? value.limitUntil : 0,
-        lastReportDate: typeof value.lastReportDate === "string" ? value.lastReportDate : "",
-      };
-    });
+    this.#file = new JsonFile<StateData>(
+      file,
+      () => ({ paused: false, limitUntil: 0, lastReportDate: "", replyModes: {} }),
+      (value) => {
+        if (!isRecord(value)) return null;
+        const replyModes: Record<string, number> = {};
+        if (isRecord(value.replyModes)) {
+          for (const [admin, user] of Object.entries(value.replyModes)) if (typeof user === "number") replyModes[admin] = user;
+        }
+        return {
+          paused: value.paused === true,
+          limitUntil: typeof value.limitUntil === "number" ? value.limitUntil : 0,
+          lastReportDate: typeof value.lastReportDate === "string" ? value.lastReportDate : "",
+          replyModes,
+        };
+      },
+    );
     this.#data = this.#file.read();
   }
 
@@ -250,6 +261,18 @@ export class RuntimeState {
 
   set lastReportDate(value: string) {
     this.#data = { ...this.#data, lastReportDate: value };
+    this.#file.write(this.#data);
+  }
+
+  get replyModes(): Readonly<Record<string, number>> {
+    return this.#data.replyModes;
+  }
+
+  setReplyMode(adminId: number, userId: number | null): void {
+    const replyModes = { ...this.#data.replyModes };
+    if (userId === null) delete replyModes[String(adminId)];
+    else replyModes[String(adminId)] = userId;
+    this.#data = { ...this.#data, replyModes };
     this.#file.write(this.#data);
   }
 }
@@ -299,7 +322,7 @@ function toKnownUser(value: unknown): KnownUser | null {
   return { id, name, username, firstSeen, lastSeen, messages };
 }
 
-/** People who wrote to the bot, for the owner's "users" list. Forgotten after ttlDays without messages. */
+/** People who wrote to the bot, for the admins' "users" list. Kept until an admin deletes them (ttlDays 0). */
 export class UserDirectory {
   readonly #file: JsonFile<KnownUser[]>;
   readonly #users: Map<number, KnownUser>;
@@ -344,6 +367,7 @@ export class UserDirectory {
   }
 
   #prune(): boolean {
+    if (this.ttlDays <= 0) return false;
     const cutoff = this.clock() - this.ttlDays * 86400;
     let changed = false;
     for (const [id, user] of this.#users) {
