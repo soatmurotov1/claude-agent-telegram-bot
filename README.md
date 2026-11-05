@@ -263,7 +263,6 @@ src/reports.ts             PDF, Excel and CSV reports
 src/knowledge/prices.ts    the price list (knowledge/prices.json) and amount checks
 src/prompts.ts             customer system prompt, markers
 src/store.ts, clientFolder.ts, documentReview.ts, templates.ts, largeFiles.ts, dailyReport.ts, backup.ts, language.ts
-src/claudeCli.ts           the old Claude Code CLI wrapper (not used any more)
 company.md                 company profile
 knowledge/prices.json      price list (prices and days)
 templates/                 the questionnaire and the 14 documents

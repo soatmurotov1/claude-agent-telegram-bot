@@ -166,7 +166,6 @@ export class Harness {
         DATA_DIR: this.dataDir,
         PROFILE_PATH: profile,
         TEMPLATES_DIR: path.join(PROJECT_DIR, "templates"),
-        LAWS_DIR: path.join(PROJECT_DIR, "laws"),
         PRICES_PATH: path.join(PROJECT_DIR, "knowledge", "prices.json"),
         ...overrides,
       },
