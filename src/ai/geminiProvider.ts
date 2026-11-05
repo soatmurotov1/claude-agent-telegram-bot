@@ -52,7 +52,7 @@ export class GeminiProvider implements Provider, Embedder {
   }
 
   async chat(request: ChatRequest, signal: AbortSignal): Promise<ChatResponse> {
-    const model = this.modelFor(request.tier);
+    let model = this.modelFor(request.tier);
     const body: Record<string, unknown> = {
       systemInstruction: { parts: [{ text: request.system }] },
       contents: request.messages.map((message) => ({
@@ -76,7 +76,25 @@ export class GeminiProvider implements Provider, Embedder {
       ];
     }
     const started = Date.now();
-    const json = await this.#post(`/v1beta/models/${encodeURIComponent(model)}:generateContent`, body, signal);
+    // A busy model (503) or a model-level quota (429) is common on Gemini: try the other configured model before
+    // giving up, so a customer is not left without an answer because one model is overloaded.
+    const candidates = [...new Set([model, this.options.fastModel, this.options.mainModel])];
+    let json: Record<string, unknown> | null = null;
+    let lastError: unknown = null;
+    for (const name of candidates) {
+      try {
+        json = await this.#post(`/v1beta/models/${encodeURIComponent(name)}:generateContent`, body, signal);
+        model = name;
+        break;
+      } catch (error) {
+        lastError = error;
+        const retryable =
+          error instanceof ProviderError &&
+          (["overloaded", "server", "rate_limit"].includes(error.kind) || error.message.includes("HTTP 404"));
+        if (!retryable) throw error;
+      }
+    }
+    if (!json) throw lastError;
     const candidate = Array.isArray(json.candidates) && isObject(json.candidates[0]) ? json.candidates[0] : null;
     if (!candidate) {
       const blocked = isObject(json.promptFeedback) ? String(json.promptFeedback.blockReason ?? "") : "";

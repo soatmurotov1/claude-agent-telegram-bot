@@ -131,6 +131,23 @@ describe("AIProviderManager (TZ 16)", () => {
     expect(contents[1]?.parts[1]?.thoughtSignature).toBe(DUMMY_THOUGHT_SIGNATURE);
     expect(contents[2]?.parts[0]?.functionResponse).toEqual({ name: "top_chats", response: { result: "[]" } });
 
+    // an overloaded model falls back to the other Gemini model
+    const tried: string[] = [];
+    const busy = new GeminiProvider({
+      apiKey: "k",
+      mainModel: "g-main",
+      fastModel: "g-fast",
+      embeddingModel: "e",
+      fetch: (async (url: string) => {
+        tried.push(url.includes("g-main") ? "main" : "fast");
+        if (url.includes("g-main")) return new Response('{"error":{"status":"UNAVAILABLE","message":"high demand"}}', { status: 503 });
+        return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] }, finishReason: "STOP" }] }), { status: 200 });
+      }) as unknown as typeof fetch,
+    });
+    const viaFast = await busy.chat(request, controller.signal);
+    expect(tried).toEqual(["main", "fast"]);
+    expect(viaFast.model).toBe("g-fast");
+
     const failing = new GeminiProvider({
       apiKey: "SECRET-KEY",
       mainModel: "m",
