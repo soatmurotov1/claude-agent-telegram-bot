@@ -8,17 +8,20 @@ import { parse } from "dotenv";
 export const SETTING_KEYS = [
   "TELEGRAM_BOT_TOKEN",
   "OWNER_ID",
+  "ADMIN_IDS",
   "COMPANY_NAME",
   "AUTO_SEND",
-  "CLAUDE_CODE_OAUTH_TOKEN",
-  "CLAUDE_BIN",
+  "ANTHROPIC_API_KEY",
   "CLAUDE_MODEL",
-  "CLAUDE_EFFORT",
-  "CLAUDE_TIMEOUT_SECONDS",
-  "LIMIT_COOLDOWN_MINUTES",
-  "OWNER_TAKEOVER_MINUTES",
+  "CLAUDE_MODEL_FAST",
+  "GEMINI_API_KEY",
+  "GEMINI_MODEL",
+  "GEMINI_MODEL_FAST",
+  "GEMINI_EMBEDDING_MODEL",
+  "AI_TIMEOUT_SECONDS",
+  "AI_PROBE_MINUTES",
+  "DATABASE_URL",
   "HISTORY_LIMIT",
-  "HISTORY_TTL_DAYS",
   "REVIEW_DAILY_LIMIT",
   "DAILY_REPORT_HOUR",
   "MAX_FILE_MB",
@@ -28,19 +31,38 @@ export const SETTING_KEYS = [
   "PROFILE_PATH",
   "TEMPLATES_DIR",
   "LAWS_DIR",
+  "PRICES_PATH",
+  "REPORT_FONT_PATH",
+  // No longer used (Claude now runs through the API, and nothing is deleted by age); read only to warn about them.
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "CLAUDE_BIN",
+  "CLAUDE_EFFORT",
+  "CLAUDE_TIMEOUT_SECONDS",
+  "LIMIT_COOLDOWN_MINUTES",
+  "OWNER_TAKEOVER_MINUTES",
+  "HISTORY_TTL_DAYS",
 ] as const;
+
+/** Settings from the previous version that are ignored now; bot.ts warns when one is still set. */
+export const OBSOLETE_KEYS: readonly SettingKey[] = [
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "CLAUDE_BIN",
+  "CLAUDE_EFFORT",
+  "CLAUDE_TIMEOUT_SECONDS",
+  "LIMIT_COOLDOWN_MINUTES",
+  "OWNER_TAKEOVER_MINUTES",
+  "HISTORY_TTL_DAYS",
+];
+
+export const DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5";
+export const DEFAULT_CLAUDE_MODEL_FAST = "claude-haiku-5-5";
+export const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
+export const DEFAULT_GEMINI_MODEL_FAST = "gemini-3.5-flash-lite";
+export const DEFAULT_GEMINI_EMBEDDING_MODEL = "gemini-embedding-001";
 
 export type SettingKey = (typeof SETTING_KEYS)[number];
 
-export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
-export type Effort = (typeof EFFORT_LEVELS)[number];
-
 export const DEFAULT_COMPANY_NAME = "Sanoatgeokontexxizmat";
-
-export type ClaudeAuthMode =
-  | "this machine's claude login"
-  | "subscription token from .env"
-  | "subscription token from environment variables";
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -51,18 +73,26 @@ export class ConfigError extends Error {
 
 export interface Settings {
   readonly botToken: string;
+  /** The first admin (OWNER_ID, or the first of ADMIN_IDS); kept for the business connection check. */
   readonly ownerId: number;
+  /** Every admin: OWNER_ID plus ADMIN_IDS. All admins are equal. */
+  readonly adminIds: readonly number[];
   readonly companyName: string;
   readonly autoSend: boolean;
-  readonly claudeOauthToken: string;
-  readonly claudeBin: string;
+  readonly anthropicApiKey: string;
   readonly claudeModel: string;
-  readonly claudeEffort: Effort;
-  readonly claudeTimeoutSeconds: number;
-  readonly limitCooldownMinutes: number;
-  readonly ownerTakeoverMinutes: number;
+  readonly claudeModelFast: string;
+  readonly geminiApiKey: string;
+  readonly geminiModel: string;
+  readonly geminiModelFast: string;
+  readonly geminiEmbeddingModel: string;
+  readonly aiTimeoutSeconds: number;
+  readonly aiProbeMinutes: number;
+  readonly databaseUrl: string;
+  /** Recent messages put into every reply prompt (older ones come from the summary and semantic search). */
   readonly historyLimit: number;
-  readonly historyTtlDays: number;
+  /** Obsolete settings that are still set (bot.ts warns about them). */
+  readonly obsoleteSettings: readonly string[];
   /** Claude calls for document checks allowed per 24 hours across all clients. */
   readonly reviewDailyLimit: number;
   /** Hour (0-23, Tashkent) at which the daily report goes to the admin. */
@@ -76,9 +106,10 @@ export interface Settings {
   readonly profilePath: string;
   readonly templatesDir: string;
   readonly lawsDir: string;
+  readonly pricesPath: string;
+  readonly reportFontPath: string;
   readonly envFile: string;
   readonly fromEnvironment: boolean;
-  readonly claudeAuthMode: ClaudeAuthMode;
 }
 
 export interface LoadOptions {
@@ -124,9 +155,20 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
   const get = (key: SettingKey): string => (raw[key] ?? "").trim();
 
   let botToken = "";
-  let ownerId = 0;
   const tokenValue = get("TELEGRAM_BOT_TOKEN");
   const ownerValue = get("OWNER_ID");
+  const adminValue = get("ADMIN_IDS");
+  const adminIds: number[] = [];
+  for (const part of [ownerValue, ...adminValue.split(/[,;\s]+/)]) {
+    if (!part) continue;
+    if (!/^\d+$/.test(part) || Number(part) <= 0) {
+      if (requireTelegram) {
+        throw new ConfigError(`OWNER_ID and ADMIN_IDS must hold numeric Telegram user IDs, separated by commas (check ${where}).`);
+      }
+      continue;
+    }
+    if (!adminIds.includes(Number(part))) adminIds.push(Number(part));
+  }
   if (requireTelegram) {
     if (!tokenValue) throw new ConfigError(`TELEGRAM_BOT_TOKEN is missing (check ${where}).`);
     if (!isBotToken(tokenValue)) {
@@ -134,17 +176,13 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
         `TELEGRAM_BOT_TOKEN does not look like a bot token from @BotFather (expected <digits>:<text>; check ${where}).`,
       );
     }
-    if (!ownerValue) throw new ConfigError(`OWNER_ID is missing (check ${where}).`);
-    if (!/^\d+$/.test(ownerValue) || Number(ownerValue) <= 0) {
-      throw new ConfigError(`OWNER_ID must be a numeric Telegram user ID (check ${where}).`);
-    }
+    if (adminIds.length === 0) throw new ConfigError(`ADMIN_IDS (or OWNER_ID) is missing (check ${where}).`);
     botToken = tokenValue;
-    ownerId = Number(ownerValue);
-  } else {
-    // Telegram settings are optional here (--check-claude, --try); keep them only when valid.
-    if (isBotToken(tokenValue)) botToken = tokenValue;
-    if (/^\d+$/.test(ownerValue)) ownerId = Number(ownerValue);
+  } else if (isBotToken(tokenValue)) {
+    // Telegram settings are optional here (--check-ai, --try); keep them only when valid.
+    botToken = tokenValue;
   }
+  const ownerId = adminIds[0] ?? 0;
 
   const autoSendValue = get("AUTO_SEND").toLowerCase();
   let autoSend = false;
@@ -155,26 +193,25 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
     }
   }
 
-  const claudeOauthToken = get("CLAUDE_CODE_OAUTH_TOKEN");
-  if (claudeOauthToken) {
-    if (claudeOauthToken.startsWith("sk-ant-api")) {
-      throw new ConfigError(
-        `CLAUDE_CODE_OAUTH_TOKEN holds an Anthropic API key, not a subscription token. ` +
-          `Run "claude setup-token" and use the sk-ant-oat... token it prints (check ${where}).`,
-      );
-    }
-    if (!claudeOauthToken.startsWith("sk-ant-oat") || /\s/.test(claudeOauthToken)) {
-      throw new ConfigError(
-        `CLAUDE_CODE_OAUTH_TOKEN is not a valid "claude setup-token" token: it must start with sk-ant-oat ` +
-          `and be on a single line without spaces (check ${where}).`,
-      );
-    }
+  const anthropicApiKey = get("ANTHROPIC_API_KEY");
+  if (anthropicApiKey && (!anthropicApiKey.startsWith("sk-ant-") || /\s/.test(anthropicApiKey))) {
+    throw new ConfigError(`ANTHROPIC_API_KEY must be an Anthropic API key (sk-ant-..., one line; check ${where}).`);
   }
-
-  const effortValue = get("CLAUDE_EFFORT").toLowerCase() || "low";
-  if (!isEffort(effortValue)) {
-    throw new ConfigError(`CLAUDE_EFFORT must be one of ${EFFORT_LEVELS.join(", ")} (check ${where}).`);
+  if (anthropicApiKey.startsWith("sk-ant-oat")) {
+    throw new ConfigError(
+      `ANTHROPIC_API_KEY holds a Claude subscription token (sk-ant-oat...). Create an API key in the Claude Console ` +
+        `(console.anthropic.com -> API keys) and use that (check ${where}).`,
+    );
   }
+  const geminiApiKey = get("GEMINI_API_KEY");
+  if (geminiApiKey && /\s/.test(geminiApiKey)) {
+    throw new ConfigError(`GEMINI_API_KEY must be on one line without spaces (check ${where}).`);
+  }
+  const databaseUrl = get("DATABASE_URL");
+  if (databaseUrl && !/^postgres(ql)?:\/\//.test(databaseUrl)) {
+    throw new ConfigError(`DATABASE_URL must be a postgresql:// connection string (check ${where}).`);
+  }
+  const obsoleteSettings = OBSOLETE_KEYS.filter((key) => get(key) !== "");
 
   const int = (key: SettingKey, fallback: number, min: number): number => {
     const value = get(key);
@@ -201,25 +238,20 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
     throw new ConfigError(`Set both TELEGRAM_API_ID and TELEGRAM_API_HASH, or neither (check ${where}).`);
   }
 
-  const claudeBinValue = get("CLAUDE_BIN");
-  const claudeBin = claudeBinValue
-    ? claudeBinValue.includes("/") || claudeBinValue.includes("\\")
-      ? path.resolve(baseDir, claudeBinValue)
-      : (which(claudeBinValue) ?? claudeBinValue)
-    : findClaudeBin();
-
   const values = {
     companyName: get("COMPANY_NAME") || DEFAULT_COMPANY_NAME,
     ownerId,
+    adminIds: Object.freeze([...adminIds]),
     autoSend,
-    claudeBin,
-    claudeModel: get("CLAUDE_MODEL"),
-    claudeEffort: effortValue,
-    claudeTimeoutSeconds: int("CLAUDE_TIMEOUT_SECONDS", 120, 1),
-    limitCooldownMinutes: int("LIMIT_COOLDOWN_MINUTES", 30, 1),
-    ownerTakeoverMinutes: int("OWNER_TAKEOVER_MINUTES", 15, 0),
-    historyLimit: int("HISTORY_LIMIT", 50, 1),
-    historyTtlDays: int("HISTORY_TTL_DAYS", 30, 1),
+    claudeModel: get("CLAUDE_MODEL") || DEFAULT_CLAUDE_MODEL,
+    claudeModelFast: get("CLAUDE_MODEL_FAST") || DEFAULT_CLAUDE_MODEL_FAST,
+    geminiModel: get("GEMINI_MODEL") || DEFAULT_GEMINI_MODEL,
+    geminiModelFast: get("GEMINI_MODEL_FAST") || DEFAULT_GEMINI_MODEL_FAST,
+    geminiEmbeddingModel: get("GEMINI_EMBEDDING_MODEL") || DEFAULT_GEMINI_EMBEDDING_MODEL,
+    aiTimeoutSeconds: int("AI_TIMEOUT_SECONDS", 90, 5),
+    aiProbeMinutes: int("AI_PROBE_MINUTES", 5, 1),
+    historyLimit: int("HISTORY_LIMIT", 40, 1),
+    obsoleteSettings: Object.freeze([...obsoleteSettings]),
     reviewDailyLimit: int("REVIEW_DAILY_LIMIT", 100, 1),
     dailyReportHour: Math.min(int("DAILY_REPORT_HOUR", 9, 0), 23),
     maxFileMb: Math.min(int("MAX_FILE_MB", 100, 1), 100),
@@ -228,30 +260,28 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
     profilePath: path.resolve(baseDir, get("PROFILE_PATH") || "company.md"),
     templatesDir: path.resolve(baseDir, get("TEMPLATES_DIR") || "templates"),
     lawsDir: path.resolve(baseDir, get("LAWS_DIR") || "laws"),
+    pricesPath: path.resolve(baseDir, get("PRICES_PATH") || path.join("knowledge", "prices.json")),
+    reportFontPath: get("REPORT_FONT_PATH") ? path.resolve(baseDir, get("REPORT_FONT_PATH")) : "",
     envFile: envPath,
     fromEnvironment,
   };
 
-  const authMode = (): ClaudeAuthMode => {
-    if (!claudeOauthToken) return "this machine's claude login";
-    return fromEnvironment
-      ? "subscription token from environment variables"
-      : "subscription token from .env";
-  };
   const publicView = (): Record<string, unknown> => ({
     ...values,
     botToken: botToken ? "[hidden]" : "",
-    claudeOauthToken: claudeOauthToken ? "[hidden]" : "",
+    anthropicApiKey: anthropicApiKey ? "[hidden]" : "",
+    geminiApiKey: geminiApiKey ? "[hidden]" : "",
+    databaseUrl: databaseUrl ? "[hidden]" : "",
     telegramApiHash: telegramApiHash ? "[hidden]" : "",
-    claudeAuthMode: authMode(),
   });
 
   const settings: Record<PropertyKey, unknown> = { ...values };
   // Secrets are non-enumerable so they never end up in logs, JSON or inspect output.
   Object.defineProperty(settings, "botToken", { value: botToken, enumerable: false });
-  Object.defineProperty(settings, "claudeOauthToken", { value: claudeOauthToken, enumerable: false });
+  Object.defineProperty(settings, "anthropicApiKey", { value: anthropicApiKey, enumerable: false });
+  Object.defineProperty(settings, "geminiApiKey", { value: geminiApiKey, enumerable: false });
+  Object.defineProperty(settings, "databaseUrl", { value: databaseUrl, enumerable: false });
   Object.defineProperty(settings, "telegramApiHash", { value: telegramApiHash, enumerable: false });
-  Object.defineProperty(settings, "claudeAuthMode", { get: authMode, enumerable: true });
   Object.defineProperty(settings, "toJSON", { value: publicView, enumerable: false });
   Object.defineProperty(settings, util.inspect.custom, { value: publicView, enumerable: false });
   return Object.freeze(settings) as unknown as Settings;
@@ -259,7 +289,7 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
 
 /**
  * Container mode: reads SETTING_KEYS from process.env, then removes them from process.env
- * (even on error) so child processes such as `claude` never inherit the bot token.
+ * (even on error) so no child process or library ever reads the tokens from the environment.
  */
 export function settingsFromProcessEnv(
   envFile: string,
@@ -308,21 +338,6 @@ export function which(name: string, envPath = process.env.PATH ?? ""): string | 
   return null;
 }
 
-function findClaudeBin(): string {
-  const fallback = path.join(os.homedir(), ".local", "bin", "claude");
-  if (process.platform !== "win32") return which("claude") ?? fallback;
-  // Windows: a .cmd shim cannot be started without a shell, so prefer the real claude.exe.
-  const found = which("claude.exe");
-  if (found) return found;
-  const shim = which("claude.cmd");
-  if (shim) {
-    const exe = path.join(path.dirname(shim), "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe");
-    if (isExecutableFile(exe)) return exe;
-  }
-  const localExe = `${fallback}.exe`;
-  return isExecutableFile(localExe) ? localExe : fallback;
-}
-
 function isExecutableFile(file: string): boolean {
   try {
     if (!fs.statSync(file).isFile()) return false;
@@ -336,10 +351,6 @@ function isExecutableFile(file: string): boolean {
 
 function isBotToken(value: string): boolean {
   return /^\d+:[A-Za-z0-9_-]+$/.test(value);
-}
-
-function isEffort(value: string): value is Effort {
-  return (EFFORT_LEVELS as readonly string[]).includes(value);
 }
 
 export function isErrnoCode(err: unknown, code: string): boolean {

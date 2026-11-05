@@ -1,0 +1,52 @@
+{
+  "title": "Xizmatlarimizning taxminiy narxlari (price-list)",
+  "validOn": "2026-10-30",
+  "source": "SANOATGEOKONTEXXIZMAT tijoriy taklifi, 30.10.2026 (faqat narxlar jadvali olingan; mijoz nomi, imzo va muhr olinmagan)",
+  "currency": "so'm",
+  "disclaimer": {
+    "uz": "Xizmatlarimizning taxminiy narxlari (price-list). Bu narxlar taxminiy, aniq summa geologiya bo'yicha direktorimiz bilan maslahatlashganingizdan so'ng kelishiladi. Summa korxonangiz joylashgan joy yoki ishlab chiqaradigan xom-ashyo turiga qarab o'zgarishi mumkin.",
+    "ru": "Ориентировочные цены на наши услуги (прайс-лист). Эти цены ориентировочные, точная сумма согласовывается после консультации с нашим директором по геологии. Сумма может меняться в зависимости от местоположения Вашего предприятия или вида добываемого сырья.",
+    "en": "Indicative prices of our services (price list). These prices are indicative; the exact amount is agreed after a consultation with our director of geology. The amount may change depending on where your company is located or the type of raw material it produces."
+  },
+  "groups": [
+    {
+      "key": "noruda",
+      "title": {
+        "uz": "Noruda foydali qazilmalar (qum, shag'al, tosh, gil va boshqa qurilish xom-ashyosi)",
+        "ru": "Нерудные полезные ископаемые",
+        "en": "Non-metallic minerals"
+      },
+      "items": [
+        { "key": "grr", "title": { "uz": "Geologiya-qidiruv ishlari (GRR)", "ru": "Геологоразведочные работы (ГРР)", "en": "Geological exploration (GRR)" }, "unit": null, "price": null, "priceText": "kelishiladi, uchastkaga bog'liq", "days": null, "daysText": "kelishiladi" },
+        { "key": "tog_ajratmasi", "title": { "uz": "Tog' ajratmasi (ishchi loyiha, kalendar reja)", "ru": "Горный отвод (рабочий проект, календарный план)", "en": "Mining allotment (working project, calendar plan)" }, "unit": null, "price": 15000000, "days": 30 },
+        { "key": "5gr_1", "title": { "uz": "5-GR shakli bo'yicha hisobot — I chorak", "ru": "Отчёт по форме 5-ГР — I квартал", "en": "Form 5-GR report — Q1" }, "unit": "hisobot", "price": 5000000, "days": 10 },
+        { "key": "5gr_2", "title": { "uz": "5-GR shakli bo'yicha hisobot — II chorak", "ru": "Отчёт по форме 5-ГР — II квартал", "en": "Form 5-GR report — Q2" }, "unit": "hisobot", "price": 5000000, "days": 10 },
+        { "key": "5gr_3", "title": { "uz": "5-GR shakli bo'yicha hisobot — III chorak", "ru": "Отчёт по форме 5-ГР — III квартал", "en": "Form 5-GR report — Q3" }, "unit": "hisobot", "price": 5000000, "days": 10 },
+        { "key": "5gr_4", "title": { "uz": "5-GR shakli bo'yicha hisobot — IV chorak", "ru": "Отчёт по форме 5-ГР — IV квартал", "en": "Form 5-GR report — Q4" }, "unit": "hisobot", "price": 6000000, "days": 10 },
+        { "key": "zvos", "title": { "uz": "ZVOS loyihasi", "ru": "Проект ЗВОС", "en": "ZVOS project" }, "unit": "loyiha", "price": 8000000, "days": 10 },
+        { "key": "zep", "title": { "uz": "ZEP loyihasi", "ru": "Проект ЗЭП", "en": "ZEP project" }, "unit": "loyiha", "price": 9000000, "days": 10 },
+        { "key": "teo", "title": { "uz": "TEO (TIA, texnik-iqtisodiy asoslash)", "ru": "ТЭО", "en": "Feasibility study (TEO)" }, "unit": "loyiha", "price": 8000000, "days": 10 },
+        { "key": "uter", "title": { "uz": "UTER", "ru": "УТЭР", "en": "UTER" }, "unit": "loyiha", "price": 8000000, "days": 10 },
+        { "key": "toposyomka", "title": { "uz": "Toposyomka (topografik s'yomka)", "ru": "Топосъёмка", "en": "Topographic survey" }, "unit": "gektar", "price": null, "priceMin": 500000, "priceMax": 1000000, "days": null, "daysText": "price-list'da ko'rsatilmagan" }
+      ]
+    },
+    {
+      "key": "ruda",
+      "title": {
+        "uz": "Ruda foydali qazilmalar (metall rudalari: oltin, mis va boshqalar)",
+        "ru": "Рудные полезные ископаемые",
+        "en": "Metallic ores"
+      },
+      "items": [
+        { "key": "grr", "title": { "uz": "Geologiya-qidiruv ishlari (GRR)", "ru": "Геологоразведочные работы (ГРР)", "en": "Geological exploration (GRR)" }, "unit": null, "price": null, "priceText": "kelishiladi, uchastkaga bog'liq", "days": null, "daysText": "kelishiladi" },
+        { "key": "tog_ajratmasi", "title": { "uz": "Tog' ajratmasi (ishchi loyiha, kalendar reja)", "ru": "Горный отвод (рабочий проект, календарный план)", "en": "Mining allotment (working project, calendar plan)" }, "unit": null, "price": null, "priceText": "kelishiladi, uchastkaga bog'liq", "days": null, "daysText": "kelishiladi" },
+        { "key": "5gr", "title": { "uz": "Nazorat o'lchovi, 5-GR choraklik hisobotini tayyorlash va Davgeolinspeksiyaga topshirish", "ru": "Контрольный замер, подготовка и сдача в Госгеолинспекцию квартального отчёта по форме 5-ГР", "en": "Control survey, preparing and filing the quarterly form 5-GR report" }, "unit": "hisobot", "price": null, "priceText": "kelishiladi, uchastkaga bog'liq", "days": null, "daysText": "kelishiladi" },
+        { "key": "zvos", "title": { "uz": "ZVOS loyihasi", "ru": "Проект ЗВОС", "en": "ZVOS project" }, "unit": "loyiha", "price": null, "priceText": "kelishiladi, uchastkaga bog'liq", "days": null, "daysText": "kelishiladi" },
+        { "key": "zep", "title": { "uz": "ZEP loyihasi", "ru": "Проект ЗЭП", "en": "ZEP project" }, "unit": "loyiha", "price": null, "priceText": "kelishiladi, uchastkaga bog'liq", "days": null, "daysText": "kelishiladi" },
+        { "key": "teo", "title": { "uz": "TEO (TIA)", "ru": "ТЭО", "en": "Feasibility study (TEO)" }, "unit": "loyiha", "price": null, "priceText": "kelishiladi, uchastkaga bog'liq", "days": null, "daysText": "kelishiladi" },
+        { "key": "uter", "title": { "uz": "UTER", "ru": "УТЭР", "en": "UTER" }, "unit": "loyiha", "price": null, "priceText": "kelishiladi, uchastkaga bog'liq", "days": null, "daysText": "kelishiladi" },
+        { "key": "toposyomka", "title": { "uz": "Toposyomka", "ru": "Топосъёмка", "en": "Topographic survey" }, "unit": "gektar", "price": null, "priceText": "kelishiladi, uchastkaga bog'liq", "days": null, "daysText": "kelishiladi" }
+      ]
+    }
+  ]
+}

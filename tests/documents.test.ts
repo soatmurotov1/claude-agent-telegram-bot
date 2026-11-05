@@ -355,7 +355,8 @@ describe("client folder and questionnaire", () => {
     expect(h.generator.calls).toHaveLength(0);
     const caption = String(h.api.sentTo(CLIENT_ID, "sendDocument")[0]?.payload.caption);
     expect(caption).toContain("14 документов");
-    expect(caption).toContain("14) решения на земельный отвод");
+    expect(caption).toContain("14. Решения о земельном отводе");
+    expect(caption).toContain("1. Устав предприятия\n2. Выписка из ЕГРПО");
     expect(caption).not.toContain("NDA");
   });
 
