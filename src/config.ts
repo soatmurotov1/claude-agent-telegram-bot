@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import util from "node:util";
 import { parse } from "dotenv";
@@ -30,7 +29,6 @@ export const SETTING_KEYS = [
   "DATA_DIR",
   "PROFILE_PATH",
   "TEMPLATES_DIR",
-  "LAWS_DIR",
   "PRICES_PATH",
   "REPORT_FONT_PATH",
   // No longer used (Claude now runs through the API, and nothing is deleted by age); read only to warn about them.
@@ -105,7 +103,6 @@ export interface Settings {
   readonly dataDir: string;
   readonly profilePath: string;
   readonly templatesDir: string;
-  readonly lawsDir: string;
   readonly pricesPath: string;
   readonly reportFontPath: string;
   readonly envFile: string;
@@ -259,7 +256,6 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
     dataDir: path.resolve(baseDir, get("DATA_DIR") || "data"),
     profilePath: path.resolve(baseDir, get("PROFILE_PATH") || "company.md"),
     templatesDir: path.resolve(baseDir, get("TEMPLATES_DIR") || "templates"),
-    lawsDir: path.resolve(baseDir, get("LAWS_DIR") || "laws"),
     pricesPath: path.resolve(baseDir, get("PRICES_PATH") || path.join("knowledge", "prices.json")),
     reportFontPath: get("REPORT_FONT_PATH") ? path.resolve(baseDir, get("REPORT_FONT_PATH")) : "",
     envFile: envPath,
@@ -319,34 +315,6 @@ export function envFileWarning(envFile: string): string | null {
   if ((mode & 0o077) === 0) return null;
   const octal = (mode & 0o777).toString(8).padStart(3, "0");
   return `${envFile} is readable by other users (mode ${octal}) and holds secret tokens. Fix it with: chmod 600 ${envFile}`;
-}
-
-/** Minimal shell-free `which`: searches PATH for an executable file. */
-export function which(name: string, envPath = process.env.PATH ?? ""): string | null {
-  // On Windows a name without an extension is tried with PATHEXT only (a bare "claude" there is a sh shim).
-  const exts =
-    process.platform === "win32" && !path.extname(name)
-      ? (process.env.PATHEXT ?? ".EXE;.COM").split(";").filter(Boolean).map((e) => e.toLowerCase())
-      : [""];
-  for (const dir of envPath.split(path.delimiter)) {
-    if (!dir) continue;
-    for (const ext of exts) {
-      const candidate = path.join(dir, name + ext);
-      if (isExecutableFile(candidate)) return candidate;
-    }
-  }
-  return null;
-}
-
-function isExecutableFile(file: string): boolean {
-  try {
-    if (!fs.statSync(file).isFile()) return false;
-    if (process.platform === "win32") return true;
-    fs.accessSync(file, fs.constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function isBotToken(value: string): boolean {

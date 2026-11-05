@@ -206,7 +206,6 @@ hafta davomida qilish kerak.
 - **Litsenziya muddatlari** faqat mijoz suhbatda aytgan ma'lumotdan olinadi (Q6 qarori). Reyestr importi qilinmagan.
 - **"Tijoriy taklif yuborilgan mijozlar"**: bot taklif yubormaydi. `offer_sent` belgisi faqat AI suhbatdan
   "negotiation" bosqichini aniqlaganda qo'yiladi.
-- `src/claudeCli.ts` va `laws/` ishlatilmayapti, lekin o'chirilmadi (avval sizdan so'rash kerak).
 
 ## 11. O'zgargan va yangi fayllar
 
@@ -216,8 +215,9 @@ hafta davomida qilish kerak.
 - `knowledge/prices.json`, `docs/AI-TIZIM.md`
 - `tests/fakes.ts`, `tests/providers.test.ts`, `tests/acceptance.test.ts`
 
+**O'chirilgan:** `src/claudeCli.ts` (eski Claude Code CLI), `laws/` (bot o'qimaydigan lex.uz konspektlari; mazmuni `company.md` da bor).
+
 **O'zgargan:**
 - `src/service.ts`, `src/handlers.ts`, `src/bot.ts`, `src/config.ts`, `src/store.ts`, `src/prompts.ts`
-- `src/claudeCli.ts` (faqat type importi)
 - `company.md`, `README.md`, `.env.example`, `Dockerfile`, `package.json`
 - `tests/harness.ts`, `tests/documents.test.ts` (ruscha ro'yxat formati)

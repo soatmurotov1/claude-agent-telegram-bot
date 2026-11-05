@@ -26,7 +26,6 @@ COPY --from=build /app/dist ./dist
 COPY company.md ./
 COPY templates ./templates
 COPY knowledge ./knowledge
-COPY laws ./laws
 
 # Runs as root on purpose: Railway mounts the volume at /app/data owned by root.
 # Started with node directly (not npm) so SIGTERM from Railway reaches the bot.
