@@ -1,7 +1,7 @@
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
-import { run } from "@grammyjs/runner";
+import { run, type RunnerHandle } from "@grammyjs/runner";
 import { Bot, GrammyError } from "grammy";
 import { ConfigError, envFileWarning, loadSettings, type Settings, settingsFromProcessEnv } from "./config.js";
 import { Database } from "./db/database.js";
@@ -183,15 +183,22 @@ async function runBot(settings: Settings): Promise<number> {
     logError(`Error while handling update ${err.ctx.update.update_id}: ${errorMessage(err.error)}`);
   });
 
-  try {
-    await bot.init();
-  } catch (err) {
-    if (err instanceof GrammyError && err.error_code === 401) {
-      logError("Telegram rejected TELEGRAM_BOT_TOKEN (401 Unauthorized). Check the token from @BotFather.");
-      return 2;
+  // A short network hiccup at start-up must not crash the container: Railway gives up after a few failed restarts.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await bot.init();
+      break;
+    } catch (err) {
+      if (err instanceof GrammyError && err.error_code === 401) {
+        logError("Telegram rejected TELEGRAM_BOT_TOKEN (401 Unauthorized). Check the token from @BotFather.");
+        return 2;
+      }
+      if (attempt >= INIT_ATTEMPTS) throw err;
+      logError(`Telegram is not reachable (${errorMessage(err)}). Retrying in ${attempt * 5} s (${attempt}/${INIT_ATTEMPTS}).`);
+      await sleep(attempt * 5_000);
     }
-    throw err;
   }
+  await removeWebhook(bot);
   assistant.attachApi(bot.api);
 
   log(`Bot @${bot.botInfo.username} is running`);
@@ -273,14 +280,13 @@ async function runBot(settings: Settings): Promise<number> {
     backfill.unref();
   }
 
-  const runner = run(bot, { runner: { fetch: { allowed_updates: ALLOWED_UPDATES } } });
+  let runner: RunnerHandle | null = null;
   let stopping = false;
   const stop = (signal: string): void => {
     if (stopping) return;
     stopping = true;
     log(`Received ${signal}, stopping...`);
-    void runner
-      .stop()
+    void Promise.resolve(runner?.stop())
       .then(() => assistant.idle())
       .then(() => db?.close())
       .finally(() => {
@@ -291,8 +297,55 @@ async function runBot(settings: Settings): Promise<number> {
   process.once("SIGTERM", () => stop("SIGTERM"));
   process.once("SIGINT", () => stop("SIGINT"));
 
-  await runner.task();
+  // 409 Conflict means another getUpdates (a second copy of the bot with the same token: the bot started on a PC,
+  // a second Railway service or replica, the previous deployment that has not stopped yet) or a webhook. The grammY
+  // runner treats it as fatal; exiting would make Railway restart the bot a few times and then mark it Crashed.
+  // Instead the bot waits and polls again, so it takes over as soon as the other copy stops.
+  let conflictDelayMs = CONFLICT_DELAY_MIN_MS;
+  while (!stopping) {
+    const startedAt = Date.now();
+    runner = run(bot, { runner: { fetch: { allowed_updates: ALLOWED_UPDATES } } });
+    try {
+      await runner.task();
+      return 0;
+    } catch (err) {
+      if (stopping) return 0;
+      if (!(err instanceof GrammyError && err.error_code === 409)) throw err;
+      if (Date.now() - startedAt > 10 * 60_000) conflictDelayMs = CONFLICT_DELAY_MIN_MS;
+      if (/webhook/i.test(err.description)) {
+        await removeWebhook(bot);
+      } else {
+        logError(
+          "WARNING: 409 Conflict — another copy of this bot is reading updates with the same TELEGRAM_BOT_TOKEN " +
+            "(the bot running on a computer, a second Railway service or replica, or the previous deployment). " +
+            `Only one copy may run. Polling again in ${Math.round(conflictDelayMs / 1000)} s.`,
+        );
+      }
+      await sleep(conflictDelayMs);
+      conflictDelayMs = Math.min(conflictDelayMs * 2, CONFLICT_DELAY_MAX_MS);
+    }
+  }
   return 0;
+}
+
+const INIT_ATTEMPTS = 6;
+const CONFLICT_DELAY_MIN_MS = 5_000;
+const CONFLICT_DELAY_MAX_MS = 120_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** The bot reads updates by polling, which Telegram refuses (409) while a webhook is set for the token. */
+async function removeWebhook(bot: Bot): Promise<void> {
+  try {
+    const info = await bot.api.getWebhookInfo();
+    if (!info.url) return;
+    await bot.api.deleteWebhook();
+    logError(`WARNING: a webhook (${info.url}) was set for this bot token; it was removed so polling works.`);
+  } catch (err) {
+    logError(`WARNING: could not check or remove the webhook: ${errorMessage(err)}`);
+  }
 }
 
 process.on("unhandledRejection", (reason) => {
@@ -307,7 +360,8 @@ if (invokedDirectly) {
     },
     (err: unknown) => {
       logError(`Fatal error: ${errorMessage(err)}`);
-      process.exitCode = 1;
+      // Exit now: open PostgreSQL connections would otherwise keep a bot that no longer polls alive for a while.
+      process.exit(1);
     },
   );
 }
