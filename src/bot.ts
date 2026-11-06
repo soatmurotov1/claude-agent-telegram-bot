@@ -62,6 +62,7 @@ async function main(): Promise<number> {
   for (const key of settings.obsoleteSettings) {
     logError(`WARNING: ${key} is no longer used and can be removed (Claude now runs through ANTHROPIC_API_KEY; nothing is deleted by age).`);
   }
+  for (const warning of settings.aiWarnings) logError(`WARNING: ${warning}`);
   ensurePrivateDir(settings.dataDir);
 
   if (checkAi) return checkProviders(settings);
@@ -200,6 +201,15 @@ async function runBot(settings: Settings): Promise<number> {
   }
   await removeWebhook(bot);
   assistant.attachApi(bot.api);
+  if (settings.aiWarnings.length > 0) {
+    const text =
+      "⚠️ Claude kaliti (ANTHROPIC_API_KEY) ishlamaydi, shuning uchun bot hozir faqat Gemini orqali javob beryapti.\n\n" +
+      "Claude obuna tokeni (sk-ant-oat...) API uchun yaramaydi. console.anthropic.com -> API keys bo'limida " +
+      "sk-ant-api... bilan boshlanadigan API kalit yarating va Railway -> Variables -> ANTHROPIC_API_KEY ga qo'ying.";
+    for (const adminId of assistant.adminIds) {
+      await bot.api.sendMessage(adminId, text).catch((err: unknown) => logError(`Could not warn admin ${adminId}: ${errorMessage(err)}`));
+    }
+  }
 
   log(`Bot @${bot.botInfo.username} is running`);
   log(`Company: ${settings.companyName}`);

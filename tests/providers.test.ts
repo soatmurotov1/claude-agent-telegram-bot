@@ -1,3 +1,4 @@
+import { loadSettings } from "../src/config.js";
 import { describe, expect, it } from "vitest";
 import { classifyClaude } from "../src/ai/claudeProvider.js";
 import { classifyGemini, DUMMY_THOUGHT_SIGNATURE, GeminiProvider } from "../src/ai/geminiProvider.js";
@@ -248,5 +249,30 @@ describe("price disclaimer is added by the code", () => {
     expect(fixed.match(/Xizmatlarimizning taxminiy narxlari/g)).toHaveLength(1);
     expect(ensurePriceDisclaimer(fixed, "uz", list)).toBe(fixed); // idempotent
     expect(ensurePriceDisclaimer("ZEP 9 mln", "ru", list)).toContain(list!.disclaimer.ru);
+  });
+});
+
+describe("a wrong Claude key does not stop the bot", () => {
+  const base = { TELEGRAM_BOT_TOKEN: "123:abc", ADMIN_IDS: "42", GEMINI_API_KEY: "g-key" };
+
+  it("switches Claude off for a subscription token and keeps Gemini", () => {
+    const settings = loadSettings("/tmp/none.env", { source: { ...base, ANTHROPIC_API_KEY: "sk-ant-oat01-abc" } });
+    expect(settings.anthropicApiKey).toBe("");
+    expect(settings.geminiApiKey).toBe("g-key");
+    expect(settings.aiWarnings).toHaveLength(1);
+    expect(settings.aiWarnings[0]).toContain("subscription token");
+    expect(settings.aiWarnings[0]).not.toContain("abc");
+  });
+
+  it("switches Claude off for a value that is not an Anthropic key", () => {
+    const settings = loadSettings("/tmp/none.env", { source: { ...base, ANTHROPIC_API_KEY: "hello world" } });
+    expect(settings.anthropicApiKey).toBe("");
+    expect(settings.aiWarnings).toHaveLength(1);
+  });
+
+  it("keeps a real API key", () => {
+    const settings = loadSettings("/tmp/none.env", { source: { ...base, ANTHROPIC_API_KEY: "sk-ant-api03-xyz" } });
+    expect(settings.anthropicApiKey).toBe("sk-ant-api03-xyz");
+    expect(settings.aiWarnings).toHaveLength(0);
   });
 });

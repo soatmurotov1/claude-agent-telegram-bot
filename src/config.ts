@@ -91,6 +91,8 @@ export interface Settings {
   readonly historyLimit: number;
   /** Obsolete settings that are still set (bot.ts warns about them). */
   readonly obsoleteSettings: readonly string[];
+  /** AI keys that were set but unusable and therefore switched off (bot.ts logs them and tells the admins). */
+  readonly aiWarnings: readonly string[];
   /** Claude calls for document checks allowed per 24 hours across all clients. */
   readonly reviewDailyLimit: number;
   /** Hour (0-23, Tashkent) at which the daily report goes to the admin. */
@@ -190,15 +192,20 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
     }
   }
 
-  const anthropicApiKey = get("ANTHROPIC_API_KEY");
-  if (anthropicApiKey && (!anthropicApiKey.startsWith("sk-ant-") || /\s/.test(anthropicApiKey))) {
-    throw new ConfigError(`ANTHROPIC_API_KEY must be an Anthropic API key (sk-ant-..., one line; check ${where}).`);
-  }
+  // A wrong Claude key must not stop the bot: Claude is switched off and Gemini (the backup) answers everything.
+  const aiWarnings: string[] = [];
+  let anthropicApiKey = get("ANTHROPIC_API_KEY");
   if (anthropicApiKey.startsWith("sk-ant-oat")) {
-    throw new ConfigError(
-      `ANTHROPIC_API_KEY holds a Claude subscription token (sk-ant-oat...). Create an API key in the Claude Console ` +
-        `(console.anthropic.com -> API keys) and use that (check ${where}).`,
+    aiWarnings.push(
+      "ANTHROPIC_API_KEY holds a Claude subscription token (sk-ant-oat...), which the Anthropic API does not accept. " +
+        `Claude is switched off; create an API key in the Claude Console (console.anthropic.com -> API keys, it starts with sk-ant-api) and put it into ${where}.`,
     );
+    anthropicApiKey = "";
+  } else if (anthropicApiKey && (!anthropicApiKey.startsWith("sk-ant-") || /\s/.test(anthropicApiKey))) {
+    aiWarnings.push(
+      `ANTHROPIC_API_KEY is not an Anthropic API key (expected sk-ant-api..., one line, no spaces). Claude is switched off; check ${where}.`,
+    );
+    anthropicApiKey = "";
   }
   const geminiApiKey = get("GEMINI_API_KEY");
   if (geminiApiKey && /\s/.test(geminiApiKey)) {
@@ -249,6 +256,7 @@ export function loadSettings(envFile: string, opts: LoadOptions = {}): Settings 
     aiProbeMinutes: int("AI_PROBE_MINUTES", 5, 1),
     historyLimit: int("HISTORY_LIMIT", 40, 1),
     obsoleteSettings: Object.freeze([...obsoleteSettings]),
+    aiWarnings: Object.freeze([...aiWarnings]),
     reviewDailyLimit: int("REVIEW_DAILY_LIMIT", 100, 1),
     dailyReportHour: Math.min(int("DAILY_REPORT_HOUR", 9, 0), 23),
     maxFileMb: Math.min(int("MAX_FILE_MB", 100, 1), 100),
