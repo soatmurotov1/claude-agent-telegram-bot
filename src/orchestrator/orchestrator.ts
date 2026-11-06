@@ -3,7 +3,7 @@ import { extractJson } from "../ai/json.js";
 import type { AIProviderManager } from "../ai/providerManager.js";
 import { AllProvidersDownError, type ChatResponse } from "../ai/types.js";
 import type { Database, ProfileField } from "../db/database.js";
-import { priceListPrompt, type PriceList } from "../knowledge/prices.js";
+import { amountsIn, priceListPrompt, type PriceList } from "../knowledge/prices.js";
 import { LANGUAGE_NAMES, type Language } from "../language.js";
 import { knownFactsBlock, type MemoryManager } from "../memory.js";
 import { buildSystemPrompt, buildUserPrompt } from "../prompts.js";
@@ -202,7 +202,9 @@ export class Orchestrator implements CustomerBrain {
     } else {
       path.push("self_check:ok");
     }
-    if (!raw.trim().startsWith("[SKIP]") && workflow === "price_answer") {
+    // Any reply that names an amount carries the exact disclaimer and contacts, whatever workflow the message fell into
+    // (a misspelt "UTER narxini bilmoqchiamn" is not always classified as a price request).
+    if (!raw.trim().startsWith("[SKIP]") && (workflow === "price_answer" || amountsIn(raw).length > 0)) {
       const fixed = ensurePriceDisclaimer(raw, input.language, priceList);
       if (fixed !== raw) {
         raw = fixed;
@@ -233,7 +235,12 @@ export class Orchestrator implements CustomerBrain {
             },
           ]
         : [{ role: "user" as const, content: user }];
-    return this.options.ai.chat({ purpose: "customer-reply", tier: "main", maxTokens: 1200, system, messages });
+    let response = await this.options.ai.chat({ purpose: "customer-reply", tier: "main", maxTokens: 1200, system, messages });
+    // A reply cut off by the token limit is asked for again with more room instead of being sent half-written.
+    if (response.stopReason === "max_tokens") {
+      response = await this.options.ai.chat({ purpose: "customer-reply", tier: "main", maxTokens: 3000, system, messages });
+    }
+    return response;
   }
 
   async #safe<T>(fn: () => Promise<T>, fallback: T): Promise<T> {

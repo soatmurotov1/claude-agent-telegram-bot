@@ -5,6 +5,7 @@ import { AllProvidersDownError, ProviderError } from "../src/ai/types.js";
 import { amountsIn, inventedAmounts, loadPriceList } from "../src/knowledge/prices.js";
 import { bannedPhrases, removeBannedSentences, repeatedReply, reviewReply } from "../src/orchestrator/validation.js";
 import { parseAnalysis, selectWorkflow } from "../src/orchestrator/decisionTree.js";
+import { ensurePriceDisclaimer } from "../src/orchestrator/orchestrator.js";
 import { makeAi } from "./fakes.js";
 import path from "node:path";
 import { PROJECT_DIR } from "./harness.js";
@@ -177,6 +178,15 @@ describe("price list and reply checks", () => {
     expect(inventedAmounts("UTER taxminan 8 000 000 so'm", list)).toEqual([]);
     expect(inventedAmounts("UTER taxminan 7 500 000 so'm", list)).toEqual([7_500_000]);
     expect(inventedAmounts("Toposyomka 500 000 – 1 000 000 so'm/gektar", list)).toEqual([]);
+  });
+
+  it("completes a cut-off disclaimer with the exact text and the contacts", () => {
+    const cut = "UTER tayyorlash 8 000 000 so'm (1 loyiha uchun), muddati 10 kun.\nXizmatlarimizning taxminiy narxlari (";
+    const fixed = ensurePriceDisclaimer(cut, "uz", list);
+    expect(fixed).toContain(list!.disclaimer.uz);
+    expect(fixed).toContain("+998 99 850 24 01");
+    expect(fixed.startsWith("UTER tayyorlash 8 000 000 so'm")).toBe(true);
+    expect(fixed).not.toContain("narxlari (\n");
   });
 
   it("finds the forbidden 'an employee will answer' phrases in every language", () => {
