@@ -62,7 +62,9 @@ export class GeminiProvider implements Provider, Embedder {
             ? [{ text: message.content }]
             : message.content.map((part) => toGeminiPart(part)),
       })),
-      generationConfig: { maxOutputTokens: request.maxTokens ?? 1500 },
+      // Gemini 3 counts its hidden "thinking" tokens against maxOutputTokens, so without headroom a long answer is
+      // cut off mid-sentence (seen in production: a reply ended at "narxlari (").
+      generationConfig: { maxOutputTokens: (request.maxTokens ?? 1500) + 4096 },
     };
     if (request.tools && request.tools.length > 0) {
       body.tools = [

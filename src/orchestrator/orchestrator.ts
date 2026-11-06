@@ -202,6 +202,13 @@ export class Orchestrator implements CustomerBrain {
     } else {
       path.push("self_check:ok");
     }
+    if (!raw.trim().startsWith("[SKIP]") && workflow === "price_answer") {
+      const fixed = ensurePriceDisclaimer(raw, input.language, priceList);
+      if (fixed !== raw) {
+        raw = fixed;
+        notes.push("price disclaimer and contacts added by the code");
+      }
+    }
     return {
       raw,
       requestId,
@@ -238,6 +245,36 @@ export class Orchestrator implements CustomerBrain {
       return fallback;
     }
   }
+}
+
+const CONTACTS_TAIL: Record<Language, string> = {
+  uz: "Obyektingiz bo'yicha hisob-kitob uchun biz bilan bog'laning: +998 99 850 24 01, +998 97 721 26 09, sanoatgeokontexxizmat@gmail.com, Telegram @sanoatgeokontex_xizmat, https://sanoatgeokontexxizmat.uz/",
+  ru: "Для расчёта по Вашему объекту свяжитесь с нами: +998 99 850 24 01, +998 97 721 26 09, sanoatgeokontexxizmat@gmail.com, Telegram @sanoatgeokontex_xizmat, https://sanoatgeokontexxizmat.uz/",
+  en: "For a calculation for your site, contact us: +998 99 850 24 01, +998 97 721 26 09, sanoatgeokontexxizmat@gmail.com, Telegram @sanoatgeokontex_xizmat, https://sanoatgeokontexxizmat.uz/",
+} as Record<Language, string>;
+
+const squash = (text: string): string => text.replace(/\s+/g, " ").trim().toLowerCase();
+
+/**
+ * A reply that names prices must end with the agreed price-list disclaimer (word for word) and the contacts. The model
+ * is asked to write them, but it sometimes shortens, rephrases or gets cut off, so the code makes sure of it: a partial or
+ * reworded disclaimer is cut away and the exact text is added.
+ */
+export function ensurePriceDisclaimer(reply: string, language: Language | null, list: PriceList | null): string {
+  if (!list) return reply;
+  const lang: Language = language === "ru" || language === "en" ? language : "uz";
+  const disclaimer = list.disclaimer[lang];
+  if (!disclaimer) return reply;
+  let body = reply.trim();
+  if (!squash(body).includes(squash(disclaimer))) {
+    // Cut a started or reworded copy of the disclaimer (it starts with the same heading) together with what follows.
+    const heading = disclaimer.split("\n")[0]!.replace(/\s*\(.*$/, "").trim();
+    const at = body.toLowerCase().indexOf(heading.toLowerCase());
+    if (at >= 0) body = body.slice(0, at).trim();
+    body = `${body}\n\n${disclaimer}`;
+  }
+  if (!body.includes("+998 99 850 24 01")) body = `${body}\n\n${CONTACTS_TAIL[lang]}`;
+  return body;
 }
 
 /** The reply used when the model kept naming amounts that are not in the price list. */

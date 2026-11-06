@@ -225,3 +225,18 @@ describe("decision tree", () => {
     expect(parseAnalysis("garbage").fromAi).toBe(false);
   });
 });
+
+describe("price disclaimer is added by the code", () => {
+  const list = loadPriceList(path.join(PROJECT_DIR, "knowledge", "prices.json"));
+  it("completes a cut-off or missing disclaimer and the contacts, exactly once", async () => {
+    const { ensurePriceDisclaimer } = await import("../src/orchestrator/orchestrator.js");
+    const cut = "UTER tayyorlash 8 000 000 so'm (1 loyiha uchun), muddati 10 kun. Xizmatlarimizning taxminiy narxlari (";
+    const fixed = ensurePriceDisclaimer(cut, "uz", list);
+    expect(fixed.startsWith("UTER tayyorlash 8 000 000 so'm (1 loyiha uchun), muddati 10 kun.")).toBe(true);
+    expect(fixed).toContain(list!.disclaimer.uz);
+    expect(fixed).toContain("+998 99 850 24 01");
+    expect(fixed.match(/Xizmatlarimizning taxminiy narxlari/g)).toHaveLength(1);
+    expect(ensurePriceDisclaimer(fixed, "uz", list)).toBe(fixed); // idempotent
+    expect(ensurePriceDisclaimer("ZEP 9 mln", "ru", list)).toContain(list!.disclaimer.ru);
+  });
+});
